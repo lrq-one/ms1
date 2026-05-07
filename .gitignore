@@ -1,0 +1,9 @@
+*.pth
+/data
+/outputs
+/logs
+/checkpoints
+/tests
+/__pycache__
+/build
+*.pyc
