@@ -1710,7 +1710,23 @@ class MolAttentionGRUNewSparse(nn.Module):
         set_in = self.set_score_norm(set_in)
         score_h = F.relu(self.set_score_l1(set_in))
         score_h = F.relu(self.set_score_l2(score_h))
-        rerank_delta_pool = self.set_score_out(score_h).squeeze(-1)
+        raw_rerank_delta_pool = self.set_score_out(score_h).squeeze(-1)
+
+        try:
+            rerank_loss_weight_env = float(os.environ.get("RERANK_LOSS_WEIGHT", "0.0"))
+        except Exception:
+            rerank_loss_weight_env = 0.0
+
+        use_rerank_delta = (
+            os.environ.get("USE_RERANK_DELTA", "0") == "1"
+            or rerank_loss_weight_env > 0.0
+        )
+
+        if use_rerank_delta:
+            rerank_delta_pool = raw_rerank_delta_pool
+        else:
+            rerank_delta_pool = torch.zeros_like(pool_selector_logits)
+
         rerank_delta_pool_mean = rerank_delta_pool.mean().detach()
         rerank_delta_pool_std = rerank_delta_pool.std().detach()
         selector_logits_pool_std = pool_selector_logits.std().detach()
@@ -2127,7 +2143,13 @@ class MolAttentionGRUNewSparse(nn.Module):
             'selector_probs': selector_probs,
             'selector_pool_idx': pool_idx,
             'rerank_delta_pool': rerank_delta_pool,
+            'raw_rerank_delta_pool': raw_rerank_delta_pool.detach(),
             'rerank_logits_pool': final_pool_logits,
+            'use_rerank_delta': torch.tensor(
+                1.0 if use_rerank_delta else 0.0,
+                device=device,
+                dtype=torch.float32,
+            ),
             'rerank_delta_pool_mean': rerank_delta_pool_mean,
             'rerank_delta_pool_std': rerank_delta_pool_std,
             'selector_logits_pool_std': selector_logits_pool_std,
@@ -2171,4 +2193,3 @@ __all__ = [
     'GraphVertSpect',
     'MolAttentionGRUNewSparse',
 ]
-

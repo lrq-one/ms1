@@ -2161,21 +2161,42 @@ def build_candidate_local_quality_target(
         true_support_for_match = true_support
 
     idx_safe = off_idx.clamp(0, official_bin_n - 1)
-    true_at_candidate_bins = torch.gather(
+    true_at_candidate_bins_exact = torch.gather(
+        true_dense.unsqueeze(1).expand(B, M, official_bin_n),
+        2,
+        idx_safe,
+    )
+
+    support_at_candidate_bins_exact = torch.gather(
+        true_support.unsqueeze(1).expand(B, M, official_bin_n),
+        2,
+        idx_safe,
+    )
+
+    true_at_candidate_bins_tol = torch.gather(
         true_dense_for_match.unsqueeze(1).expand(B, M, official_bin_n),
         2,
         idx_safe,
     )
 
-    support_at_candidate_bins = torch.gather(
+    support_at_candidate_bins_tol = torch.gather(
         true_support_for_match.unsqueeze(1).expand(B, M, official_bin_n),
         2,
         idx_safe,
     )
 
-    overlap_intensity = (off_int_norm * true_at_candidate_bins * valid_peak.float()).sum(dim=-1)
-    hit_support_mass = (off_int_norm * support_at_candidate_bins * valid_peak.float()).sum(dim=-1)
-    false_support_mass = (off_int_norm * (1.0 - support_at_candidate_bins) * valid_peak.float()).sum(dim=-1)
+    overlap_intensity_exact = (
+        off_int_norm * true_at_candidate_bins_exact * valid_peak.float()
+    ).sum(dim=-1)
+    overlap_intensity_tol = (
+        off_int_norm * true_at_candidate_bins_tol * valid_peak.float()
+    ).sum(dim=-1)
+    hit_support_mass_tol = (
+        off_int_norm * support_at_candidate_bins_tol * valid_peak.float()
+    ).sum(dim=-1)
+    false_support_mass_exact = (
+        off_int_norm * (1.0 - support_at_candidate_bins_exact) * valid_peak.float()
+    ).sum(dim=-1)
 
     top20_dense = torch.zeros((B, official_bin_n), dtype=torch.float32, device=device)
     top20_idx_list = batch.get(top20_key_idx, None)
@@ -2217,11 +2238,32 @@ def build_candidate_local_quality_target(
     )
     hit_top20_mass = (off_int_norm * top20_at_candidate_bins * valid_peak.float()).sum(dim=-1)
 
+    try:
+        w_overlap = float(os.environ.get("SELECTOR_QUALITY_W_OVERLAP", "1.50"))
+    except Exception:
+        w_overlap = 1.50
+
+    try:
+        w_support = float(os.environ.get("SELECTOR_QUALITY_W_SUPPORT", "0.35"))
+    except Exception:
+        w_support = 0.35
+
+    try:
+        w_top20 = float(os.environ.get("SELECTOR_QUALITY_W_TOP20", "0.75"))
+    except Exception:
+        w_top20 = 0.75
+
+    try:
+        w_false = float(os.environ.get("SELECTOR_QUALITY_W_FALSE", "1.20"))
+    except Exception:
+        w_false = 1.20
+
     quality_raw = (
-        1.00 * overlap_intensity
-        + 0.50 * hit_support_mass
-        + 0.75 * hit_top20_mass
-        - 0.35 * false_support_mass
+        w_overlap * overlap_intensity_exact
+        + 0.40 * overlap_intensity_tol
+        + w_support * hit_support_mass_tol
+        + w_top20 * hit_top20_mass
+        - w_false * false_support_mass_exact
     )
 
     quality_raw = torch.where(
@@ -2239,7 +2281,7 @@ def build_candidate_local_quality_target(
     try:
         target_support_topk = int(os.environ.get("TARGET_SUPPORT_TOPK", "64"))
     except Exception:
-        target_support_topk = 256
+        target_support_topk = 64
 
     k = max(1, min(target_support_topk, M))
     top_idx = torch.topk(
@@ -2256,9 +2298,11 @@ def build_candidate_local_quality_target(
     valid_mask = formulae_mask.float() * has_signal
 
     return quality, pos_label, valid_mask, {
-        'overlap_intensity': overlap_intensity,
-        'hit_top20_mass': hit_top20_mass,
-        'false_support_mass': false_support_mass,
+        'overlap_intensity_exact': overlap_intensity_exact.detach(),
+        'overlap_intensity_tol': overlap_intensity_tol.detach(),
+        'hit_support_mass_tol': hit_support_mass_tol.detach(),
+        'hit_top20_mass': hit_top20_mass.detach(),
+        'false_support_mass_exact': false_support_mass_exact.detach(),
     }
 
 
@@ -4456,11 +4500,17 @@ def train_mssubsetnet():
         'train_selector_kl': [],
         'train_selector_quality_mean': [],
         'train_selector_pos_rate': [],
+        'train_target_pos_false_mass': [],
+        'train_target_pos_overlap_exact': [],
+        'train_use_rerank_delta': [],
         'val_selector_loss': [],
         'val_selector_bce': [],
         'val_selector_kl': [],
         'val_selector_quality_mean': [],
         'val_selector_pos_rate': [],
+        'val_target_pos_false_mass': [],
+        'val_target_pos_overlap_exact': [],
+        'val_use_rerank_delta': [],
         'val_model_topk_teacher_recall': [],
         'train_precursor_loss': [],
         'val_precursor_loss': [],
@@ -4516,6 +4566,9 @@ def train_mssubsetnet():
         train_selector_kl_vals = []
         train_selector_quality_mean_vals = []
         train_selector_pos_rate_vals = []
+        train_target_pos_false_mass_vals = []
+        train_target_pos_overlap_exact_vals = []
+        train_use_rerank_delta_vals = []
         train_rerank_kl_vals = []
         train_rerank_bce_vals = []
         train_rerank_loss_vals = []
@@ -4710,6 +4763,31 @@ def train_mssubsetnet():
                         selector_pos_label.sum() / selector_valid_mask.sum().clamp_min(1.0)
                     )
                     selector_quality_mean = selector_quality.mean()
+
+                target_pos_false_mass = res_full['spect'].sum() * 0.0
+                target_pos_overlap_exact = res_full['spect'].sum() * 0.0
+                if (
+                    isinstance(selector_extra, dict)
+                    and torch.is_tensor(selector_pos_label)
+                    and torch.is_tensor(selector_extra.get('false_support_mass_exact', None))
+                    and torch.is_tensor(selector_extra.get('overlap_intensity_exact', None))
+                ):
+                    pos = selector_pos_label.float()
+                    pos_den = pos.sum().clamp_min(1.0)
+                    target_pos_false_mass = (
+                        selector_extra['false_support_mass_exact'].to(
+                            device=pos.device,
+                            dtype=pos.dtype,
+                        )
+                        * pos
+                    ).sum() / pos_den
+                    target_pos_overlap_exact = (
+                        selector_extra['overlap_intensity_exact'].to(
+                            device=pos.device,
+                            dtype=pos.dtype,
+                        )
+                        * pos
+                    ).sum() / pos_den
 
                 selector_loss = (
                     float(selector_bce_weight) * selector_bce_loss
@@ -5015,6 +5093,10 @@ def train_mssubsetnet():
             train_selector_kl_vals.append(float(selector_kl_loss.detach().item()))
             train_selector_quality_mean_vals.append(float(selector_quality_mean.detach().item()))
             train_selector_pos_rate_vals.append(float(selector_pos_rate.detach().item()))
+            train_target_pos_false_mass_vals.append(float(target_pos_false_mass.detach().item()))
+            train_target_pos_overlap_exact_vals.append(float(target_pos_overlap_exact.detach().item()))
+            if isinstance(res_full, dict) and torch.is_tensor(res_full.get('use_rerank_delta', None)):
+                train_use_rerank_delta_vals.append(float(res_full['use_rerank_delta'].detach().item()))
             train_rerank_kl_vals.append(float(rerank_kl.detach().item()))
             train_rerank_bce_vals.append(float(rerank_bce.detach().item()))
             train_rerank_loss_vals.append(float(main_candidate_kl.detach().item()))
@@ -5044,6 +5126,9 @@ def train_mssubsetnet():
         val_selector_kl_vals = []
         val_selector_quality_mean_vals = []
         val_selector_pos_rate_vals = []
+        val_target_pos_false_mass_vals = []
+        val_target_pos_overlap_exact_vals = []
+        val_use_rerank_delta_vals = []
         val_rerank_kl_vals = []
         val_rerank_bce_vals = []
         val_rerank_loss_vals = []
@@ -5314,6 +5399,31 @@ def train_mssubsetnet():
                             selector_pos_label.sum() / selector_valid_mask.sum().clamp_min(1.0)
                         )
                         val_selector_quality_mean = selector_quality.mean()
+
+                    val_target_pos_false_mass = res_full['spect'].sum() * 0.0
+                    val_target_pos_overlap_exact = res_full['spect'].sum() * 0.0
+                    if (
+                        isinstance(selector_extra, dict)
+                        and torch.is_tensor(selector_pos_label)
+                        and torch.is_tensor(selector_extra.get('false_support_mass_exact', None))
+                        and torch.is_tensor(selector_extra.get('overlap_intensity_exact', None))
+                    ):
+                        pos = selector_pos_label.float()
+                        pos_den = pos.sum().clamp_min(1.0)
+                        val_target_pos_false_mass = (
+                            selector_extra['false_support_mass_exact'].to(
+                                device=pos.device,
+                                dtype=pos.dtype,
+                            )
+                            * pos
+                        ).sum() / pos_den
+                        val_target_pos_overlap_exact = (
+                            selector_extra['overlap_intensity_exact'].to(
+                                device=pos.device,
+                                dtype=pos.dtype,
+                            )
+                            * pos
+                        ).sum() / pos_den
 
                     val_selector_loss = (
                         float(selector_bce_weight) * val_selector_bce
@@ -5693,6 +5803,10 @@ def train_mssubsetnet():
                 val_selector_kl_vals.append(float(val_selector_kl.detach().item()))
                 val_selector_quality_mean_vals.append(float(val_selector_quality_mean.detach().item()))
                 val_selector_pos_rate_vals.append(float(val_selector_pos_rate.detach().item()))
+                val_target_pos_false_mass_vals.append(float(val_target_pos_false_mass.detach().item()))
+                val_target_pos_overlap_exact_vals.append(float(val_target_pos_overlap_exact.detach().item()))
+                if isinstance(res_full, dict) and torch.is_tensor(res_full.get('use_rerank_delta', None)):
+                    val_use_rerank_delta_vals.append(float(res_full['use_rerank_delta'].detach().item()))
                 val_rerank_kl_vals.append(float(val_rerank_kl.detach().item()))
                 val_rerank_bce_vals.append(float(val_rerank_bce.detach().item()))
                 val_rerank_loss_vals.append(float(val_main_kl.detach().item()))
@@ -5743,11 +5857,17 @@ def train_mssubsetnet():
         avg_train_selector_kl = _finite_mean(train_selector_kl_vals)
         avg_train_selector_quality_mean = _finite_mean(train_selector_quality_mean_vals)
         avg_train_selector_pos_rate = _finite_mean(train_selector_pos_rate_vals)
+        avg_train_target_pos_false_mass = _finite_mean(train_target_pos_false_mass_vals)
+        avg_train_target_pos_overlap_exact = _finite_mean(train_target_pos_overlap_exact_vals)
+        avg_train_use_rerank_delta = _finite_mean(train_use_rerank_delta_vals)
         avg_val_selector_loss = _finite_mean(val_selector_loss_vals)
         avg_val_selector_bce = _finite_mean(val_selector_bce_vals)
         avg_val_selector_kl = _finite_mean(val_selector_kl_vals)
         avg_val_selector_quality_mean = _finite_mean(val_selector_quality_mean_vals)
         avg_val_selector_pos_rate = _finite_mean(val_selector_pos_rate_vals)
+        avg_val_target_pos_false_mass = _finite_mean(val_target_pos_false_mass_vals)
+        avg_val_target_pos_overlap_exact = _finite_mean(val_target_pos_overlap_exact_vals)
+        avg_val_use_rerank_delta = _finite_mean(val_use_rerank_delta_vals)
         avg_val_model_topk_teacher_recall = _finite_mean(val_model_topk_teacher_recall_vals)
         avg_val_active_teacher_recall = _finite_mean(val_active_teacher_recall_vals)
         avg_val_fragaux_teacher_recall = _finite_mean(val_fragaux_teacher_recall_vals)
@@ -5945,6 +6065,9 @@ def train_mssubsetnet():
             f'train_selector_kl={avg_train_selector_kl:.4f} | '
             f'train_selector_quality_mean={avg_train_selector_quality_mean:.4f} | '
             f'train_selector_pos_rate={avg_train_selector_pos_rate:.4f} | '
+            f'train_target_pos_false_mass={avg_train_target_pos_false_mass:.4f} | '
+            f'train_target_pos_overlap_exact={avg_train_target_pos_overlap_exact:.4f} | '
+            f'train_use_rerank_delta={avg_train_use_rerank_delta:.1f} | '
             f'train_main_candidate_kl={avg_train_main_kl:.4f} | '
             f'train_rerank_kl={avg_train_rerank_kl:.4f} | '
             f'train_rerank_bce={avg_train_rerank_bce:.4f} | '
@@ -5962,6 +6085,9 @@ def train_mssubsetnet():
             f'val_selector_kl={avg_val_selector_kl:.4f} | '
             f'val_selector_quality_mean={avg_val_selector_quality_mean:.4f} | '
             f'val_selector_pos_rate={avg_val_selector_pos_rate:.4f} | '
+            f'val_target_pos_false_mass={avg_val_target_pos_false_mass:.4f} | '
+            f'val_target_pos_overlap_exact={avg_val_target_pos_overlap_exact:.4f} | '
+            f'val_use_rerank_delta={avg_val_use_rerank_delta:.1f} | '
             f'val_model_topk_teacher_recall@{model_topk_eval}={avg_val_model_topk_teacher_recall:.4f} | '
             f'val_active_teacher_recall={avg_val_active_teacher_recall:.4f} | '
             f'val_fragaux_teacher_recall={avg_val_fragaux_teacher_recall:.4f} | '
@@ -6051,10 +6177,16 @@ def train_mssubsetnet():
         history['train_selector_kl'].append(avg_train_selector_kl)
         history['train_selector_quality_mean'].append(avg_train_selector_quality_mean)
         history['train_selector_pos_rate'].append(avg_train_selector_pos_rate)
+        history['train_target_pos_false_mass'].append(avg_train_target_pos_false_mass)
+        history['train_target_pos_overlap_exact'].append(avg_train_target_pos_overlap_exact)
+        history['train_use_rerank_delta'].append(avg_train_use_rerank_delta)
         history['val_selector_bce'].append(avg_val_selector_bce)
         history['val_selector_kl'].append(avg_val_selector_kl)
         history['val_selector_quality_mean'].append(avg_val_selector_quality_mean)
         history['val_selector_pos_rate'].append(avg_val_selector_pos_rate)
+        history['val_target_pos_false_mass'].append(avg_val_target_pos_false_mass)
+        history['val_target_pos_overlap_exact'].append(avg_val_target_pos_overlap_exact)
+        history['val_use_rerank_delta'].append(avg_val_use_rerank_delta)
         history['val_selector_loss'].append(avg_val_selector_loss)
         history['val_model_topk_teacher_recall'].append(avg_val_model_topk_teacher_recall)
         history['val_active_teacher_recall'].append(avg_val_active_teacher_recall)
