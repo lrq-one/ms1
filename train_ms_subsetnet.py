@@ -2354,15 +2354,33 @@ def build_candidate_local_quality_target(
         + 0.15 * hit_top20_mass
     ) * formulae_mask.float()
 
-    fallback_score = fallback_score.masked_fill(formulae_mask <= 0.5, -1e9)
+    try:
+        fb_min_exact_support = float(os.environ.get("SELECTOR_FB_MIN_EXACT_SUPPORT", "0.05"))
+    except Exception:
+        fb_min_exact_support = 0.05
+
+    try:
+        fb_max_false_support = float(os.environ.get("SELECTOR_FB_MAX_FALSE_SUPPORT", "0.95"))
+    except Exception:
+        fb_max_false_support = 0.95
+
+    fallback_keep = (
+        (formulae_mask > 0.5)
+        & (fallback_score > 0.0)
+        & (exact_support_mass >= fb_min_exact_support)
+        & (false_support_mass_exact <= fb_max_false_support)
+    )
+
+    fallback_score = fallback_score.masked_fill(~fallback_keep, -1e9)
 
     fb_k = max(1, min(target_min_pos, M))
     fb_idx = torch.topk(fallback_score, k=fb_k, dim=1).indices
     fb_label = torch.zeros_like(pos_label)
     fb_label.scatter_(1, fb_idx, 1.0)
-    fb_label = fb_label * formulae_mask.float()
+    fb_label = fb_label * fallback_keep.float()
 
     need_fb = (row_pos_n < float(target_min_pos)).float()
+    fallback_used = need_fb.float()
     pos_label = torch.where(
         need_fb > 0.5,
         torch.maximum(pos_label, fb_label),
@@ -2389,6 +2407,8 @@ def build_candidate_local_quality_target(
         'exact_support_mass': exact_support_mass.detach(),
         'strict_keep': strict_keep.float().detach(),
         'quality_score': quality_score.detach(),
+        'fallback_used': fallback_used.detach(),
+        'fallback_keep': fallback_keep.float().detach(),
     }
 
 
@@ -4590,6 +4610,7 @@ def train_mssubsetnet():
         'train_target_pos_overlap_exact': [],
         'train_target_pos_exact_support_mass': [],
         'train_target_strict_keep_rate': [],
+        'train_target_fallback_rate': [],
         'train_use_rerank_delta': [],
         'val_selector_loss': [],
         'val_selector_bce': [],
@@ -4600,6 +4621,7 @@ def train_mssubsetnet():
         'val_target_pos_overlap_exact': [],
         'val_target_pos_exact_support_mass': [],
         'val_target_strict_keep_rate': [],
+        'val_target_fallback_rate': [],
         'val_use_rerank_delta': [],
         'val_model_topk_teacher_recall': [],
         'train_precursor_loss': [],
@@ -4660,6 +4682,7 @@ def train_mssubsetnet():
         train_target_pos_overlap_exact_vals = []
         train_target_pos_exact_support_mass_vals = []
         train_target_strict_keep_rate_vals = []
+        train_target_fallback_rate_vals = []
         train_use_rerank_delta_vals = []
         train_rerank_kl_vals = []
         train_rerank_bce_vals = []
@@ -4901,23 +4924,38 @@ def train_mssubsetnet():
 
                 target_pos_exact_support_mass = res_full['spect'].sum() * 0.0
                 target_strict_keep_rate = res_full['spect'].sum() * 0.0
+                target_fallback_rate = res_full['spect'].sum() * 0.0
 
                 if (
                     isinstance(selector_extra, dict)
                     and torch.is_tensor(selector_pos_label)
-                    and torch.is_tensor(selector_extra.get('exact_support_mass', None))
-                    and torch.is_tensor(selector_extra.get('strict_keep', None))
                 ):
                     pos = selector_pos_label.float()
                     pos_den = pos.sum().clamp_min(1.0)
 
-                    target_pos_exact_support_mass = (
-                        selector_extra['exact_support_mass'].to(device=pos.device, dtype=pos.dtype) * pos
-                    ).sum() / pos_den
+                    if torch.is_tensor(selector_extra.get('exact_support_mass', None)):
+                        exact_support_mass_t = selector_extra['exact_support_mass'].to(
+                            device=pos.device,
+                            dtype=pos.dtype,
+                        )
+                        target_pos_exact_support_mass = (
+                            exact_support_mass_t * pos
+                        ).sum() / pos_den
 
-                    target_strict_keep_rate = (
-                        selector_extra['strict_keep'].to(device=pos.device, dtype=pos.dtype) * formulae_mask.float()
-                    ).sum() / formulae_mask.float().sum().clamp_min(1.0)
+                    if torch.is_tensor(selector_extra.get('strict_keep', None)):
+                        strict_keep_t = selector_extra['strict_keep'].to(
+                            device=pos.device,
+                            dtype=pos.dtype,
+                        )
+                        target_strict_keep_rate = (
+                            strict_keep_t * formulae_mask.float()
+                        ).sum() / formulae_mask.float().sum().clamp_min(1.0)
+
+                    if torch.is_tensor(selector_extra.get('fallback_used', None)):
+                        target_fallback_rate = selector_extra['fallback_used'].to(
+                            device=pos.device,
+                            dtype=pos.dtype,
+                        ).float().mean()
 
                 # Optional: selector pairwise ranking loss (hard-negative sampling)
                 if os.environ.get('ENABLE_SELECTOR_PAIRWISE', '0') == '1':
@@ -5226,6 +5264,9 @@ def train_mssubsetnet():
             train_target_strict_keep_rate_vals.append(
                 float(target_strict_keep_rate.detach().item())
             )
+            train_target_fallback_rate_vals.append(
+                float(target_fallback_rate.detach().item())
+            )
             use_rerank_delta_val = 0.0
             if isinstance(res_full, dict):
                 v = res_full.get('use_rerank_delta', 0.0)
@@ -5274,6 +5315,7 @@ def train_mssubsetnet():
         val_target_pos_overlap_exact_vals = []
         val_target_pos_exact_support_mass_vals = []
         val_target_strict_keep_rate_vals = []
+        val_target_fallback_rate_vals = []
         val_use_rerank_delta_vals = []
         val_rerank_kl_vals = []
         val_rerank_bce_vals = []
@@ -5548,28 +5590,52 @@ def train_mssubsetnet():
 
                     val_target_pos_false_mass = res_full['spect'].sum() * 0.0
                     val_target_pos_overlap_exact = res_full['spect'].sum() * 0.0
+                    val_target_pos_exact_support_mass = res_full['spect'].sum() * 0.0
+                    val_target_strict_keep_rate = res_full['spect'].sum() * 0.0
+                    val_target_fallback_rate = res_full['spect'].sum() * 0.0
                     if (
                         isinstance(selector_extra, dict)
                         and torch.is_tensor(selector_pos_label)
-                        and torch.is_tensor(selector_extra.get('false_support_mass_exact', None))
-                        and torch.is_tensor(selector_extra.get('overlap_intensity_exact', None))
                     ):
                         pos = selector_pos_label.float()
                         pos_den = pos.sum().clamp_min(1.0)
-                        val_target_pos_false_mass = (
-                            selector_extra['false_support_mass_exact'].to(
+                        if torch.is_tensor(selector_extra.get('false_support_mass_exact', None)):
+                            val_target_pos_false_mass = (
+                                selector_extra['false_support_mass_exact'].to(
+                                    device=pos.device,
+                                    dtype=pos.dtype,
+                                )
+                                * pos
+                            ).sum() / pos_den
+                        if torch.is_tensor(selector_extra.get('overlap_intensity_exact', None)):
+                            val_target_pos_overlap_exact = (
+                                selector_extra['overlap_intensity_exact'].to(
+                                    device=pos.device,
+                                    dtype=pos.dtype,
+                                )
+                                * pos
+                            ).sum() / pos_den
+                        if torch.is_tensor(selector_extra.get('exact_support_mass', None)):
+                            exact_support_mass_t = selector_extra['exact_support_mass'].to(
                                 device=pos.device,
                                 dtype=pos.dtype,
                             )
-                            * pos
-                        ).sum() / pos_den
-                        val_target_pos_overlap_exact = (
-                            selector_extra['overlap_intensity_exact'].to(
+                            val_target_pos_exact_support_mass = (
+                                exact_support_mass_t * pos
+                            ).sum() / pos_den
+                        if torch.is_tensor(selector_extra.get('strict_keep', None)):
+                            strict_keep_t = selector_extra['strict_keep'].to(
                                 device=pos.device,
                                 dtype=pos.dtype,
                             )
-                            * pos
-                        ).sum() / pos_den
+                            val_target_strict_keep_rate = (
+                                strict_keep_t * formulae_mask.float()
+                            ).sum() / formulae_mask.float().sum().clamp_min(1.0)
+                        if torch.is_tensor(selector_extra.get('fallback_used', None)):
+                            val_target_fallback_rate = selector_extra['fallback_used'].to(
+                                device=pos.device,
+                                dtype=pos.dtype,
+                            ).float().mean()
 
                     val_selector_loss = (
                         float(selector_bce_weight) * val_selector_bce
@@ -5957,6 +6023,9 @@ def train_mssubsetnet():
                 val_target_strict_keep_rate_vals.append(
                     float(val_target_strict_keep_rate.detach().item())
                 )
+                val_target_fallback_rate_vals.append(
+                    float(val_target_fallback_rate.detach().item())
+                )
                 use_rerank_delta_val = 0.0
                 if isinstance(res_full, dict):
                     v = res_full.get('use_rerank_delta', 0.0)
@@ -6026,6 +6095,7 @@ def train_mssubsetnet():
         avg_train_target_pos_overlap_exact = _finite_mean(train_target_pos_overlap_exact_vals)
         avg_train_target_pos_exact_support_mass = _finite_mean(train_target_pos_exact_support_mass_vals)
         avg_train_target_strict_keep_rate = _finite_mean(train_target_strict_keep_rate_vals)
+        avg_train_target_fallback_rate = _finite_mean(train_target_fallback_rate_vals)
         avg_train_use_rerank_delta = _finite_mean(train_use_rerank_delta_vals)
         avg_val_selector_loss = _finite_mean(val_selector_loss_vals)
         avg_val_selector_bce = _finite_mean(val_selector_bce_vals)
@@ -6036,6 +6106,7 @@ def train_mssubsetnet():
         avg_val_target_pos_overlap_exact = _finite_mean(val_target_pos_overlap_exact_vals)
         avg_val_target_pos_exact_support_mass = _finite_mean(val_target_pos_exact_support_mass_vals)
         avg_val_target_strict_keep_rate = _finite_mean(val_target_strict_keep_rate_vals)
+        avg_val_target_fallback_rate = _finite_mean(val_target_fallback_rate_vals)
         avg_val_use_rerank_delta = _finite_mean(val_use_rerank_delta_vals)
         avg_val_model_topk_teacher_recall = _finite_mean(val_model_topk_teacher_recall_vals)
         avg_val_active_teacher_recall = _finite_mean(val_active_teacher_recall_vals)
@@ -6237,7 +6308,8 @@ def train_mssubsetnet():
             f'train_target_pos_false_mass={avg_train_target_pos_false_mass:.4f} | '
             f'train_target_pos_overlap_exact={avg_train_target_pos_overlap_exact:.4f} | '
             f'train_target_pos_exact_support_mass={avg_train_target_pos_exact_support_mass:.4f} | '
-            f'train_target_strict_keep_rate={avg_train_target_strict_keep_rate:.4f} | ' 
+            f'train_target_strict_keep_rate={avg_train_target_strict_keep_rate:.4f} | '
+            f'train_target_fallback_rate={avg_train_target_fallback_rate:.4f} | '
             f'train_use_rerank_delta={avg_train_use_rerank_delta:.1f} | '
             f'train_main_candidate_kl={avg_train_main_kl:.4f} | '
             f'train_rerank_kl={avg_train_rerank_kl:.4f} | '
@@ -6260,6 +6332,7 @@ def train_mssubsetnet():
             f'val_target_pos_overlap_exact={avg_val_target_pos_overlap_exact:.4f} | '
             f'val_target_pos_exact_support_mass={avg_val_target_pos_exact_support_mass:.4f} | '
             f'val_target_strict_keep_rate={avg_val_target_strict_keep_rate:.4f} | '
+            f'val_target_fallback_rate={avg_val_target_fallback_rate:.4f} | '
             f'val_use_rerank_delta={avg_val_use_rerank_delta:.1f} | '
             f'val_model_topk_teacher_recall@{model_topk_eval}={avg_val_model_topk_teacher_recall:.4f} | '
             f'val_active_teacher_recall={avg_val_active_teacher_recall:.4f} | '
@@ -6354,6 +6427,7 @@ def train_mssubsetnet():
         history['train_target_pos_overlap_exact'].append(avg_train_target_pos_overlap_exact)
         history['train_target_pos_exact_support_mass'].append(avg_train_target_pos_exact_support_mass)
         history['train_target_strict_keep_rate'].append(avg_train_target_strict_keep_rate)
+        history['train_target_fallback_rate'].append(avg_train_target_fallback_rate)
         history['train_use_rerank_delta'].append(avg_train_use_rerank_delta)
         history['val_selector_bce'].append(avg_val_selector_bce)
         history['val_selector_kl'].append(avg_val_selector_kl)
@@ -6363,6 +6437,7 @@ def train_mssubsetnet():
         history['val_target_pos_overlap_exact'].append(avg_val_target_pos_overlap_exact)
         history['val_target_pos_exact_support_mass'].append(avg_val_target_pos_exact_support_mass)
         history['val_target_strict_keep_rate'].append(avg_val_target_strict_keep_rate)
+        history['val_target_fallback_rate'].append(avg_val_target_fallback_rate)
         history['val_use_rerank_delta'].append(avg_val_use_rerank_delta)
         history['val_selector_loss'].append(avg_val_selector_loss)
         history['val_model_topk_teacher_recall'].append(avg_val_model_topk_teacher_recall)
