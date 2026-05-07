@@ -2129,15 +2129,46 @@ def build_candidate_local_quality_target(
     true_dense = true_dense / true_dense.sum(dim=-1, keepdim=True).clamp_min(eps)
     true_support = (true_dense > 0).float()
 
+    # Allow small official-bin mismatch when building selector target.
+    # Exact 0.01-bin matching is too strict for candidate-local supervision.
+    try:
+        selector_target_bin_tol = int(os.environ.get("SELECTOR_TARGET_BIN_TOL", "1"))
+    except Exception:
+        selector_target_bin_tol = 1
+
+    selector_target_bin_tol = max(0, int(selector_target_bin_tol))
+
+    if selector_target_bin_tol > 0:
+        ksz = 2 * selector_target_bin_tol + 1
+
+        # For intensity overlap, max-pool is intentionally used:
+        # a candidate peak gets credit if it falls near a true bin.
+        true_dense_for_match = F.max_pool1d(
+            true_dense.unsqueeze(1),
+            kernel_size=ksz,
+            stride=1,
+            padding=selector_target_bin_tol,
+        ).squeeze(1)
+
+        true_support_for_match = F.max_pool1d(
+            true_support.unsqueeze(1),
+            kernel_size=ksz,
+            stride=1,
+            padding=selector_target_bin_tol,
+        ).squeeze(1)
+    else:
+        true_dense_for_match = true_dense
+        true_support_for_match = true_support
+
     idx_safe = off_idx.clamp(0, official_bin_n - 1)
     true_at_candidate_bins = torch.gather(
-        true_dense.unsqueeze(1).expand(B, M, official_bin_n),
+        true_dense_for_match.unsqueeze(1).expand(B, M, official_bin_n),
         2,
         idx_safe,
     )
 
     support_at_candidate_bins = torch.gather(
-        true_support.unsqueeze(1).expand(B, M, official_bin_n),
+        true_support_for_match.unsqueeze(1).expand(B, M, official_bin_n),
         2,
         idx_safe,
     )
@@ -2169,8 +2200,18 @@ def build_candidate_local_quality_target(
             if bool(keep.any().item()):
                 top20_dense[b, idx[keep]] = 1.0
 
+    if selector_target_bin_tol > 0:
+        ksz = 2 * selector_target_bin_tol + 1
+        top20_dense_for_match = F.max_pool1d(
+            top20_dense.unsqueeze(1),
+            kernel_size=ksz,
+            stride=1,
+            padding=selector_target_bin_tol,
+        ).squeeze(1)
+    else:
+        top20_dense_for_match = top20_dense
     top20_at_candidate_bins = torch.gather(
-        top20_dense.unsqueeze(1).expand(B, M, official_bin_n),
+        top20_dense_for_match.unsqueeze(1).expand(B, M, official_bin_n),
         2,
         idx_safe,
     )
@@ -2196,7 +2237,7 @@ def build_candidate_local_quality_target(
     quality = torch.where(formulae_mask > 0.5, quality.clamp(0.0, 1.0), torch.zeros_like(quality))
 
     try:
-        target_support_topk = int(os.environ.get("TARGET_SUPPORT_TOPK", "256"))
+        target_support_topk = int(os.environ.get("TARGET_SUPPORT_TOPK", "64"))
     except Exception:
         target_support_topk = 256
 
