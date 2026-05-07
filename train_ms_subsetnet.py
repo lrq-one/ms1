@@ -2302,6 +2302,312 @@ def build_selector_teacher_dist_from_official_overlap(
 
     return teacher_dist.detach()
 
+
+def build_selector_teacher_dist_setcover(
+    batch,
+    formulae_mask,
+    official_bin_n,
+    eps=1e-8,
+):
+    """
+    Runtime set-cover selector teacher.
+
+    Greedy objective:
+      select candidates that add true-spectrum coverage and top20 coverage,
+      while penalizing added false support and redundancy.
+
+    Output:
+      teacher_dist: [B, M]
+    """
+    device = formulae_mask.device
+    B, M = formulae_mask.shape
+
+    off_idx = batch.get('formulae_peaks_official_idx', None)
+    off_int = batch.get('formulae_peaks_official_intensity', None)
+
+    if off_idx is None:
+        off_idx = batch.get('formulae_peaks_mass_idx', None)
+    if off_int is None:
+        off_int = batch.get('formulae_peaks_intensity', None)
+
+    if off_idx is None or off_int is None:
+        return torch.zeros((B, M), dtype=torch.float32, device=device)
+
+    off_idx = off_idx.to(device=device, dtype=torch.long)
+    off_int = off_int.to(device=device, dtype=torch.float32)
+
+    if off_idx.dim() == 2:
+        off_idx = off_idx.unsqueeze(0)
+    if off_int.dim() == 2:
+        off_int = off_int.unsqueeze(0)
+
+    K = min(off_idx.shape[-1], off_int.shape[-1])
+    off_idx = off_idx[:B, :M, :K]
+    off_int = off_int[:B, :M, :K]
+
+    valid_peak = (
+        (off_idx >= 0)
+        & (off_idx < int(official_bin_n))
+        & torch.isfinite(off_int)
+        & (off_int > 0)
+    )
+
+    off_int = torch.where(valid_peak, off_int.clamp_min(0.0), torch.zeros_like(off_int))
+    off_int_norm = off_int / off_int.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+    # Build true dense.
+    true_dense = torch.zeros((B, official_bin_n), dtype=torch.float32, device=device)
+
+    true_idx_list = batch.get('true_all_official_idx', None)
+    true_int_list = batch.get('true_all_official_intensity', None)
+
+    if isinstance(true_idx_list, (list, tuple)) and isinstance(true_int_list, (list, tuple)):
+        for b in range(min(B, len(true_idx_list), len(true_int_list))):
+            ti = true_idx_list[b]
+            tv = true_int_list[b]
+            if ti is None or tv is None:
+                continue
+            if not torch.is_tensor(ti):
+                ti = torch.as_tensor(ti)
+            if not torch.is_tensor(tv):
+                tv = torch.as_tensor(tv)
+
+            ti = ti.to(device=device, dtype=torch.long).reshape(-1)
+            tv = tv.to(device=device, dtype=torch.float32).reshape(-1)
+
+            n = min(ti.numel(), tv.numel())
+            if n <= 0:
+                continue
+
+            ti = ti[:n]
+            tv = tv[:n]
+
+            keep = (
+                (ti >= 0)
+                & (ti < official_bin_n)
+                & torch.isfinite(tv)
+                & (tv > 0)
+            )
+
+            if bool(keep.any().item()):
+                true_dense[b].scatter_add_(0, ti[keep], tv[keep].clamp_min(0.0))
+
+    elif torch.is_tensor(true_idx_list) and torch.is_tensor(true_int_list):
+        ti = true_idx_list.to(device=device, dtype=torch.long)
+        tv = true_int_list.to(device=device, dtype=torch.float32)
+
+        if ti.dim() == 1:
+            ti = ti.unsqueeze(0)
+        if tv.dim() == 1:
+            tv = tv.unsqueeze(0)
+
+        for b in range(min(B, ti.shape[0], tv.shape[0])):
+            idx = ti[b].reshape(-1)
+            val = tv[b].reshape(-1)
+
+            n = min(idx.numel(), val.numel())
+            if n <= 0:
+                continue
+
+            idx = idx[:n]
+            val = val[:n]
+
+            keep = (
+                (idx >= 0)
+                & (idx < official_bin_n)
+                & torch.isfinite(val)
+                & (val > 0)
+            )
+
+            if bool(keep.any().item()):
+                true_dense[b].scatter_add_(0, idx[keep], val[keep].clamp_min(0.0))
+
+    true_dense = true_dense / true_dense.sum(dim=-1, keepdim=True).clamp_min(eps)
+    true_support = (true_dense > 0).float()
+
+    # Optional top20 support.
+    top20_dense = torch.zeros((B, official_bin_n), dtype=torch.float32, device=device)
+    top20_idx_list = batch.get('true_top20_official_idx', None)
+
+    if isinstance(top20_idx_list, (list, tuple)):
+        for b in range(min(B, len(top20_idx_list))):
+            ti = top20_idx_list[b]
+            if ti is None:
+                continue
+            if not torch.is_tensor(ti):
+                ti = torch.as_tensor(ti)
+            ti = ti.to(device=device, dtype=torch.long).reshape(-1)
+            keep = (ti >= 0) & (ti < official_bin_n)
+            if bool(keep.any().item()):
+                top20_dense[b, ti[keep]] = 1.0
+
+    elif torch.is_tensor(top20_idx_list):
+        ti = top20_idx_list.to(device=device, dtype=torch.long)
+        if ti.dim() == 1:
+            ti = ti.unsqueeze(0)
+
+        for b in range(min(B, ti.shape[0])):
+            idx = ti[b].reshape(-1)
+            keep = (idx >= 0) & (idx < official_bin_n)
+            if bool(keep.any().item()):
+                top20_dense[b, idx[keep]] = 1.0
+
+    try:
+        setcover_steps = int(os.environ.get("RUNTIME_SETCOVER_STEPS", "64"))
+    except Exception:
+        setcover_steps = 64
+
+    try:
+        candidate_prefilter_k = int(os.environ.get("RUNTIME_SETCOVER_PREFILTER_TOPK", "512"))
+    except Exception:
+        candidate_prefilter_k = 512
+
+    try:
+        w_gain = float(os.environ.get("RUNTIME_SETCOVER_W_GAIN", "3.0"))
+    except Exception:
+        w_gain = 3.0
+
+    try:
+        w_top20 = float(os.environ.get("RUNTIME_SETCOVER_W_TOP20", "1.5"))
+    except Exception:
+        w_top20 = 1.5
+
+    try:
+        w_false = float(os.environ.get("RUNTIME_SETCOVER_W_FALSE", "0.8"))
+    except Exception:
+        w_false = 0.8
+
+    try:
+        w_redun = float(os.environ.get("RUNTIME_SETCOVER_W_REDUN", "0.3"))
+    except Exception:
+        w_redun = 0.3
+
+    teacher_dist = torch.zeros((B, M), dtype=torch.float32, device=device)
+
+    idx_safe_all = off_idx.clamp(0, official_bin_n - 1)
+
+    for b in range(B):
+        valid_m = formulae_mask[b].float()
+        if float(valid_m.sum().detach().cpu().item()) <= 0:
+            continue
+
+        true_b = true_dense[b]
+        support_b = true_support[b]
+        top20_b = top20_dense[b]
+
+        idx_b = idx_safe_all[b]       # [M, K]
+        int_b = off_int_norm[b]       # [M, K]
+        valid_peak_b = valid_peak[b].float()
+
+        true_at = torch.gather(
+            true_b.unsqueeze(0).expand(M, official_bin_n),
+            1,
+            idx_b,
+        )
+        support_at = torch.gather(
+            support_b.unsqueeze(0).expand(M, official_bin_n),
+            1,
+            idx_b,
+        )
+        top20_at = torch.gather(
+            top20_b.unsqueeze(0).expand(M, official_bin_n),
+            1,
+            idx_b,
+        )
+
+        overlap = (int_b * true_at * valid_peak_b).sum(dim=-1)
+        support_hit = (int_b * support_at * valid_peak_b).sum(dim=-1)
+        top20_hit = (int_b * top20_at * valid_peak_b).sum(dim=-1)
+        false_mass = (int_b * (1.0 - support_at) * valid_peak_b).sum(dim=-1)
+
+        base_score = (
+            4.0 * overlap
+            + 1.0 * support_hit
+            + 2.0 * top20_hit
+            - 1.0 * false_mass
+        )
+        base_score = base_score.masked_fill(valid_m <= 0.5, -1e9)
+
+        pk = max(1, min(candidate_prefilter_k, M))
+        pref_idx = torch.topk(base_score, k=pk, dim=0).indices
+
+        selected = []
+        selected_mask = torch.zeros((M,), dtype=torch.bool, device=device)
+
+        covered_true = torch.zeros((official_bin_n,), dtype=torch.float32, device=device)
+        covered_top20 = torch.zeros((official_bin_n,), dtype=torch.float32, device=device)
+
+        steps = max(1, min(setcover_steps, pk))
+
+        for step in range(steps):
+            best_score = None
+            best_j = None
+
+            for jj in pref_idx:
+                j = int(jj.detach().cpu().item())
+                if bool(selected_mask[j].detach().cpu().item()):
+                    continue
+
+                bins_j = idx_b[j]
+                inten_j = int_b[j]
+                vp_j = valid_peak_b[j]
+
+                true_mass_j = true_b[bins_j] * inten_j * vp_j
+                top20_mass_j = top20_b[bins_j] * inten_j * vp_j
+                false_j = (1.0 - support_b[bins_j]) * inten_j * vp_j
+
+                # New gain: only credit bins not already covered.
+                already_true = covered_true[bins_j].clamp(0.0, 1.0)
+                already_top20 = covered_top20[bins_j].clamp(0.0, 1.0)
+
+                new_true_gain = (true_mass_j * (1.0 - already_true)).sum()
+                new_top20_gain = (top20_mass_j * (1.0 - already_top20)).sum()
+
+                redun_true = (true_mass_j * already_true).sum()
+                false_add = false_j.sum()
+
+                score_j = (
+                    w_gain * new_true_gain
+                    + w_top20 * new_top20_gain
+                    - w_false * false_add
+                    - w_redun * redun_true
+                )
+
+                if best_score is None or float(score_j.detach().cpu().item()) > float(best_score.detach().cpu().item()):
+                    best_score = score_j
+                    best_j = j
+
+            if best_j is None:
+                break
+
+            if best_score is not None and float(best_score.detach().cpu().item()) <= 0:
+                break
+
+            selected.append(best_j)
+            selected_mask[best_j] = True
+
+            bins_sel = idx_b[best_j]
+            inten_sel = int_b[best_j]
+            vp_sel = valid_peak_b[best_j]
+
+            # accumulate coverage, capped later by clamp in scoring
+            covered_true.scatter_add_(0, bins_sel, true_b[bins_sel] * inten_sel * vp_sel)
+            covered_top20.scatter_add_(0, bins_sel, top20_b[bins_sel] * inten_sel * vp_sel)
+
+        if len(selected) == 0:
+            continue
+
+        selected_t = torch.as_tensor(selected, dtype=torch.long, device=device)
+
+        selected_scores = base_score[selected_t].clamp_min(0.0)
+        if float(selected_scores.sum().detach().cpu().item()) <= 0:
+            selected_scores = torch.ones_like(selected_scores)
+
+        selected_probs = selected_scores / selected_scores.sum().clamp_min(eps)
+        teacher_dist[b, selected_t] = selected_probs
+
+    return teacher_dist.detach()
+
 def build_candidate_local_quality_target(
     batch,
     formulae_mask,
@@ -5166,11 +5472,20 @@ def train_mssubsetnet():
             selector_extra = {}
             if torch.is_tensor(formulae_mask):
                 if os.environ.get("BUILD_RUNTIME_SELECTOR_TEACHER", "1") == "1":
-                    batch["selector_teacher_dist"] = build_selector_teacher_dist_from_official_overlap(
-                        batch=batch,
-                        formulae_mask=formulae_mask,
-                        official_bin_n=official_bin_n,
-                    )
+                    teacher_mode = os.environ.get("RUNTIME_SELECTOR_TEACHER_MODE", "setcover").strip().lower()
+
+                    if teacher_mode in ("setcover", "greedy", "set_cover"):
+                        batch["selector_teacher_dist"] = build_selector_teacher_dist_setcover(
+                            batch=batch,
+                            formulae_mask=formulae_mask,
+                            official_bin_n=official_bin_n,
+                        )
+                    else:
+                        batch["selector_teacher_dist"] = build_selector_teacher_dist_from_official_overlap(
+                            batch=batch,
+                            formulae_mask=formulae_mask,
+                            official_bin_n=official_bin_n,
+                        )
                 selector_quality, selector_pos_label, selector_valid_mask, selector_extra = (
                     build_candidate_local_quality_target(
                         batch=batch,
@@ -5992,11 +6307,20 @@ def train_mssubsetnet():
                 selector_extra = {}
                 if torch.is_tensor(formulae_mask):
                     if os.environ.get("BUILD_RUNTIME_SELECTOR_TEACHER", "1") == "1":
-                        batch["selector_teacher_dist"] = build_selector_teacher_dist_from_official_overlap(
-                            batch=batch,
-                            formulae_mask=formulae_mask,
-                            official_bin_n=official_bin_n,
-                        )
+                        teacher_mode = os.environ.get("RUNTIME_SELECTOR_TEACHER_MODE", "setcover").strip().lower()
+
+                        if teacher_mode in ("setcover", "greedy", "set_cover"):
+                            batch["selector_teacher_dist"] = build_selector_teacher_dist_setcover(
+                                batch=batch,
+                                formulae_mask=formulae_mask,
+                                official_bin_n=official_bin_n,
+                            )
+                        else:
+                            batch["selector_teacher_dist"] = build_selector_teacher_dist_from_official_overlap(
+                                batch=batch,
+                                formulae_mask=formulae_mask,
+                                official_bin_n=official_bin_n,
+                            )
                     selector_quality, selector_pos_label, selector_valid_mask, selector_extra = (
                         build_candidate_local_quality_target(
                             batch=batch,
