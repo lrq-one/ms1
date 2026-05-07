@@ -2485,7 +2485,17 @@ def build_selector_teacher_dist_setcover(
         w_redun = float(os.environ.get("RUNTIME_SETCOVER_W_REDUN", "0.3"))
     except Exception:
         w_redun = 0.3
+    try:
+        min_steps = int(os.environ.get("RUNTIME_SETCOVER_MIN_STEPS", "16"))
+    except Exception:
+        min_steps = 16
 
+    force_min_steps = os.environ.get("RUNTIME_SETCOVER_FORCE_MIN_STEPS", "1") == "1"
+
+    try:
+        stop_eps = float(os.environ.get("RUNTIME_SETCOVER_STOP_EPS", "0.0"))
+    except Exception:
+        stop_eps = 0.0
     teacher_dist = torch.zeros((B, M), dtype=torch.float32, device=device)
 
     # -----------------------------
@@ -2568,8 +2578,12 @@ def build_selector_teacher_dist_setcover(
             best_pos = torch.argmax(gain_score)
             best_score = gain_score[best_pos]
 
-            if best_score <= 0:
-                break
+            selected_n = len(selected_pref_positions)
+
+            # Do not stop too early. A too-sparse teacher cannot train top256 recall.
+            if best_score <= stop_eps:
+                if (not force_min_steps) or (selected_n >= int(min_steps)):
+                    break
 
             selected_pref_positions.append(best_pos)
 
@@ -3124,7 +3138,7 @@ def build_candidate_local_quality_target(
 
     has_signal = (pos_label.sum(dim=1, keepdim=True) > 0).float()
     valid_mask = formulae_mask.float() * has_signal
-
+    teacher_added_label = teacher_pos_label * (1.0 - clean_pos_label)
     return quality, pos_label, valid_mask, {
         'overlap_intensity_exact': overlap_intensity_exact.detach(),
         'overlap_intensity_tol': overlap_intensity_tol.detach(),
@@ -3142,6 +3156,7 @@ def build_candidate_local_quality_target(
         'pool_score': pool_score.detach(),
         'teacher_pos_label': teacher_pos_label.detach(),
         'teacher_dist': teacher_dist.detach(),
+        'teacher_added_label': teacher_added_label.detach(),
     }
 
 
@@ -5350,6 +5365,7 @@ def train_mssubsetnet():
         'train_target_pool_pos_overlap_tol': [],
         'train_target_teacher_pos_rate': [],
         'train_target_teacher_dist_n': [],
+        'train_target_teacher_added_rate': [],
         'train_selector_dyn_pos_weight': [],
         'train_use_rerank_delta': [],
         'val_selector_loss': [],
@@ -5368,6 +5384,7 @@ def train_mssubsetnet():
         'val_target_pool_pos_overlap_tol': [],
         'val_target_teacher_pos_rate': [],
         'val_target_teacher_dist_n': [],
+        'val_target_teacher_added_rate': [],
         'val_selector_dyn_pos_weight': [],
         'val_use_rerank_delta': [],
         'val_model_topk_teacher_recall': [],
@@ -5436,6 +5453,7 @@ def train_mssubsetnet():
         train_target_pool_pos_overlap_tol_vals = []
         train_target_teacher_pos_rate_vals = []
         train_target_teacher_dist_n_vals = []
+        train_target_teacher_added_rate_vals = []
         train_selector_dyn_pos_weight_vals = []
         train_use_rerank_delta_vals = []
         train_rerank_kl_vals = []
@@ -5737,6 +5755,7 @@ def train_mssubsetnet():
                 target_pool_pos_overlap_tol = res_full['spect'].sum() * 0.0
                 target_teacher_pos_rate = res_full['spect'].sum() * 0.0
                 target_teacher_dist_n = res_full['spect'].sum() * 0.0
+                target_teacher_added_rate = res_full['spect'].sum() * 0.0
                 if (
                     isinstance(selector_extra, dict)
                     and torch.is_tensor(selector_pos_label)
@@ -5804,6 +5823,14 @@ def train_mssubsetnet():
                         target_teacher_dist_n = (
                             teacher_dist_t > 0
                         ).float().sum(dim=1).mean()
+                    if torch.is_tensor(selector_extra.get("teacher_added_label", None)):
+                        teacher_added = selector_extra["teacher_added_label"].to(
+                            device=selector_pos_label.device,
+                            dtype=selector_pos_label.dtype,
+                        )
+                        target_teacher_added_rate = (
+                            teacher_added * formulae_mask.float()
+                        ).sum() / formulae_mask.float().sum().clamp_min(1.0)
 
                 selector_loss = (
                     float(selector_bce_weight) * selector_bce_loss
@@ -6173,6 +6200,9 @@ def train_mssubsetnet():
             train_target_teacher_dist_n_vals.append(
                 float(target_teacher_dist_n.detach().item())
             )
+            train_target_teacher_added_rate_vals.append(
+                float(target_teacher_added_rate.detach().item())
+            )
             train_selector_dyn_pos_weight_vals.append(
                 float(selector_dyn_pos_weight.detach().item())
             )
@@ -6231,6 +6261,7 @@ def train_mssubsetnet():
         val_target_pool_pos_overlap_tol_vals = []
         val_target_teacher_pos_rate_vals = []
         val_target_teacher_dist_n_vals = []
+        val_target_teacher_added_rate_vals = []
         val_selector_dyn_pos_weight_vals = []
         val_use_rerank_delta_vals = []
         val_rerank_kl_vals = []
@@ -6621,6 +6652,7 @@ def train_mssubsetnet():
                     val_target_pool_pos_overlap_tol = res_full['spect'].sum() * 0.0
                     val_target_teacher_pos_rate = res_full['spect'].sum() * 0.0
                     val_target_teacher_dist_n = res_full['spect'].sum() * 0.0
+                    val_target_teacher_added_rate = res_full['spect'].sum() * 0.0
                     if (
                         isinstance(selector_extra, dict)
                         and torch.is_tensor(selector_pos_label)
@@ -6709,6 +6741,14 @@ def train_mssubsetnet():
                             val_target_teacher_dist_n = (
                                 teacher_dist_t > 0
                             ).float().sum(dim=1).mean()
+                        if torch.is_tensor(selector_extra.get("teacher_added_label", None)):
+                            teacher_added = selector_extra["teacher_added_label"].to(
+                                device=selector_pos_label.device,
+                                dtype=selector_pos_label.dtype,
+                            )
+                            val_target_teacher_added_rate = (
+                                teacher_added * formulae_mask.float()
+                            ).sum() / formulae_mask.float().sum().clamp_min(1.0)
 
                     val_selector_loss = (
                         float(selector_bce_weight) * val_selector_bce
@@ -7117,6 +7157,9 @@ def train_mssubsetnet():
                 val_target_teacher_dist_n_vals.append(
                     float(val_target_teacher_dist_n.detach().item())
                 )
+                val_target_teacher_added_rate_vals.append(
+                    float(val_target_teacher_added_rate.detach().item())
+                )
                 val_selector_dyn_pos_weight_vals.append(
                     float(val_selector_dyn_pos_weight.detach().item())
                 )
@@ -7196,6 +7239,7 @@ def train_mssubsetnet():
         avg_train_target_pool_pos_overlap_tol = _finite_mean(train_target_pool_pos_overlap_tol_vals)
         avg_train_target_teacher_pos_rate = _finite_mean(train_target_teacher_pos_rate_vals)
         avg_train_target_teacher_dist_n = _finite_mean(train_target_teacher_dist_n_vals)
+        avg_train_target_teacher_added_rate = _finite_mean(train_target_teacher_added_rate_vals)
         avg_train_selector_dyn_pos_weight = _finite_mean(train_selector_dyn_pos_weight_vals)
         avg_train_use_rerank_delta = _finite_mean(train_use_rerank_delta_vals)
         avg_val_selector_loss = _finite_mean(val_selector_loss_vals)
@@ -7214,6 +7258,7 @@ def train_mssubsetnet():
         avg_val_target_pool_pos_overlap_tol = _finite_mean(val_target_pool_pos_overlap_tol_vals)
         avg_val_target_teacher_pos_rate = _finite_mean(val_target_teacher_pos_rate_vals)
         avg_val_target_teacher_dist_n = _finite_mean(val_target_teacher_dist_n_vals)
+        avg_val_target_teacher_added_rate = _finite_mean(val_target_teacher_added_rate_vals)
         avg_val_selector_dyn_pos_weight = _finite_mean(val_selector_dyn_pos_weight_vals)
         avg_val_use_rerank_delta = _finite_mean(val_use_rerank_delta_vals)
         avg_val_model_topk_teacher_recall = _finite_mean(val_model_topk_teacher_recall_vals)
@@ -7424,6 +7469,7 @@ def train_mssubsetnet():
             f'train_target_pool_pos_overlap_tol={avg_train_target_pool_pos_overlap_tol:.4f} | '
             f'train_target_teacher_pos_rate={avg_train_target_teacher_pos_rate:.4f} | '
             f'train_target_teacher_dist_n={avg_train_target_teacher_dist_n:.4f} | '
+            f'train_target_teacher_added_rate={avg_train_target_teacher_added_rate:.4f} | '
             f'train_selector_dyn_pos_weight={avg_train_selector_dyn_pos_weight:.4f} | '
             f'train_use_rerank_delta={avg_train_use_rerank_delta:.1f} | '
             f'train_main_candidate_kl={avg_train_main_kl:.4f} | '
@@ -7454,6 +7500,7 @@ def train_mssubsetnet():
             f'val_target_pool_pos_overlap_tol={avg_val_target_pool_pos_overlap_tol:.4f} | '
             f'val_target_teacher_pos_rate={avg_val_target_teacher_pos_rate:.4f} | '
             f'val_target_teacher_dist_n={avg_val_target_teacher_dist_n:.4f} | '
+            f'val_target_teacher_added_rate={avg_val_target_teacher_added_rate:.4f} | '
             f'val_selector_dyn_pos_weight={avg_val_selector_dyn_pos_weight:.4f} | '
             f'val_use_rerank_delta={avg_val_use_rerank_delta:.1f} | '
             f'val_model_topk_teacher_recall@{model_topk_eval}={avg_val_model_topk_teacher_recall:.4f} | '
@@ -7556,6 +7603,7 @@ def train_mssubsetnet():
         history['train_target_pool_pos_overlap_tol'].append(avg_train_target_pool_pos_overlap_tol)
         history['train_target_teacher_pos_rate'].append(avg_train_target_teacher_pos_rate)
         history['train_target_teacher_dist_n'].append(avg_train_target_teacher_dist_n)
+        history['train_target_teacher_added_rate'].append(avg_train_target_teacher_added_rate)
         history['train_selector_dyn_pos_weight'].append(avg_train_selector_dyn_pos_weight)
         history['train_use_rerank_delta'].append(avg_train_use_rerank_delta)
         history['val_selector_bce'].append(avg_val_selector_bce)
@@ -7573,6 +7621,7 @@ def train_mssubsetnet():
         history['val_target_pool_pos_overlap_tol'].append(avg_val_target_pool_pos_overlap_tol)
         history['val_target_teacher_pos_rate'].append(avg_val_target_teacher_pos_rate)
         history['val_target_teacher_dist_n'].append(avg_val_target_teacher_dist_n)
+        history['val_target_teacher_added_rate'].append(avg_val_target_teacher_added_rate)
         history['val_selector_dyn_pos_weight'].append(avg_val_selector_dyn_pos_weight)
         history['val_use_rerank_delta'].append(avg_val_use_rerank_delta)
         history['val_selector_loss'].append(avg_val_selector_loss)
