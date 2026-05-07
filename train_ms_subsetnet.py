@@ -2302,7 +2302,6 @@ def build_selector_teacher_dist_from_official_overlap(
 
     return teacher_dist.detach()
 
-
 def build_selector_teacher_dist_setcover(
     batch,
     formulae_mask,
@@ -2310,14 +2309,11 @@ def build_selector_teacher_dist_setcover(
     eps=1e-8,
 ):
     """
-    Runtime set-cover selector teacher.
+    Runtime vectorized set-cover selector teacher.
 
-    Greedy objective:
-      select candidates that add true-spectrum coverage and top20 coverage,
-      while penalizing added false support and redundancy.
-
-    Output:
-      teacher_dist: [B, M]
+    Important:
+      This avoids Python loop over candidates.
+      It loops over batch and greedy steps only.
     """
     device = formulae_mask.device
     B, M = formulae_mask.shape
@@ -2354,8 +2350,11 @@ def build_selector_teacher_dist_setcover(
 
     off_int = torch.where(valid_peak, off_int.clamp_min(0.0), torch.zeros_like(off_int))
     off_int_norm = off_int / off_int.sum(dim=-1, keepdim=True).clamp_min(eps)
+    idx_safe_all = off_idx.clamp(0, official_bin_n - 1)
 
-    # Build true dense.
+    # -----------------------------
+    # Build true dense spectrum
+    # -----------------------------
     true_dense = torch.zeros((B, official_bin_n), dtype=torch.float32, device=device)
 
     true_idx_list = batch.get('true_all_official_idx', None)
@@ -2425,7 +2424,9 @@ def build_selector_teacher_dist_setcover(
     true_dense = true_dense / true_dense.sum(dim=-1, keepdim=True).clamp_min(eps)
     true_support = (true_dense > 0).float()
 
-    # Optional top20 support.
+    # -----------------------------
+    # Build top20 support
+    # -----------------------------
     top20_dense = torch.zeros((B, official_bin_n), dtype=torch.float32, device=device)
     top20_idx_list = batch.get('true_top20_official_idx', None)
 
@@ -2452,15 +2453,18 @@ def build_selector_teacher_dist_setcover(
             if bool(keep.any().item()):
                 top20_dense[b, idx[keep]] = 1.0
 
+    # -----------------------------
+    # Hyperparams
+    # -----------------------------
     try:
-        setcover_steps = int(os.environ.get("RUNTIME_SETCOVER_STEPS", "64"))
+        setcover_steps = int(os.environ.get("RUNTIME_SETCOVER_STEPS", "16"))
     except Exception:
-        setcover_steps = 64
+        setcover_steps = 16
 
     try:
-        candidate_prefilter_k = int(os.environ.get("RUNTIME_SETCOVER_PREFILTER_TOPK", "512"))
+        candidate_prefilter_k = int(os.environ.get("RUNTIME_SETCOVER_PREFILTER_TOPK", "128"))
     except Exception:
-        candidate_prefilter_k = 512
+        candidate_prefilter_k = 128
 
     try:
         w_gain = float(os.environ.get("RUNTIME_SETCOVER_W_GAIN", "3.0"))
@@ -2484,36 +2488,26 @@ def build_selector_teacher_dist_setcover(
 
     teacher_dist = torch.zeros((B, M), dtype=torch.float32, device=device)
 
-    idx_safe_all = off_idx.clamp(0, official_bin_n - 1)
-
+    # -----------------------------
+    # Per sample greedy, vectorized over candidates
+    # -----------------------------
     for b in range(B):
         valid_m = formulae_mask[b].float()
-        if float(valid_m.sum().detach().cpu().item()) <= 0:
+        if valid_m.sum() <= 0:
             continue
 
         true_b = true_dense[b]
         support_b = true_support[b]
         top20_b = top20_dense[b]
 
-        idx_b = idx_safe_all[b]       # [M, K]
-        int_b = off_int_norm[b]       # [M, K]
+        idx_b = idx_safe_all[b]          # [M, K]
+        int_b = off_int_norm[b]          # [M, K]
         valid_peak_b = valid_peak[b].float()
 
-        true_at = torch.gather(
-            true_b.unsqueeze(0).expand(M, official_bin_n),
-            1,
-            idx_b,
-        )
-        support_at = torch.gather(
-            support_b.unsqueeze(0).expand(M, official_bin_n),
-            1,
-            idx_b,
-        )
-        top20_at = torch.gather(
-            top20_b.unsqueeze(0).expand(M, official_bin_n),
-            1,
-            idx_b,
-        )
+        # Base prefilter score, vectorized over all M.
+        true_at = true_b[idx_b]
+        support_at = support_b[idx_b]
+        top20_at = top20_b[idx_b]
 
         overlap = (int_b * true_at * valid_peak_b).sum(dim=-1)
         support_hit = (int_b * support_at * valid_peak_b).sum(dim=-1)
@@ -2526,85 +2520,83 @@ def build_selector_teacher_dist_setcover(
             + 2.0 * top20_hit
             - 1.0 * false_mass
         )
+
         base_score = base_score.masked_fill(valid_m <= 0.5, -1e9)
 
-        pk = max(1, min(candidate_prefilter_k, M))
+        pk = max(1, min(int(candidate_prefilter_k), M))
         pref_idx = torch.topk(base_score, k=pk, dim=0).indices
 
-        selected = []
-        selected_mask = torch.zeros((M,), dtype=torch.bool, device=device)
+        pref_bins = idx_b[pref_idx]              # [P, K]
+        pref_int = int_b[pref_idx]               # [P, K]
+        pref_valid = valid_peak_b[pref_idx]      # [P, K]
+
+        pref_true = true_b[pref_bins]            # [P, K]
+        pref_support = support_b[pref_bins]      # [P, K]
+        pref_top20 = top20_b[pref_bins]          # [P, K]
+
+        pref_true_mass = pref_true * pref_int * pref_valid
+        pref_top20_mass = pref_top20 * pref_int * pref_valid
+        pref_false_mass = (1.0 - pref_support) * pref_int * pref_valid
+
+        available = torch.ones((pk,), dtype=torch.bool, device=device)
 
         covered_true = torch.zeros((official_bin_n,), dtype=torch.float32, device=device)
         covered_top20 = torch.zeros((official_bin_n,), dtype=torch.float32, device=device)
 
-        steps = max(1, min(setcover_steps, pk))
+        selected_pref_positions = []
 
-        for step in range(steps):
-            best_score = None
-            best_j = None
+        steps = max(1, min(int(setcover_steps), pk))
 
-            for jj in pref_idx:
-                j = int(jj.detach().cpu().item())
-                if bool(selected_mask[j].detach().cpu().item()):
-                    continue
+        for _step in range(steps):
+            already_true = covered_true[pref_bins].clamp(0.0, 1.0)
+            already_top20 = covered_top20[pref_bins].clamp(0.0, 1.0)
 
-                bins_j = idx_b[j]
-                inten_j = int_b[j]
-                vp_j = valid_peak_b[j]
+            new_true_gain = (pref_true_mass * (1.0 - already_true)).sum(dim=-1)
+            new_top20_gain = (pref_top20_mass * (1.0 - already_top20)).sum(dim=-1)
+            redun_true = (pref_true_mass * already_true).sum(dim=-1)
+            false_add = pref_false_mass.sum(dim=-1)
 
-                true_mass_j = true_b[bins_j] * inten_j * vp_j
-                top20_mass_j = top20_b[bins_j] * inten_j * vp_j
-                false_j = (1.0 - support_b[bins_j]) * inten_j * vp_j
+            gain_score = (
+                w_gain * new_true_gain
+                + w_top20 * new_top20_gain
+                - w_false * false_add
+                - w_redun * redun_true
+            )
 
-                # New gain: only credit bins not already covered.
-                already_true = covered_true[bins_j].clamp(0.0, 1.0)
-                already_top20 = covered_top20[bins_j].clamp(0.0, 1.0)
+            gain_score = gain_score.masked_fill(~available, -1e9)
 
-                new_true_gain = (true_mass_j * (1.0 - already_true)).sum()
-                new_top20_gain = (top20_mass_j * (1.0 - already_top20)).sum()
+            best_pos = torch.argmax(gain_score)
+            best_score = gain_score[best_pos]
 
-                redun_true = (true_mass_j * already_true).sum()
-                false_add = false_j.sum()
-
-                score_j = (
-                    w_gain * new_true_gain
-                    + w_top20 * new_top20_gain
-                    - w_false * false_add
-                    - w_redun * redun_true
-                )
-
-                if best_score is None or float(score_j.detach().cpu().item()) > float(best_score.detach().cpu().item()):
-                    best_score = score_j
-                    best_j = j
-
-            if best_j is None:
+            if best_score <= 0:
                 break
 
-            if best_score is not None and float(best_score.detach().cpu().item()) <= 0:
-                break
+            selected_pref_positions.append(best_pos)
 
-            selected.append(best_j)
-            selected_mask[best_j] = True
+            available[best_pos] = False
 
-            bins_sel = idx_b[best_j]
-            inten_sel = int_b[best_j]
-            vp_sel = valid_peak_b[best_j]
+            bins_sel = pref_bins[best_pos]
+            true_sel = pref_true_mass[best_pos]
+            top20_sel = pref_top20_mass[best_pos]
 
-            # accumulate coverage, capped later by clamp in scoring
-            covered_true.scatter_add_(0, bins_sel, true_b[bins_sel] * inten_sel * vp_sel)
-            covered_top20.scatter_add_(0, bins_sel, top20_b[bins_sel] * inten_sel * vp_sel)
+            covered_true.scatter_add_(0, bins_sel, true_sel)
+            covered_top20.scatter_add_(0, bins_sel, top20_sel)
 
-        if len(selected) == 0:
+        if len(selected_pref_positions) == 0:
             continue
 
-        selected_t = torch.as_tensor(selected, dtype=torch.long, device=device)
+        selected_pref_positions = torch.stack(selected_pref_positions).long()
+        selected_global_idx = pref_idx[selected_pref_positions]
 
-        selected_scores = base_score[selected_t].clamp_min(0.0)
-        if float(selected_scores.sum().detach().cpu().item()) <= 0:
+        # Use positive greedy gains approximated by base_score for probability.
+        selected_scores = base_score[selected_global_idx].clamp_min(0.0)
+
+        if selected_scores.sum() <= 0:
             selected_scores = torch.ones_like(selected_scores)
 
         selected_probs = selected_scores / selected_scores.sum().clamp_min(eps)
-        teacher_dist[b, selected_t] = selected_probs
+
+        teacher_dist[b, selected_global_idx] = selected_probs
 
     return teacher_dist.detach()
 
