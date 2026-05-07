@@ -2258,6 +2258,13 @@ def build_candidate_local_quality_target(
     except Exception:
         w_false = 1.20
 
+    # ------------------------------------------------------------------
+    # Absolute clean selector target.
+    # Do NOT row-minmax bad candidates into positives.
+    # ------------------------------------------------------------------
+
+    exact_support_mass = (1.0 - false_support_mass_exact).clamp(0.0, 1.0)
+
     quality_raw = (
         w_overlap * overlap_intensity_exact
         + 0.40 * overlap_intensity_tol
@@ -2266,35 +2273,111 @@ def build_candidate_local_quality_target(
         - w_false * false_support_mass_exact
     )
 
-    quality_raw = torch.where(
-        formulae_mask > 0.5,
-        quality_raw,
-        torch.full_like(quality_raw, -1e9),
+    # A multiplicative clean gate is much stronger than only subtracting false mass.
+    try:
+        clean_gamma = float(os.environ.get("SELECTOR_CLEAN_GAMMA", "2.0"))
+    except Exception:
+        clean_gamma = 2.0
+
+    clean_gate = exact_support_mass.clamp(0.0, 1.0) ** clean_gamma
+
+    # Final score: must be positive and clean.
+    quality_score = quality_raw.clamp_min(0.0) * clean_gate
+
+    # Absolute positive filters.
+    try:
+        min_exact_support = float(os.environ.get("SELECTOR_POS_MIN_EXACT_SUPPORT", "0.20"))
+    except Exception:
+        min_exact_support = 0.20
+
+    try:
+        min_tol_support = float(os.environ.get("SELECTOR_POS_MIN_TOL_SUPPORT", "0.25"))
+    except Exception:
+        min_tol_support = 0.25
+
+    try:
+        max_false_support = float(os.environ.get("SELECTOR_POS_MAX_FALSE_SUPPORT", "0.80"))
+    except Exception:
+        max_false_support = 0.80
+
+    strict_keep = (
+        (formulae_mask > 0.5)
+        & (quality_score > 0.0)
+        & (exact_support_mass >= min_exact_support)
+        & (hit_support_mass_tol >= min_tol_support)
+        & (false_support_mass_exact <= max_false_support)
     )
 
-    q_min = quality_raw.masked_fill(formulae_mask <= 0.5, float('inf')).min(dim=1, keepdim=True).values
-    q_max = quality_raw.masked_fill(formulae_mask <= 0.5, float('-inf')).max(dim=1, keepdim=True).values
+    quality_score = torch.where(
+        strict_keep,
+        quality_score,
+        torch.zeros_like(quality_score),
+    )
 
-    quality = (quality_raw - q_min) / (q_max - q_min).clamp_min(eps)
-    quality = torch.where(formulae_mask > 0.5, quality.clamp(0.0, 1.0), torch.zeros_like(quality))
+    # Normalize by row max only. No row-min subtraction.
+    row_max = quality_score.max(dim=1, keepdim=True).values
+    quality = quality_score / row_max.clamp_min(eps)
+    quality = torch.where(
+        row_max > eps,
+        quality,
+        torch.zeros_like(quality),
+    )
+    quality = quality * formulae_mask.float()
 
     try:
         target_support_topk = int(os.environ.get("TARGET_SUPPORT_TOPK", "64"))
     except Exception:
         target_support_topk = 64
 
+    try:
+        target_min_pos = int(os.environ.get("TARGET_MIN_POS", "8"))
+    except Exception:
+        target_min_pos = 8
+
     k = max(1, min(target_support_topk, M))
-    top_idx = torch.topk(
-        quality.masked_fill(formulae_mask <= 0.5, -1e9),
-        k=k,
-        dim=1,
-    ).indices
+
+    # First choose topK among clean candidates.
+    masked_quality = quality.masked_fill(formulae_mask <= 0.5, -1e9)
+    top_idx = torch.topk(masked_quality, k=k, dim=1).indices
 
     pos_label = torch.zeros_like(quality)
     pos_label.scatter_(1, top_idx, 1.0)
-    pos_label = pos_label * formulae_mask.float()
+    pos_label = pos_label * strict_keep.float()
 
-    has_signal = (quality.sum(dim=1, keepdim=True) > eps).float()
+    # Fallback: if a row has too few strict positives, add the best fallback candidates.
+    # This avoids empty KL rows, but still prevents top64 garbage positives.
+    row_pos_n = pos_label.sum(dim=1, keepdim=True)
+
+    fallback_score = (
+        0.50 * exact_support_mass
+        + 0.35 * hit_support_mass_tol
+        + 0.15 * hit_top20_mass
+    ) * formulae_mask.float()
+
+    fallback_score = fallback_score.masked_fill(formulae_mask <= 0.5, -1e9)
+
+    fb_k = max(1, min(target_min_pos, M))
+    fb_idx = torch.topk(fallback_score, k=fb_k, dim=1).indices
+    fb_label = torch.zeros_like(pos_label)
+    fb_label.scatter_(1, fb_idx, 1.0)
+    fb_label = fb_label * formulae_mask.float()
+
+    need_fb = (row_pos_n < float(target_min_pos)).float()
+    pos_label = torch.where(
+        need_fb > 0.5,
+        torch.maximum(pos_label, fb_label),
+        pos_label,
+    )
+
+    # But final pos should never exceed target_support_topk.
+    if target_support_topk < M:
+        pos_quality = quality.masked_fill(pos_label <= 0.5, -1e9)
+        keep_idx = torch.topk(pos_quality, k=k, dim=1).indices
+        keep_label = torch.zeros_like(pos_label)
+        keep_label.scatter_(1, keep_idx, 1.0)
+        pos_label = pos_label * keep_label
+
+    has_signal = (pos_label.sum(dim=1, keepdim=True) > 0).float()
     valid_mask = formulae_mask.float() * has_signal
 
     return quality, pos_label, valid_mask, {
@@ -2303,6 +2386,9 @@ def build_candidate_local_quality_target(
         'hit_support_mass_tol': hit_support_mass_tol.detach(),
         'hit_top20_mass': hit_top20_mass.detach(),
         'false_support_mass_exact': false_support_mass_exact.detach(),
+        'exact_support_mass': exact_support_mass.detach(),
+        'strict_keep': strict_keep.float().detach(),
+        'quality_score': quality_score.detach(),
     }
 
 
@@ -4737,8 +4823,21 @@ def train_mssubsetnet():
                         gamma = 2.0
 
                     target_dist = selector_quality.clamp_min(0.0) ** gamma
-                    target_dist = target_dist * selector_valid_mask
-                    target_dist = target_dist / target_dist.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+                    # Critical: KL should only distribute mass over positive clean candidates.
+                    target_dist = target_dist * selector_pos_label.float() * selector_valid_mask.float()
+
+                    target_sum = target_dist.sum(dim=1, keepdim=True)
+
+                    # Fallback if no target mass: use pos_label uniformly.
+                    uniform_pos = selector_pos_label.float() * selector_valid_mask.float()
+                    uniform_pos = uniform_pos / uniform_pos.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+                    target_dist = torch.where(
+                        target_sum > 1e-8,
+                        target_dist / target_sum.clamp_min(1e-8),
+                        uniform_pos,
+                    )
 
                     log_probs = F.log_softmax(
                         selector_logits_for_loss.masked_fill(
@@ -4793,6 +4892,26 @@ def train_mssubsetnet():
                     float(selector_bce_weight) * selector_bce_loss
                     + float(selector_kl_weight) * selector_kl_loss
                 )
+
+                target_pos_exact_support_mass = res_full['spect'].sum() * 0.0
+                target_strict_keep_rate = res_full['spect'].sum() * 0.0
+
+                if (
+                    isinstance(selector_extra, dict)
+                    and torch.is_tensor(selector_pos_label)
+                    and torch.is_tensor(selector_extra.get('exact_support_mass', None))
+                    and torch.is_tensor(selector_extra.get('strict_keep', None))
+                ):
+                    pos = selector_pos_label.float()
+                    pos_den = pos.sum().clamp_min(1.0)
+
+                    target_pos_exact_support_mass = (
+                        selector_extra['exact_support_mass'].to(device=pos.device, dtype=pos.dtype) * pos
+                    ).sum() / pos_den
+
+                    target_strict_keep_rate = (
+                        selector_extra['strict_keep'].to(device=pos.device, dtype=pos.dtype) * formulae_mask.float()
+                    ).sum() / formulae_mask.float().sum().clamp_min(1.0)
 
                 # Optional: selector pairwise ranking loss (hard-negative sampling)
                 if os.environ.get('ENABLE_SELECTOR_PAIRWISE', '0') == '1':
@@ -5095,8 +5214,21 @@ def train_mssubsetnet():
             train_selector_pos_rate_vals.append(float(selector_pos_rate.detach().item()))
             train_target_pos_false_mass_vals.append(float(target_pos_false_mass.detach().item()))
             train_target_pos_overlap_exact_vals.append(float(target_pos_overlap_exact.detach().item()))
-            if isinstance(res_full, dict) and torch.is_tensor(res_full.get('use_rerank_delta', None)):
-                train_use_rerank_delta_vals.append(float(res_full['use_rerank_delta'].detach().item()))
+            use_rerank_delta_val = 0.0
+            if isinstance(res_full, dict):
+                v = res_full.get('use_rerank_delta', 0.0)
+                if torch.is_tensor(v):
+                    try:
+                        use_rerank_delta_val = float(v.detach().reshape(-1)[0].item())
+                    except Exception:
+                        use_rerank_delta_val = 0.0
+                else:
+                    try:
+                        use_rerank_delta_val = float(v)
+                    except Exception:
+                        use_rerank_delta_val = 0.0
+
+            train_use_rerank_delta_vals.append(use_rerank_delta_val)
             train_rerank_kl_vals.append(float(rerank_kl.detach().item()))
             train_rerank_bce_vals.append(float(rerank_bce.detach().item()))
             train_rerank_loss_vals.append(float(main_candidate_kl.detach().item()))
@@ -5805,8 +5937,21 @@ def train_mssubsetnet():
                 val_selector_pos_rate_vals.append(float(val_selector_pos_rate.detach().item()))
                 val_target_pos_false_mass_vals.append(float(val_target_pos_false_mass.detach().item()))
                 val_target_pos_overlap_exact_vals.append(float(val_target_pos_overlap_exact.detach().item()))
-                if isinstance(res_full, dict) and torch.is_tensor(res_full.get('use_rerank_delta', None)):
-                    val_use_rerank_delta_vals.append(float(res_full['use_rerank_delta'].detach().item()))
+                use_rerank_delta_val = 0.0
+                if isinstance(res_full, dict):
+                    v = res_full.get('use_rerank_delta', 0.0)
+                    if torch.is_tensor(v):
+                        try:
+                            use_rerank_delta_val = float(v.detach().reshape(-1)[0].item())
+                        except Exception:
+                            use_rerank_delta_val = 0.0
+                    else:
+                        try:
+                            use_rerank_delta_val = float(v)
+                        except Exception:
+                            use_rerank_delta_val = 0.0
+
+                val_use_rerank_delta_vals.append(use_rerank_delta_val)
                 val_rerank_kl_vals.append(float(val_rerank_kl.detach().item()))
                 val_rerank_bce_vals.append(float(val_rerank_bce.detach().item()))
                 val_rerank_loss_vals.append(float(val_main_kl.detach().item()))
