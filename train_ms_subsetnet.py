@@ -2031,6 +2031,246 @@ def compute_formula_target_probs_from_batch(
     )
     return target_probs
 
+
+def build_candidate_local_quality_target(
+    batch,
+    formulae_mask,
+    official_bin_n,
+    true_key_idx='true_all_official_idx',
+    true_key_int='true_all_official_intensity',
+    top20_key_idx='true_top20_official_idx',
+    eps=1e-8,
+):
+    """
+    Returns:
+      quality: [B, M], float in [0, 1]
+      pos_label: [B, M], 0/1
+      valid_mask: [B, M], 0/1
+    """
+    device = formulae_mask.device
+    B, M = formulae_mask.shape
+
+    off_idx = batch.get('formulae_peaks_official_idx', None)
+    off_int = batch.get('formulae_peaks_official_intensity', None)
+
+    if off_idx is None:
+        off_idx = batch.get('formulae_peaks_mass_idx', None)
+    if off_int is None:
+        off_int = batch.get('formulae_peaks_intensity', None)
+
+    if off_idx is None or off_int is None:
+        quality = torch.zeros((B, M), dtype=torch.float32, device=device)
+        return quality, quality, formulae_mask.float(), {}
+
+    off_idx = off_idx.to(device=device, dtype=torch.long)
+    off_int = off_int.to(device=device, dtype=torch.float32)
+
+    if off_idx.dim() == 2:
+        off_idx = off_idx.unsqueeze(0)
+    if off_int.dim() == 2:
+        off_int = off_int.unsqueeze(0)
+
+    K = min(off_idx.shape[-1], off_int.shape[-1])
+    off_idx = off_idx[:B, :M, :K]
+    off_int = off_int[:B, :M, :K]
+
+    valid_peak = (
+        (off_idx >= 0)
+        & (off_idx < int(official_bin_n))
+        & torch.isfinite(off_int)
+        & (off_int > 0)
+    )
+
+    off_int = torch.where(valid_peak, off_int.clamp_min(0.0), torch.zeros_like(off_int))
+
+    off_int_norm = off_int / off_int.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+    true_dense = torch.zeros((B, official_bin_n), dtype=torch.float32, device=device)
+    true_idx_list = batch.get(true_key_idx, None)
+    true_int_list = batch.get(true_key_int, None)
+
+    if isinstance(true_idx_list, (list, tuple)) and isinstance(true_int_list, (list, tuple)):
+        for b in range(min(B, len(true_idx_list), len(true_int_list))):
+            ti = true_idx_list[b]
+            tv = true_int_list[b]
+            if ti is None or tv is None:
+                continue
+            if not torch.is_tensor(ti):
+                ti = torch.as_tensor(ti)
+            if not torch.is_tensor(tv):
+                tv = torch.as_tensor(tv)
+            ti = ti.to(device=device, dtype=torch.long).reshape(-1)
+            tv = tv.to(device=device, dtype=torch.float32).reshape(-1)
+            n = min(ti.numel(), tv.numel())
+            if n <= 0:
+                continue
+            ti = ti[:n]
+            tv = tv[:n]
+            keep = (ti >= 0) & (ti < official_bin_n) & torch.isfinite(tv) & (tv > 0)
+            if bool(keep.any().item()):
+                true_dense[b].scatter_add_(0, ti[keep], tv[keep].clamp_min(0.0))
+    elif torch.is_tensor(true_idx_list) and torch.is_tensor(true_int_list):
+        ti = true_idx_list.to(device=device, dtype=torch.long)
+        tv = true_int_list.to(device=device, dtype=torch.float32)
+        if ti.dim() == 1:
+            ti = ti.unsqueeze(0)
+        if tv.dim() == 1:
+            tv = tv.unsqueeze(0)
+        for b in range(min(B, ti.shape[0], tv.shape[0])):
+            idx = ti[b].reshape(-1)
+            val = tv[b].reshape(-1)
+            n = min(idx.numel(), val.numel())
+            idx = idx[:n]
+            val = val[:n]
+            keep = (idx >= 0) & (idx < official_bin_n) & torch.isfinite(val) & (val > 0)
+            if bool(keep.any().item()):
+                true_dense[b].scatter_add_(0, idx[keep], val[keep].clamp_min(0.0))
+
+    true_dense = true_dense / true_dense.sum(dim=-1, keepdim=True).clamp_min(eps)
+    true_support = (true_dense > 0).float()
+
+    idx_safe = off_idx.clamp(0, official_bin_n - 1)
+    true_at_candidate_bins = torch.gather(
+        true_dense.unsqueeze(1).expand(B, M, official_bin_n),
+        2,
+        idx_safe,
+    )
+
+    support_at_candidate_bins = torch.gather(
+        true_support.unsqueeze(1).expand(B, M, official_bin_n),
+        2,
+        idx_safe,
+    )
+
+    overlap_intensity = (off_int_norm * true_at_candidate_bins * valid_peak.float()).sum(dim=-1)
+    hit_support_mass = (off_int_norm * support_at_candidate_bins * valid_peak.float()).sum(dim=-1)
+    false_support_mass = (off_int_norm * (1.0 - support_at_candidate_bins) * valid_peak.float()).sum(dim=-1)
+
+    top20_dense = torch.zeros((B, official_bin_n), dtype=torch.float32, device=device)
+    top20_idx_list = batch.get(top20_key_idx, None)
+    if isinstance(top20_idx_list, (list, tuple)):
+        for b in range(min(B, len(top20_idx_list))):
+            ti = top20_idx_list[b]
+            if ti is None:
+                continue
+            if not torch.is_tensor(ti):
+                ti = torch.as_tensor(ti)
+            ti = ti.to(device=device, dtype=torch.long).reshape(-1)
+            keep = (ti >= 0) & (ti < official_bin_n)
+            if bool(keep.any().item()):
+                top20_dense[b, ti[keep]] = 1.0
+    elif torch.is_tensor(top20_idx_list):
+        ti = top20_idx_list.to(device=device, dtype=torch.long)
+        if ti.dim() == 1:
+            ti = ti.unsqueeze(0)
+        for b in range(min(B, ti.shape[0])):
+            idx = ti[b].reshape(-1)
+            keep = (idx >= 0) & (idx < official_bin_n)
+            if bool(keep.any().item()):
+                top20_dense[b, idx[keep]] = 1.0
+
+    top20_at_candidate_bins = torch.gather(
+        top20_dense.unsqueeze(1).expand(B, M, official_bin_n),
+        2,
+        idx_safe,
+    )
+    hit_top20_mass = (off_int_norm * top20_at_candidate_bins * valid_peak.float()).sum(dim=-1)
+
+    quality_raw = (
+        1.00 * overlap_intensity
+        + 0.50 * hit_support_mass
+        + 0.75 * hit_top20_mass
+        - 0.35 * false_support_mass
+    )
+
+    quality_raw = torch.where(
+        formulae_mask > 0.5,
+        quality_raw,
+        torch.full_like(quality_raw, -1e9),
+    )
+
+    q_min = quality_raw.masked_fill(formulae_mask <= 0.5, float('inf')).min(dim=1, keepdim=True).values
+    q_max = quality_raw.masked_fill(formulae_mask <= 0.5, float('-inf')).max(dim=1, keepdim=True).values
+
+    quality = (quality_raw - q_min) / (q_max - q_min).clamp_min(eps)
+    quality = torch.where(formulae_mask > 0.5, quality.clamp(0.0, 1.0), torch.zeros_like(quality))
+
+    try:
+        target_support_topk = int(os.environ.get("TARGET_SUPPORT_TOPK", "256"))
+    except Exception:
+        target_support_topk = 256
+
+    k = max(1, min(target_support_topk, M))
+    top_idx = torch.topk(
+        quality.masked_fill(formulae_mask <= 0.5, -1e9),
+        k=k,
+        dim=1,
+    ).indices
+
+    pos_label = torch.zeros_like(quality)
+    pos_label.scatter_(1, top_idx, 1.0)
+    pos_label = pos_label * formulae_mask.float()
+
+    has_signal = (quality.sum(dim=1, keepdim=True) > eps).float()
+    valid_mask = formulae_mask.float() * has_signal
+
+    return quality, pos_label, valid_mask, {
+        'overlap_intensity': overlap_intensity,
+        'hit_top20_mass': hit_top20_mass,
+        'false_support_mass': false_support_mass,
+    }
+
+
+def build_setcover_rerank_target_from_quality(
+    selector_quality,
+    pool_idx,
+    formulae_mask,
+    eps=1e-8,
+):
+    """
+    Simplified setcover target: normalize candidate-local quality within pool.
+    """
+    B, K = pool_idx.shape
+    pool_quality = torch.gather(selector_quality, 1, pool_idx)
+    pool_mask = torch.gather(formulae_mask.float(), 1, pool_idx)
+
+    target = pool_quality.clamp_min(0.0) * pool_mask
+    target = target / target.sum(dim=1, keepdim=True).clamp_min(eps)
+
+    pos = torch.zeros_like(target)
+    try:
+        rerank_pos_k = int(os.environ.get("QUALITY_SETCOVER_TOPK", "24"))
+    except Exception:
+        rerank_pos_k = 24
+    kk = max(1, min(rerank_pos_k, K))
+
+    top_idx = torch.topk(target, k=kk, dim=1).indices
+    pos.scatter_(1, top_idx, 1.0)
+    pos = pos * pool_mask
+
+    return target, pos, pool_mask
+
+
+def compute_selector_quality_metrics(selector_logits, selector_quality, formulae_mask, ks=(32, 64, 128, 256)):
+    out = {}
+    valid_quality = selector_quality * formulae_mask.float()
+
+    for k in ks:
+        kk = min(k, selector_logits.shape[1])
+        idx = torch.topk(
+            selector_logits.masked_fill(formulae_mask <= 0.5, -1e9),
+            k=kk,
+            dim=1,
+        ).indices
+
+        q_top = torch.gather(valid_quality, 1, idx)
+        pos_top = (q_top > 0.3).float()
+
+        out[f'selector_quality_mean_at_{k}'] = q_top.mean().detach()
+        out[f'selector_precision_at_{k}'] = pos_top.mean().detach()
+
+    return out
+
 def build_candidate_peak_targets_from_batch(
     batch,
     official_bin_width=0.01,
@@ -2787,6 +3027,9 @@ def _get_selector_logits_from_res(res_dict):
 def _get_reranker_scores_from_res(res_dict):
     if not isinstance(res_dict, dict):
         return None
+    formulae_scores = res_dict.get('formulae_logits', None)
+    if torch.is_tensor(formulae_scores):
+        return formulae_scores
     formulae_scores = res_dict.get('formulae_scores_train', None)
     if torch.is_tensor(formulae_scores):
         return formulae_scores
@@ -3798,7 +4041,18 @@ def train_mssubsetnet():
     prob_softmax = os.environ.get('FORMULA_PROB_SOFTMAX', '1') == '1'
     normalize_output = os.environ.get('FORMULA_NORMALIZE_OUTPUT', '1') == '1'
 
-    main_candidate_kl_weight = max(0.0, float(os.environ.get('MAIN_CANDIDATE_KL_WEIGHT', '1.0')))
+    rerank_loss_weight = max(
+        0.0,
+        float(
+            os.environ.get(
+                'RERANK_LOSS_WEIGHT',
+                os.environ.get('MAIN_CANDIDATE_KL_WEIGHT', '1.0'),
+            )
+        ),
+    )
+    main_candidate_kl_weight = rerank_loss_weight
+    rerank_kl_weight = max(0.0, float(os.environ.get('RERANK_KL_WEIGHT', '0.7')))
+    rerank_bce_weight = max(0.0, float(os.environ.get('RERANK_BCE_WEIGHT', '0.3')))
     official_spectral_loss_weight = max(
         0.0,
         float(os.environ.get('OFFICIAL_SPECTRAL_LOSS_WEIGHT', os.environ.get('SPECTRAL_LOSS_WEIGHT', '1.0'))),
@@ -3884,6 +4138,7 @@ def train_mssubsetnet():
         'pred_min_intensity': float(max(0.0, float(os.environ.get('OFFICIAL_PRED_MIN_INTENSITY', '1e-8')))),
         'topk_peak_recall_k': int(max(1, int(os.environ.get('OFFICIAL_TOPK_PEAK_K', '20')))),
     }
+    official_bin_n = int(math.floor(official_metric_cfg['max_mz'] / official_metric_cfg['bin_width'])) + 1
     early_stop_patience = max(0, int(os.environ.get('EARLY_STOP_PATIENCE', '0')))
     early_stop_min_delta = max(0.0, float(os.environ.get('EARLY_STOP_MIN_DELTA', '0.0')))
     early_stop_warmup_epochs = max(0, int(os.environ.get('EARLY_STOP_WARMUP_EPOCHS', '0')))
@@ -4136,10 +4391,16 @@ def train_mssubsetnet():
         'train_peak_aux': [],
         'train_oos_loss': [],
         'train_rerank_teacher_ratio': [],
+        'train_rerank_kl': [],
+        'train_rerank_bce': [],
+        'train_rerank_loss': [],
         'train_formula_entropy': [],
         'val_formula_entropy': [],
         'val_loss': [],
         'val_main_candidate_kl': [],
+        'val_rerank_kl': [],
+        'val_rerank_bce': [],
+        'val_rerank_loss': [],
         'val_official_spectral_loss': [],
         'val_peak_aux': [],
         'val_oos_loss': [],
@@ -4150,7 +4411,15 @@ def train_mssubsetnet():
         'val_false_support': [],
         'val_matched_intensity_coverage': [],
         'train_selector_loss': [],
+        'train_selector_bce': [],
+        'train_selector_kl': [],
+        'train_selector_quality_mean': [],
+        'train_selector_pos_rate': [],
         'val_selector_loss': [],
+        'val_selector_bce': [],
+        'val_selector_kl': [],
+        'val_selector_quality_mean': [],
+        'val_selector_pos_rate': [],
         'val_model_topk_teacher_recall': [],
         'train_precursor_loss': [],
         'val_precursor_loss': [],
@@ -4170,6 +4439,10 @@ def train_mssubsetnet():
         'val_selector_precision@64': [],
         'val_selector_precision@128': [],
         'val_selector_precision@256': [],
+        'val_selector_quality_mean@32': [],
+        'val_selector_quality_mean@64': [],
+        'val_selector_quality_mean@128': [],
+        'val_selector_quality_mean@256': [],
         'val_selected_true_hit_mass@32': [],
         'val_selected_true_hit_mass@64': [],
         'val_selected_true_hit_mass@128': [],
@@ -4198,6 +4471,13 @@ def train_mssubsetnet():
         train_precursor_loss_vals = []
         train_fn_loss_vals = []
         train_selector_loss_vals = []
+        train_selector_bce_vals = []
+        train_selector_kl_vals = []
+        train_selector_quality_mean_vals = []
+        train_selector_pos_rate_vals = []
+        train_rerank_kl_vals = []
+        train_rerank_bce_vals = []
+        train_rerank_loss_vals = []
         train_rerank_teacher_ratio_vals = []
         train_update_n = 0
         for step, raw_batch in enumerate(tqdm(train_dl, desc=f'Epoch {epoch+1}/{epochs} [Train]'), start=1):
@@ -4206,6 +4486,27 @@ def train_mssubsetnet():
             processed = prepare_batch_cpu(raw_batch, spect_bin)
             batch = move_batch_to_device(processed, device)
             optimizer.zero_grad(set_to_none=True)
+
+            formulae_mask = batch.get('formulae_mask', None)
+            if torch.is_tensor(formulae_mask):
+                formulae_mask = formulae_mask.float()
+                if formulae_mask.dim() > 2:
+                    formulae_mask = formulae_mask.reshape(formulae_mask.shape[0], -1)
+            else:
+                formulae_mask = None
+
+            selector_quality = None
+            selector_pos_label = None
+            selector_valid_mask = None
+            selector_extra = {}
+            if torch.is_tensor(formulae_mask):
+                selector_quality, selector_pos_label, selector_valid_mask, selector_extra = (
+                    build_candidate_local_quality_target(
+                        batch=batch,
+                        formulae_mask=formulae_mask,
+                        official_bin_n=official_bin_n,
+                    )
+                )
 
             # ---------- teacher top64 target ----------
             teacher_target_full = compute_formula_target_probs_from_batch(
@@ -4260,6 +4561,10 @@ def train_mssubsetnet():
                 teacher_topk_probs = None
                 teacher_topk_mask = None
 
+            if torch.is_tensor(selector_pos_label):
+                teacher_topk_mask = selector_pos_label
+                teacher_topk_probs = None
+
             true_official_dense = _build_true_official_dense_for_batch(
                 batch,
                 official_metric_cfg,
@@ -4306,34 +4611,68 @@ def train_mssubsetnet():
                 # Biased logits: only used for topK candidate selection / rerank pruning.
                 selector_logits_for_topk = _apply_selector_aux_logit_bias(selector_logits, batch)
 
-                selector_mask_full = batch.get('formulae_mask', None)
-                selector_target_mask = teacher_topk_mask
+                selector_target_mask = selector_pos_label
+                selector_mask_full = formulae_mask
 
-                selector_bce = res_full['spect'].sum() * 0.0
-                selector_kl = res_full['spect'].sum() * 0.0
+                selector_bce_loss = res_full['spect'].sum() * 0.0
+                selector_kl_loss = res_full['spect'].sum() * 0.0
+                selector_pos_rate = res_full['spect'].sum() * 0.0
+                selector_quality_mean = res_full['spect'].sum() * 0.0
 
-                if torch.is_tensor(selector_target_mask):
-                    selector_bce_tmp = _masked_selector_bce(
-                        selector_logits_for_loss,
-                        selector_target_mask,
-                        selector_mask_full,
-                        pos_weight=selector_pos_weight,
+                if (
+                    torch.is_tensor(selector_quality)
+                    and torch.is_tensor(selector_pos_label)
+                    and torch.is_tensor(selector_valid_mask)
+                ):
+                    selector_logits_masked = selector_logits_for_loss.masked_fill(
+                        selector_valid_mask <= 0.5, 0.0
                     )
-                    if torch.is_tensor(selector_bce_tmp):
-                        selector_bce = selector_bce_tmp
-
-                if torch.is_tensor(teacher_topk_probs):
-                    selector_kl_tmp = _masked_candidate_kl(
-                        selector_logits_for_loss,
-                        teacher_topk_probs,
-                        selector_mask_full,
+                    bce_raw = F.binary_cross_entropy_with_logits(
+                        selector_logits_masked,
+                        selector_pos_label,
+                        reduction='none',
+                        pos_weight=selector_logits_for_loss.new_tensor([float(selector_pos_weight)]),
                     )
-                    if torch.is_tensor(selector_kl_tmp):
-                        selector_kl = selector_kl_tmp
+                    selector_bce_loss = (
+                        bce_raw * selector_valid_mask
+                    ).sum() / selector_valid_mask.sum().clamp_min(1.0)
+
+                    try:
+                        gamma = float(os.environ.get("QUALITY_TARGET_GAMMA", "2.0"))
+                    except Exception:
+                        gamma = 2.0
+
+                    target_dist = selector_quality.clamp_min(0.0) ** gamma
+                    target_dist = target_dist * selector_valid_mask
+                    target_dist = target_dist / target_dist.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+                    log_probs = F.log_softmax(
+                        selector_logits_for_loss.masked_fill(
+                            selector_valid_mask <= 0.5,
+                            _neg_mask_fill_value(selector_logits_for_loss),
+                        ),
+                        dim=1,
+                    )
+
+                    selector_kl_loss = F.kl_div(
+                        log_probs,
+                        target_dist,
+                        reduction='none',
+                    ).sum(dim=1)
+
+                    valid_rows = (selector_valid_mask.sum(dim=1) > 0).float()
+                    selector_kl_loss = (
+                        selector_kl_loss * valid_rows
+                    ).sum() / valid_rows.sum().clamp_min(1.0)
+
+                    selector_pos_rate = (
+                        selector_pos_label.sum() / selector_valid_mask.sum().clamp_min(1.0)
+                    )
+                    selector_quality_mean = selector_quality.mean()
 
                 selector_loss = (
-                    float(selector_bce_weight) * selector_bce
-                    + float(selector_kl_weight) * selector_kl
+                    float(selector_bce_weight) * selector_bce_loss
+                    + float(selector_kl_weight) * selector_kl_loss
                 )
 
                 # Optional: selector pairwise ranking loss (hard-negative sampling)
@@ -4351,7 +4690,7 @@ def train_mssubsetnet():
                     except Exception:
                         num_neg = 8
 
-                    pair_loss_total = selector_kl.new_tensor(0.0)
+                    pair_loss_total = selector_logits_for_loss.new_tensor(0.0)
                     pair_count = 0
                     # selector_logits_for_loss: [B, M]
                     scores = selector_logits_for_loss
@@ -4406,6 +4745,8 @@ def train_mssubsetnet():
                     rerank_teacher_ratio = 1.0
 
                     main_candidate_kl = selector_loss.new_zeros(())
+                    rerank_kl = selector_loss.new_zeros(())
+                    rerank_bce = selector_loss.new_zeros(())
                     official_spectral_loss = selector_loss.new_zeros(())
                     peak_aux_loss = selector_loss.new_zeros(())
                     oos_loss = selector_loss.new_zeros(())
@@ -4443,29 +4784,8 @@ def train_mssubsetnet():
                             candidate_mask=topk_candidate_mask_train,
                         )
 
-                    teacher_ratio_plan = _rerank_teacher_ratio_for_epoch(
-                        epoch,
-                        selector_only_warmup_epochs,
-                        rerank_mix_stage1_epochs,
-                        rerank_mix_stage2_epochs,
-                        rerank_mix_teacher_ratio_stage1,
-                        rerank_mix_teacher_ratio_stage2,
-                        rerank_mix_teacher_ratio_stage3,
-                    )
-
-                    rerank_mask, rerank_teacher_ratio = _mix_teacher_model_masks(
-                        teacher_topk_mask,
-                        model_topk_mask_train,
-                        teacher_ratio_plan,
-                    )
-
-                    if not torch.is_tensor(rerank_mask):
-                        if torch.is_tensor(teacher_topk_mask):
-                            rerank_mask = teacher_topk_mask
-                            rerank_teacher_ratio = 1.0
-                        else:
-                            rerank_mask = model_topk_mask_train
-                            rerank_teacher_ratio = 0.0
+                    rerank_mask = model_topk_mask_train
+                    rerank_teacher_ratio = 0.0
 
                     batch_with_teacher = dict(batch)
                     if torch.is_tensor(teacher_target_full):
@@ -4499,31 +4819,72 @@ def train_mssubsetnet():
                     if not torch.is_tensor(formula_entropy_loss):
                         formula_entropy_loss = pred_spect_coarse.sum() * 0.0
 
-                    teacher_target_rerank = batch_rerank.get('teacher_formula_probs', None)
-                    teacher_mask_rerank = batch_rerank.get('formulae_mask', None)
+                    rerank_logits_pool = res.get('rerank_logits_pool', None)
+                    pool_idx = res.get('selector_pool_idx', None)
+                    rerank_loss = pred_spect_coarse.sum() * 0.0
+                    rerank_kl = pred_spect_coarse.sum() * 0.0
+                    rerank_bce = pred_spect_coarse.sum() * 0.0
 
-                    if os.environ.get("USE_GROUP_AWARE_KL", "0") == "1":
-                        main_candidate_kl = _group_masked_candidate_kl(
-                            formulae_scores,
-                            teacher_target_rerank,
-                            teacher_mask_rerank,
-                            group_id=batch_rerank.get("formulae_instance_group_id", None),
-                        )
-
-                        if not torch.is_tensor(main_candidate_kl):
-                            main_candidate_kl = _masked_candidate_kl(
-                                formulae_scores,
-                                teacher_target_rerank,
-                                teacher_mask_rerank,
+                    if torch.is_tensor(rerank_logits_pool) and torch.is_tensor(pool_idx):
+                        formulae_mask_rerank = batch_rerank.get('formulae_mask', None)
+                        if torch.is_tensor(formulae_mask_rerank):
+                            formulae_mask_rerank = formulae_mask_rerank.float()
+                            if formulae_mask_rerank.dim() > 2:
+                                formulae_mask_rerank = formulae_mask_rerank.reshape(
+                                    formulae_mask_rerank.shape[0], -1
+                                )
+                        else:
+                            formulae_mask_rerank = torch.ones(
+                                (int(rerank_logits_pool.shape[0]), int(rerank_logits_pool.shape[1])),
+                                dtype=torch.float32,
+                                device=rerank_logits_pool.device,
                             )
-                    else:
-                        main_candidate_kl = _masked_candidate_kl(
-                            formulae_scores,
-                            teacher_target_rerank,
-                            teacher_mask_rerank,
+
+                        selector_quality_rerank, _, _, _ = build_candidate_local_quality_target(
+                            batch=batch_rerank,
+                            formulae_mask=formulae_mask_rerank,
+                            official_bin_n=official_bin_n,
                         )
-                    if not torch.is_tensor(main_candidate_kl):
-                        main_candidate_kl = pred_spect_coarse.sum() * 0.0
+
+                        rerank_target_dist, rerank_pos, rerank_pool_mask = (
+                            build_setcover_rerank_target_from_quality(
+                                selector_quality=selector_quality_rerank.detach(),
+                                pool_idx=pool_idx,
+                                formulae_mask=formulae_mask_rerank,
+                            )
+                        )
+
+                        logp_pool = F.log_softmax(
+                            rerank_logits_pool.masked_fill(
+                                rerank_pool_mask <= 0.5,
+                                _neg_mask_fill_value(rerank_logits_pool),
+                            ),
+                            dim=1,
+                        )
+
+                        rerank_kl = F.kl_div(
+                            logp_pool,
+                            rerank_target_dist,
+                            reduction='none',
+                        ).sum(dim=1)
+
+                        valid_rows = (rerank_pool_mask.sum(dim=1) > 0).float()
+                        rerank_kl = (
+                            rerank_kl * valid_rows
+                        ).sum() / valid_rows.sum().clamp_min(1.0)
+
+                        rerank_bce_raw = F.binary_cross_entropy_with_logits(
+                            rerank_logits_pool,
+                            rerank_pos,
+                            reduction='none',
+                        )
+                        rerank_bce = (
+                            rerank_bce_raw * rerank_pool_mask
+                        ).sum() / rerank_pool_mask.sum().clamp_min(1.0)
+
+                        rerank_loss = float(rerank_kl_weight) * rerank_kl + float(rerank_bce_weight) * rerank_bce
+
+                    main_candidate_kl = rerank_loss
 
                     if torch.is_tensor(pred_spect_official) and torch.is_tensor(true_official_dense):
                         official_spectral_loss = compute_official_dense_spectral_loss(
@@ -4609,6 +4970,13 @@ def train_mssubsetnet():
             train_precursor_loss_vals.append(float(precursor_loss.detach().item()))
             train_fn_loss_vals.append(float(fn_loss.detach().item()))
             train_selector_loss_vals.append(float(selector_loss.detach().item()))
+            train_selector_bce_vals.append(float(selector_bce_loss.detach().item()))
+            train_selector_kl_vals.append(float(selector_kl_loss.detach().item()))
+            train_selector_quality_mean_vals.append(float(selector_quality_mean.detach().item()))
+            train_selector_pos_rate_vals.append(float(selector_pos_rate.detach().item()))
+            train_rerank_kl_vals.append(float(rerank_kl.detach().item()))
+            train_rerank_bce_vals.append(float(rerank_bce.detach().item()))
+            train_rerank_loss_vals.append(float(main_candidate_kl.detach().item()))
             train_rerank_teacher_ratio_vals.append(float(rerank_teacher_ratio))
             train_false_support_vals.append(float(false_support_loss.detach().item()))
         model.eval()    
@@ -4631,6 +4999,13 @@ def train_mssubsetnet():
         official_false_pred_n_vals = []
         official_pred_int_on_true_vals = []
         val_selector_loss_vals = []
+        val_selector_bce_vals = []
+        val_selector_kl_vals = []
+        val_selector_quality_mean_vals = []
+        val_selector_pos_rate_vals = []
+        val_rerank_kl_vals = []
+        val_rerank_bce_vals = []
+        val_rerank_loss_vals = []
         val_model_topk_teacher_recall_vals = []     
         val_active_teacher_recall_vals = []
         val_fragaux_teacher_recall_vals = []
@@ -4646,6 +5021,10 @@ def train_mssubsetnet():
         val_selector_precision_64_vals = []
         val_selector_precision_128_vals = []
         val_selector_precision_256_vals = []
+        val_selector_quality_mean_32_vals = []
+        val_selector_quality_mean_64_vals = []
+        val_selector_quality_mean_128_vals = []
+        val_selector_quality_mean_256_vals = []
         val_selected_true_hit_mass_32_vals = []
         val_selected_true_hit_mass_64_vals = []
         val_selected_true_hit_mass_128_vals = []
@@ -4675,6 +5054,27 @@ def train_mssubsetnet():
                     break
                 processed = prepare_batch_cpu(raw_batch, spect_bin)
                 batch = move_batch_to_device(processed, device)
+
+                formulae_mask = batch.get('formulae_mask', None)
+                if torch.is_tensor(formulae_mask):
+                    formulae_mask = formulae_mask.float()
+                    if formulae_mask.dim() > 2:
+                        formulae_mask = formulae_mask.reshape(formulae_mask.shape[0], -1)
+                else:
+                    formulae_mask = None
+
+                selector_quality = None
+                selector_pos_label = None
+                selector_valid_mask = None
+                selector_extra = {}
+                if torch.is_tensor(formulae_mask):
+                    selector_quality, selector_pos_label, selector_valid_mask, selector_extra = (
+                        build_candidate_local_quality_target(
+                            batch=batch,
+                            formulae_mask=formulae_mask,
+                            official_bin_n=official_bin_n,
+                        )
+                    )
 
                 # teacher target 只用于诊断 KL，不用于验证 forward
                 teacher_target_full = compute_formula_target_probs_from_batch(
@@ -4725,6 +5125,10 @@ def train_mssubsetnet():
                 else:
                     teacher_topk_probs = None
                     teacher_topk_mask = None
+
+                if torch.is_tensor(selector_pos_label):
+                    teacher_topk_mask = selector_pos_label
+                    teacher_topk_probs = None
 
                 teacher_target_full = _renormalize_target_probs(
                     teacher_target_full,
@@ -4814,31 +5218,62 @@ def train_mssubsetnet():
                     # Biased logits only for topK selection.
                     selector_logits_for_topk = _apply_selector_aux_logit_bias(selector_logits, batch)
 
-                    selector_mask_full = batch.get('formulae_mask', None)
-                    selector_target_mask = teacher_topk_mask
-
                     val_selector_bce = res_full['spect'].sum() * 0.0
                     val_selector_kl = res_full['spect'].sum() * 0.0
+                    val_selector_pos_rate = res_full['spect'].sum() * 0.0
+                    val_selector_quality_mean = res_full['spect'].sum() * 0.0
 
-                    if torch.is_tensor(selector_target_mask):
-                        val_selector_bce_tmp = _masked_selector_bce(
-                            selector_logits_for_loss,
-                            selector_target_mask,
-                            selector_mask_full,
-                            pos_weight=selector_pos_weight,
+                    if (
+                        torch.is_tensor(selector_quality)
+                        and torch.is_tensor(selector_pos_label)
+                        and torch.is_tensor(selector_valid_mask)
+                    ):
+                        selector_logits_masked = selector_logits_for_loss.masked_fill(
+                            selector_valid_mask <= 0.5, 0.0
                         )
-                        if torch.is_tensor(val_selector_bce_tmp):
-                            val_selector_bce = val_selector_bce_tmp
+                        bce_raw = F.binary_cross_entropy_with_logits(
+                            selector_logits_masked,
+                            selector_pos_label,
+                            reduction='none',
+                            pos_weight=selector_logits_for_loss.new_tensor([float(selector_pos_weight)]),
+                        )
+                        val_selector_bce = (
+                            bce_raw * selector_valid_mask
+                        ).sum() / selector_valid_mask.sum().clamp_min(1.0)
 
-                    if torch.is_tensor(teacher_topk_probs):
-                        val_selector_kl_tmp = _masked_candidate_kl(
-                            selector_logits_for_loss,
-                            teacher_topk_probs,
-                            selector_mask_full,
+                        try:
+                            gamma = float(os.environ.get("QUALITY_TARGET_GAMMA", "2.0"))
+                        except Exception:
+                            gamma = 2.0
+
+                        target_dist = selector_quality.clamp_min(0.0) ** gamma
+                        target_dist = target_dist * selector_valid_mask
+                        target_dist = target_dist / target_dist.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+                        log_probs = F.log_softmax(
+                            selector_logits_for_loss.masked_fill(
+                                selector_valid_mask <= 0.5,
+                                _neg_mask_fill_value(selector_logits_for_loss),
+                            ),
+                            dim=1,
                         )
-                        if torch.is_tensor(val_selector_kl_tmp):
-                            val_selector_kl = val_selector_kl_tmp
-                    
+
+                        val_selector_kl = F.kl_div(
+                            log_probs,
+                            target_dist,
+                            reduction='none',
+                        ).sum(dim=1)
+
+                        valid_rows = (selector_valid_mask.sum(dim=1) > 0).float()
+                        val_selector_kl = (
+                            val_selector_kl * valid_rows
+                        ).sum() / valid_rows.sum().clamp_min(1.0)
+
+                        val_selector_pos_rate = (
+                            selector_pos_label.sum() / selector_valid_mask.sum().clamp_min(1.0)
+                        )
+                        val_selector_quality_mean = selector_quality.mean()
+
                     val_selector_loss = (
                         float(selector_bce_weight) * val_selector_bce
                         + float(selector_kl_weight) * val_selector_kl
@@ -4870,6 +5305,14 @@ def train_mssubsetnet():
 
                     k_list = [32, 64, 128, 256]
                     selector_masks = {}
+                    quality_metrics = {}
+                    if torch.is_tensor(selector_quality) and torch.is_tensor(formulae_mask):
+                        quality_metrics = compute_selector_quality_metrics(
+                            selector_logits_for_topk,
+                            selector_quality,
+                            formulae_mask,
+                            ks=k_list,
+                        )
                     for k in k_list:
                         if os.environ.get("USE_GROUP_UNIQUE_MODEL_TOPK", "0") == "1":
                             selector_masks[k] = _build_group_unique_topk_mask_from_scores(
@@ -4922,7 +5365,18 @@ def train_mssubsetnet():
                     for k in k_list:
                         mask_k = selector_masks.get(k, None)
                         rec_k = _mask_recall(mask_k, teacher_topk_mask)
-                        prec_k = _mask_precision(mask_k, teacher_topk_mask)
+                        prec_k = quality_metrics.get(
+                            f'selector_precision_at_{k}',
+                            _mask_precision(mask_k, teacher_topk_mask),
+                        )
+                        q_mean_k = quality_metrics.get(
+                            f'selector_quality_mean_at_{k}',
+                            float('nan'),
+                        )
+                        if torch.is_tensor(prec_k):
+                            prec_k = float(prec_k.detach().cpu().item())
+                        if torch.is_tensor(q_mean_k):
+                            q_mean_k = float(q_mean_k.detach().cpu().item())
                         stats_k = compute_candidate_support_stats(
                             batch,
                             mask_k,
@@ -4933,24 +5387,28 @@ def train_mssubsetnet():
                         if k == 32:
                             val_selector_recall_32_vals.append(rec_k)
                             val_selector_precision_32_vals.append(prec_k)
+                            val_selector_quality_mean_32_vals.append(q_mean_k)
                             if stats_k:
                                 val_selected_true_hit_mass_32_vals.append(stats_k.get('pred_int_on_true', float('nan')))
                                 val_selected_false_mass_32_vals.append(stats_k.get('false_support', float('nan')))
                         elif k == 64:
                             val_selector_recall_64_vals.append(rec_k)
                             val_selector_precision_64_vals.append(prec_k)
+                            val_selector_quality_mean_64_vals.append(q_mean_k)
                             if stats_k:
                                 val_selected_true_hit_mass_64_vals.append(stats_k.get('pred_int_on_true', float('nan')))
                                 val_selected_false_mass_64_vals.append(stats_k.get('false_support', float('nan')))
                         elif k == 128:
                             val_selector_recall_128_vals.append(rec_k)
                             val_selector_precision_128_vals.append(prec_k)
+                            val_selector_quality_mean_128_vals.append(q_mean_k)
                             if stats_k:
                                 val_selected_true_hit_mass_128_vals.append(stats_k.get('pred_int_on_true', float('nan')))
                                 val_selected_false_mass_128_vals.append(stats_k.get('false_support', float('nan')))
                         elif k == 256:
                             val_selector_recall_256_vals.append(rec_k)
                             val_selector_precision_256_vals.append(prec_k)
+                            val_selector_quality_mean_256_vals.append(q_mean_k)
                             if stats_k:
                                 val_selected_true_hit_mass_256_vals.append(stats_k.get('pred_int_on_true', float('nan')))
                                 val_selected_false_mass_256_vals.append(stats_k.get('false_support', float('nan')))
@@ -5054,32 +5512,72 @@ def train_mssubsetnet():
                         val_false_support = pred_spect_coarse.sum() * 0.0
 
 
-                teacher_target_val_rerank = batch_rerank.get('teacher_formula_probs', None)
-                teacher_mask_val_rerank = batch_rerank.get('formulae_mask', None)
+                rerank_logits_pool = res.get('rerank_logits_pool', None)
+                pool_idx = res.get('selector_pool_idx', None)
+                val_rerank_kl = pred_spect_coarse.sum() * 0.0
+                val_rerank_bce = pred_spect_coarse.sum() * 0.0
+                val_rerank_loss = pred_spect_coarse.sum() * 0.0
 
-                if os.environ.get("USE_GROUP_AWARE_KL", "0") == "1":
-                    val_main_kl = _group_masked_candidate_kl(
-                        formulae_scores,
-                        teacher_target_val_rerank,
-                        teacher_mask_val_rerank,
-                        group_id=batch_rerank.get("formulae_instance_group_id", None),
-                    )
-
-                    if not torch.is_tensor(val_main_kl):
-                        val_main_kl = _masked_candidate_kl(
-                            formulae_scores,
-                            teacher_target_val_rerank,
-                            teacher_mask_val_rerank,
+                if torch.is_tensor(rerank_logits_pool) and torch.is_tensor(pool_idx):
+                    formulae_mask_rerank = batch_rerank.get('formulae_mask', None)
+                    if torch.is_tensor(formulae_mask_rerank):
+                        formulae_mask_rerank = formulae_mask_rerank.float()
+                        if formulae_mask_rerank.dim() > 2:
+                            formulae_mask_rerank = formulae_mask_rerank.reshape(
+                                formulae_mask_rerank.shape[0], -1
+                            )
+                    else:
+                        formulae_mask_rerank = torch.ones(
+                            (int(rerank_logits_pool.shape[0]), int(rerank_logits_pool.shape[1])),
+                            dtype=torch.float32,
+                            device=rerank_logits_pool.device,
                         )
-                else:
-                    val_main_kl = _masked_candidate_kl(
-                        formulae_scores,
-                        teacher_target_val_rerank,
-                        teacher_mask_val_rerank,
+
+                    selector_quality_rerank, _, _, _ = build_candidate_local_quality_target(
+                        batch=batch_rerank,
+                        formulae_mask=formulae_mask_rerank,
+                        official_bin_n=official_bin_n,
                     )
 
-                if not torch.is_tensor(val_main_kl):
-                    val_main_kl = pred_spect_coarse.sum() * 0.0
+                    rerank_target_dist, rerank_pos, rerank_pool_mask = (
+                        build_setcover_rerank_target_from_quality(
+                            selector_quality=selector_quality_rerank.detach(),
+                            pool_idx=pool_idx,
+                            formulae_mask=formulae_mask_rerank,
+                        )
+                    )
+
+                    logp_pool = F.log_softmax(
+                        rerank_logits_pool.masked_fill(
+                            rerank_pool_mask <= 0.5,
+                            _neg_mask_fill_value(rerank_logits_pool),
+                        ),
+                        dim=1,
+                    )
+
+                    val_rerank_kl = F.kl_div(
+                        logp_pool,
+                        rerank_target_dist,
+                        reduction='none',
+                    ).sum(dim=1)
+
+                    valid_rows = (rerank_pool_mask.sum(dim=1) > 0).float()
+                    val_rerank_kl = (
+                        val_rerank_kl * valid_rows
+                    ).sum() / valid_rows.sum().clamp_min(1.0)
+
+                    rerank_bce_raw = F.binary_cross_entropy_with_logits(
+                        rerank_logits_pool,
+                        rerank_pos,
+                        reduction='none',
+                    )
+                    val_rerank_bce = (
+                        rerank_bce_raw * rerank_pool_mask
+                    ).sum() / rerank_pool_mask.sum().clamp_min(1.0)
+
+                    val_rerank_loss = float(rerank_kl_weight) * val_rerank_kl + float(rerank_bce_weight) * val_rerank_bce
+
+                val_main_kl = val_rerank_loss
 
                 val_peak_aux = _compute_peak_aux_loss_from_batch(
                     batch_rerank,
@@ -5150,6 +5648,13 @@ def train_mssubsetnet():
                 val_precursor_loss_vals.append(float(val_precursor_loss.detach().item()))
                 val_fn_loss_vals.append(float(val_fn_loss.detach().item()))
                 val_selector_loss_vals.append(float(val_selector_loss.detach().item()))
+                val_selector_bce_vals.append(float(val_selector_bce.detach().item()))
+                val_selector_kl_vals.append(float(val_selector_kl.detach().item()))
+                val_selector_quality_mean_vals.append(float(val_selector_quality_mean.detach().item()))
+                val_selector_pos_rate_vals.append(float(val_selector_pos_rate.detach().item()))
+                val_rerank_kl_vals.append(float(val_rerank_kl.detach().item()))
+                val_rerank_bce_vals.append(float(val_rerank_bce.detach().item()))
+                val_rerank_loss_vals.append(float(val_main_kl.detach().item()))
                 val_model_topk_teacher_recall_vals.append(float(model_topk_teacher_recall))
                 val_active_teacher_recall_vals.append(float(active_teacher_recall))
                 val_fragaux_teacher_recall_vals.append(float(fragaux_teacher_recall))
@@ -5193,7 +5698,15 @@ def train_mssubsetnet():
                         epoch_worst_overlap_sparse = cur_sparse
         avg_train_loss = _finite_mean(train_losses)
         avg_train_selector_loss = _finite_mean(train_selector_loss_vals)
+        avg_train_selector_bce = _finite_mean(train_selector_bce_vals)
+        avg_train_selector_kl = _finite_mean(train_selector_kl_vals)
+        avg_train_selector_quality_mean = _finite_mean(train_selector_quality_mean_vals)
+        avg_train_selector_pos_rate = _finite_mean(train_selector_pos_rate_vals)
         avg_val_selector_loss = _finite_mean(val_selector_loss_vals)
+        avg_val_selector_bce = _finite_mean(val_selector_bce_vals)
+        avg_val_selector_kl = _finite_mean(val_selector_kl_vals)
+        avg_val_selector_quality_mean = _finite_mean(val_selector_quality_mean_vals)
+        avg_val_selector_pos_rate = _finite_mean(val_selector_pos_rate_vals)
         avg_val_model_topk_teacher_recall = _finite_mean(val_model_topk_teacher_recall_vals)
         avg_val_active_teacher_recall = _finite_mean(val_active_teacher_recall_vals)
         avg_val_fragaux_teacher_recall = _finite_mean(val_fragaux_teacher_recall_vals)
@@ -5202,6 +5715,9 @@ def train_mssubsetnet():
         avg_val_fragaux_model_topk_ratio_128 = _finite_mean(val_fragaux_model_topk_ratio_128_vals)
         avg_val_fragaux_model_topk_ratio_256 = _finite_mean(val_fragaux_model_topk_ratio_256_vals)
         avg_train_rerank_teacher_ratio = _finite_mean(train_rerank_teacher_ratio_vals)
+        avg_train_rerank_kl = _finite_mean(train_rerank_kl_vals)
+        avg_train_rerank_bce = _finite_mean(train_rerank_bce_vals)
+        avg_train_rerank_loss = _finite_mean(train_rerank_loss_vals)
         avg_train_main_kl = _finite_mean(train_main_kl_vals)
         avg_train_official_spectral = _finite_mean(train_official_spectral_vals)
         avg_train_peak_aux = _finite_mean(train_peak_aux_vals)
@@ -5213,6 +5729,9 @@ def train_mssubsetnet():
         avg_val_loss = _finite_mean(val_losses)
         avg_val_formula_entropy = _finite_mean(val_formula_entropy_vals)
         avg_val_main_kl = _finite_mean(val_main_kl_vals)
+        avg_val_rerank_kl = _finite_mean(val_rerank_kl_vals)
+        avg_val_rerank_bce = _finite_mean(val_rerank_bce_vals)
+        avg_val_rerank_loss = _finite_mean(val_rerank_loss_vals)
         avg_val_official_spectral = _finite_mean(val_official_spectral_vals)
         avg_val_peak_aux = _finite_mean(val_peak_aux_vals)
         avg_val_oos = _finite_mean(val_oos_vals)
@@ -5236,6 +5755,10 @@ def train_mssubsetnet():
         avg_val_selector_precision_64 = _finite_mean(val_selector_precision_64_vals)
         avg_val_selector_precision_128 = _finite_mean(val_selector_precision_128_vals)
         avg_val_selector_precision_256 = _finite_mean(val_selector_precision_256_vals)
+        avg_val_selector_quality_mean_32 = _finite_mean(val_selector_quality_mean_32_vals)
+        avg_val_selector_quality_mean_64 = _finite_mean(val_selector_quality_mean_64_vals)
+        avg_val_selector_quality_mean_128 = _finite_mean(val_selector_quality_mean_128_vals)
+        avg_val_selector_quality_mean_256 = _finite_mean(val_selector_quality_mean_256_vals)
         avg_val_selected_true_hit_mass_32 = _finite_mean(val_selected_true_hit_mass_32_vals)
         avg_val_selected_true_hit_mass_64 = _finite_mean(val_selected_true_hit_mass_64_vals)
         avg_val_selected_true_hit_mass_128 = _finite_mean(val_selected_true_hit_mass_128_vals)
@@ -5276,6 +5799,17 @@ def train_mssubsetnet():
             model_select_metric = (
                 -avg_val_selector_loss
                 if np.isfinite(avg_val_selector_loss)
+                else -1e9
+            )
+
+        elif model_select_metric_name in (
+            "selector_precision_at_256",
+            "selector_precision_256",
+            "selector_precision",
+        ):
+            model_select_metric = (
+                avg_val_selector_precision_256
+                if np.isfinite(avg_val_selector_precision_256)
                 else -1e9
             )
 
@@ -5366,7 +5900,14 @@ def train_mssubsetnet():
             f'train_loss={avg_train_loss:.4f} | '
             f'train_rerank_teacher_ratio={avg_train_rerank_teacher_ratio:.4f} | '
             f'train_selector_loss={avg_train_selector_loss:.4f} | '
+            f'train_selector_bce={avg_train_selector_bce:.4f} | '
+            f'train_selector_kl={avg_train_selector_kl:.4f} | '
+            f'train_selector_quality_mean={avg_train_selector_quality_mean:.4f} | '
+            f'train_selector_pos_rate={avg_train_selector_pos_rate:.4f} | '
             f'train_main_candidate_kl={avg_train_main_kl:.4f} | '
+            f'train_rerank_kl={avg_train_rerank_kl:.4f} | '
+            f'train_rerank_bce={avg_train_rerank_bce:.4f} | '
+            f'train_rerank_loss={avg_train_rerank_loss:.4f} | '
             f'train_official_spectral={avg_train_official_spectral:.4f} | '
             f'train_peak_aux={avg_train_peak_aux:.4f} | '
             f'train_oos={avg_train_oos:.4f} | '
@@ -5376,6 +5917,10 @@ def train_mssubsetnet():
             f'train_fn_loss={avg_train_fn_loss:.4f} | '
             f'val_loss={avg_val_loss:.4f} | '
             f'val_selector_loss={avg_val_selector_loss:.4f} | '
+            f'val_selector_bce={avg_val_selector_bce:.4f} | '
+            f'val_selector_kl={avg_val_selector_kl:.4f} | '
+            f'val_selector_quality_mean={avg_val_selector_quality_mean:.4f} | '
+            f'val_selector_pos_rate={avg_val_selector_pos_rate:.4f} | '
             f'val_model_topk_teacher_recall@{model_topk_eval}={avg_val_model_topk_teacher_recall:.4f} | '
             f'val_active_teacher_recall={avg_val_active_teacher_recall:.4f} | '
             f'val_fragaux_teacher_recall={avg_val_fragaux_teacher_recall:.4f} | '
@@ -5391,7 +5936,14 @@ def train_mssubsetnet():
             f'val_selector_precision@64={avg_val_selector_precision_64:.4f} | '
             f'val_selector_precision@128={avg_val_selector_precision_128:.4f} | '
             f'val_selector_precision@256={avg_val_selector_precision_256:.4f} | '
+            f'val_selector_quality_mean@32={avg_val_selector_quality_mean_32:.4f} | '
+            f'val_selector_quality_mean@64={avg_val_selector_quality_mean_64:.4f} | '
+            f'val_selector_quality_mean@128={avg_val_selector_quality_mean_128:.4f} | '
+            f'val_selector_quality_mean@256={avg_val_selector_quality_mean_256:.4f} | '
             f'val_main_candidate_kl={avg_val_main_kl:.4f} | '
+            f'val_rerank_kl={avg_val_rerank_kl:.4f} | '
+            f'val_rerank_bce={avg_val_rerank_bce:.4f} | '
+            f'val_rerank_loss={avg_val_rerank_loss:.4f} | '
             f'val_official_spectral={avg_val_official_spectral:.4f} | '
             f'val_peak_aux={avg_val_peak_aux:.4f} | '
             f'val_oos={avg_val_oos:.4f} | '
@@ -5437,8 +5989,14 @@ def train_mssubsetnet():
         history['train_fn_loss'].append(avg_train_fn_loss)
         history['val_fn_loss'].append(avg_val_fn_loss)
         history['train_rerank_teacher_ratio'].append(avg_train_rerank_teacher_ratio)
+        history['train_rerank_kl'].append(avg_train_rerank_kl)
+        history['train_rerank_bce'].append(avg_train_rerank_bce)
+        history['train_rerank_loss'].append(avg_train_rerank_loss)
         history['val_loss'].append(avg_val_loss)
         history['val_main_candidate_kl'].append(avg_val_main_kl)
+        history['val_rerank_kl'].append(avg_val_rerank_kl)
+        history['val_rerank_bce'].append(avg_val_rerank_bce)
+        history['val_rerank_loss'].append(avg_val_rerank_loss)
         history['val_official_spectral_loss'].append(avg_val_official_spectral)
         history['val_peak_aux'].append(avg_val_peak_aux)
         history['val_oos_loss'].append(avg_val_oos)
@@ -5448,6 +6006,14 @@ def train_mssubsetnet():
         history['val_topk_peak_recall@20'].append(avg_val_recall)
         history['val_matched_intensity_coverage'].append(avg_val_cov)
         history['train_selector_loss'].append(avg_train_selector_loss)
+        history['train_selector_bce'].append(avg_train_selector_bce)
+        history['train_selector_kl'].append(avg_train_selector_kl)
+        history['train_selector_quality_mean'].append(avg_train_selector_quality_mean)
+        history['train_selector_pos_rate'].append(avg_train_selector_pos_rate)
+        history['val_selector_bce'].append(avg_val_selector_bce)
+        history['val_selector_kl'].append(avg_val_selector_kl)
+        history['val_selector_quality_mean'].append(avg_val_selector_quality_mean)
+        history['val_selector_pos_rate'].append(avg_val_selector_pos_rate)
         history['val_selector_loss'].append(avg_val_selector_loss)
         history['val_model_topk_teacher_recall'].append(avg_val_model_topk_teacher_recall)
         history['val_active_teacher_recall'].append(avg_val_active_teacher_recall)
@@ -5464,6 +6030,10 @@ def train_mssubsetnet():
         history['val_selector_precision@64'].append(avg_val_selector_precision_64)
         history['val_selector_precision@128'].append(avg_val_selector_precision_128)
         history['val_selector_precision@256'].append(avg_val_selector_precision_256)
+        history['val_selector_quality_mean@32'].append(avg_val_selector_quality_mean_32)
+        history['val_selector_quality_mean@64'].append(avg_val_selector_quality_mean_64)
+        history['val_selector_quality_mean@128'].append(avg_val_selector_quality_mean_128)
+        history['val_selector_quality_mean@256'].append(avg_val_selector_quality_mean_256)
         history['val_selected_true_hit_mass@32'].append(avg_val_selected_true_hit_mass_32)
         history['val_selected_true_hit_mass@64'].append(avg_val_selected_true_hit_mass_64)
         history['val_selected_true_hit_mass@128'].append(avg_val_selected_true_hit_mass_128)

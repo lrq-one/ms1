@@ -24,6 +24,30 @@ def _neg_mask_fill_value(x):
             return -1e9
     return -1e9
 
+_TARGET_LEAKAGE_KEYS = {
+    'spect',
+    'spect_raw',
+
+    'true_official_idx',
+    'true_official_intensity',
+    'true_top20_official_idx',
+    'true_top20_official_intensity',
+    'true_all_official_idx',
+    'true_all_official_intensity',
+
+    'true_precursor_bin',
+    'true_precursor_intensity',
+    'true_precursor_prob_in_all',
+    'true_precursor_present',
+
+    'fragment_node_label',
+    'fragment_node_label_top20',
+    'fragment_node_true_intensity',
+    'fragment_node_true_intensity_share',
+
+    'teacher_formula_probs',
+}
+
 # Class overview: GraphVertSpect wraps graph encoder and formula-spectrum head.
 class GraphVertSpect(nn.Module):
     def __init__(
@@ -106,6 +130,82 @@ class GraphVertSpect(nn.Module):
             return g_features
 
         g_squeeze = g_features.squeeze(1)
+        allow_target_alignment = os.environ.get("MODEL_ALLOW_TARGET_ALIGNMENT_FEAT", "0") == "1"
+        strict_kwarg_whitelist = os.environ.get("STRICT_MODEL_KWARG_WHITELIST", "1") == "1"
+
+        safe_kwargs = {}
+        for kk, vv in kwargs.items():
+            if (not allow_target_alignment) and kk in _TARGET_LEAKAGE_KEYS:
+                if os.environ.get("DEBUG_TARGET_LEAKAGE_CHECK", "0") == "1":
+                    print(f"[TARGET_LEAKAGE_BLOCKED] key={kk}", flush=True)
+                continue
+            safe_kwargs[kk] = vv
+
+        if strict_kwarg_whitelist:
+            allowed_model_keys = {
+                # condition
+                'ce',
+                'adduct',
+                'instrument_type',
+                'ms_level',
+                'precursor_mz',
+                'ce_missing',
+                'adduct_missing',
+                'instrument_missing',
+                'ms_level_missing',
+                'precursor_mz_missing',
+
+                # candidate masks / aux
+                'formulae_mask',
+                'formulae_aux_feat',
+                'formulae_frag_aux_feat',
+                'formulae_active_mask',
+                'formulae_prior_score',
+                'formulae_source_flag',
+                'formulae_break_depth',
+                'formulae_ring_cut_flag',
+
+                # official candidate peaks (candidate-generated, not target)
+                'formulae_peaks_official_idx',
+                'formulae_peaks_official_intensity',
+                'formulae_peaks_official_idx_agg',
+                'formulae_peaks_official_intensity_agg',
+
+                # source-instance metadata
+                'formulae_instance_is_source',
+                'formulae_instance_group_id',
+                'formulae_instance_depth',
+                'formulae_instance_h_shift',
+
+                # fragment-node candidate inputs, not labels
+                'fragment_node_mz',
+                'fragment_node_intensity',
+                'fragment_node_local_feat',
+                'fragment_node_depth',
+                'fragment_node_h_shift',
+                'fragment_node_is_brics',
+                'fragment_node_ring_cut',
+                'fragment_node_atom_count',
+                'fragment_node_cut_count',
+                'fragment_node_source_type',
+                'fragment_node_mask',
+                'fragment_node_formula',
+                'fragment_node_official_idx',
+                'fragment_node_group_formula_id',
+                'fragment_node_n_valid',
+                'fragment_node_bin_dup_count',
+
+                # misc
+                'formulae_peaks',
+                'formula_topk_orig_idx',
+                'selector_only_forward',
+            }
+
+            if allow_target_alignment:
+                allowed_model_keys = allowed_model_keys | set(_TARGET_LEAKAGE_KEYS)
+
+            safe_kwargs = {kk: vv for kk, vv in safe_kwargs.items() if kk in allowed_model_keys}
+
         pred_dense_spect_dict = self.spect_out(
             g_squeeze,
             input_mask,
@@ -116,7 +216,7 @@ class GraphVertSpect(nn.Module):
             vert_element_oh=vert_element_oh,
             adj_oh=adj_oh,
             formula_frag_count=formula_frag_count,
-            **kwargs,
+            **safe_kwargs,
         )
 
         pred_dense_spect = pred_dense_spect_dict['spect_out']
@@ -189,6 +289,11 @@ class MolAttentionGRUNewSparse(nn.Module):
             self.fragment_local_aux_dim = max(0, int(fragment_local_aux_dim))
         except Exception:
             self.fragment_local_aux_dim = 0
+        try:
+            self.fragment_local_aux_scale = float(os.environ.get("FRAGMENT_LOCAL_AUX_SCALE", "1.0"))
+        except Exception:
+            self.fragment_local_aux_scale = 1.0
+        self.gate_fragment_local_aux = os.environ.get("GATE_FRAGMENT_LOCAL_AUX", "1") == "1"
         self.peak_support_feat_dim = 8
         self.peak_support_proj_dim = 16
         self.peak_support_proj = nn.Sequential(
@@ -429,6 +534,63 @@ class MolAttentionGRUNewSparse(nn.Module):
                 flat = torch.cat([flat, torch.zeros((pad_n,), dtype=flat.dtype, device=device)], dim=0)
             x = flat[:batch_n].view(batch_n, 1)
         return x.float()
+
+    def _coerce_frag_aux(self, x, batch_n, formula_n, device):
+        if x is None or self.fragment_local_aux_dim <= 0:
+            return None
+
+        if not torch.is_tensor(x):
+            try:
+                x = torch.as_tensor(x)
+            except Exception:
+                return None
+
+        x = x.to(device=device, dtype=torch.float32)
+
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+        elif x.dim() > 3:
+            x = x.reshape(x.shape[0], x.shape[1], -1)
+
+        if x.dim() != 3:
+            return None
+
+        if x.shape[0] < batch_n:
+            pad = torch.zeros(
+                (batch_n - x.shape[0], x.shape[1], x.shape[2]),
+                dtype=x.dtype,
+                device=device,
+            )
+            x = torch.cat([x, pad], dim=0)
+        x = x[:batch_n]
+
+        if x.shape[1] < formula_n:
+            pad = torch.zeros(
+                (batch_n, formula_n - x.shape[1], x.shape[2]),
+                dtype=x.dtype,
+                device=device,
+            )
+            x = torch.cat([x, pad], dim=1)
+        x = x[:, :formula_n, :]
+
+        if x.shape[2] < self.fragment_local_aux_dim:
+            pad = torch.zeros(
+                (batch_n, formula_n, self.fragment_local_aux_dim - x.shape[2]),
+                dtype=x.dtype,
+                device=device,
+            )
+            x = torch.cat([x, pad], dim=-1)
+        x = x[:, :, :self.fragment_local_aux_dim]
+
+        return x
+
+    def _gather_candidates_3d(self, x, idx):
+        if (not torch.is_tensor(x)) or (not torch.is_tensor(idx)):
+            return None
+        B, K = idx.shape
+        D = x.shape[-1]
+        gather_idx = idx.unsqueeze(-1).expand(B, K, D)
+        return torch.gather(x, 1, gather_idx)
 
     def _to_vocab_index(self, x, batch_n, device, vocab_size):
         if x is None:
@@ -1273,42 +1435,33 @@ class MolAttentionGRUNewSparse(nn.Module):
         if true_idx is None:
             true_idx = kwargs.get('true_all_official_idx', None)
             true_val = kwargs.get('true_all_official_intensity', None)
-
-        
+        allow_target_alignment = os.environ.get("MODEL_ALLOW_TARGET_ALIGNMENT_FEAT", "0") == "1"
+        align_feat = None
+        if allow_target_alignment:
+            if self.training:
+                raise RuntimeError(
+                    "MODEL_ALLOW_TARGET_ALIGNMENT_FEAT=1 is forbidden during training: target leakage risk."
+                )
+            align_feat = self._build_candidate_true_alignment_feat(
+                batch_n=batch_n,
+                formula_n=formula_n,
+                device=device,
+                formulae_mask=formulae_mask,
+                off_idx=off_idx,
+                off_int=off_int,
+                true_idx=true_idx,
+                true_val=true_val,
+                official_bin_n=official_bin_n,
+                official_bin_width=official_bin_width,
+            )
 
         frag_aux = kwargs.get('formulae_frag_aux_feat', None)
-        frag_aux_t = None
-        if self.frag_aux_proj is not None:
-            if frag_aux is None:
-                frag_aux_t = torch.zeros((batch_n, formula_n, self.fragment_local_aux_dim), dtype=torch.float32, device=device)
-            else:
-                if not torch.is_tensor(frag_aux):
-                    frag_aux = torch.as_tensor(frag_aux)
-                frag_aux_t = frag_aux.to(device=device, dtype=torch.float32)
-                if frag_aux_t.dim() == 1:
-                    frag_aux_t = frag_aux_t.view(1, 1, -1)
-                elif frag_aux_t.dim() == 2:
-                    frag_aux_t = frag_aux_t.unsqueeze(0)
-                elif frag_aux_t.dim() > 3:
-                    frag_aux_t = frag_aux_t.reshape(frag_aux_t.shape[0], frag_aux_t.shape[1], -1)
-
-                if frag_aux_t.dim() != 3:
-                    frag_aux_t = torch.zeros((batch_n, formula_n, self.fragment_local_aux_dim), dtype=torch.float32, device=device)
-                else:
-                    if int(frag_aux_t.shape[0]) < batch_n:
-                        pad = torch.zeros((batch_n - int(frag_aux_t.shape[0]), int(frag_aux_t.shape[1]), int(frag_aux_t.shape[2])), dtype=frag_aux_t.dtype, device=device)
-                        frag_aux_t = torch.cat([frag_aux_t, pad], dim=0)
-                    frag_aux_t = frag_aux_t[:batch_n]
-
-                    if int(frag_aux_t.shape[1]) < formula_n:
-                        pad = torch.zeros((batch_n, formula_n - int(frag_aux_t.shape[1]), int(frag_aux_t.shape[2])), dtype=frag_aux_t.dtype, device=device)
-                        frag_aux_t = torch.cat([frag_aux_t, pad], dim=1)
-                    frag_aux_t = frag_aux_t[:, :formula_n, :]
-
-                    if int(frag_aux_t.shape[2]) < self.fragment_local_aux_dim:
-                        pad = torch.zeros((batch_n, formula_n, self.fragment_local_aux_dim - int(frag_aux_t.shape[2])), dtype=frag_aux_t.dtype, device=device)
-                        frag_aux_t = torch.cat([frag_aux_t, pad], dim=-1)
-                    frag_aux_t = frag_aux_t[:, :, :self.fragment_local_aux_dim]
+        frag_aux_t = self._coerce_frag_aux(
+            frag_aux,
+            batch_n=batch_n,
+            formula_n=formula_n,
+            device=device,
+        )
 
         base_parts = [formulae_encoded, vert_att_reduce, candidate_peak_feat]
         if self.formulae_aux_dim > 0:
@@ -1322,9 +1475,18 @@ class MolAttentionGRUNewSparse(nn.Module):
         base_h = F.relu(self.base_score_l1(base_in))
         base_h = F.relu(self.base_score_l2(base_h))
 
-        # ---- 后融合：fragment 辅助特征（保持原逻辑） ----
+        if align_feat is not None:
+            base_h = base_h + self.align_to_base_proj(align_feat)
+
+        frag_has_source = None
         if self.frag_aux_proj is not None and torch.is_tensor(frag_aux_t):
-            base_h = base_h + self.frag_aux_proj(frag_aux_t)
+            frag_has_source = (frag_aux_t[..., 0:1] > 0.5).float()
+            frag_h = self.frag_aux_proj(frag_aux_t)
+            if self.gate_fragment_local_aux:
+                frag_h = frag_h * frag_has_source
+            if torch.is_tensor(formulae_mask):
+                frag_h = frag_h * formulae_mask.unsqueeze(-1).float()
+            base_h = base_h + float(self.fragment_local_aux_scale) * frag_h
 
         # debug diagnostics for explanation matching
         matched_subset_per_sample = torch.zeros((batch_n,), dtype=torch.float32, device=device)
@@ -1502,31 +1664,69 @@ class MolAttentionGRUNewSparse(nn.Module):
         oos_feat = self.oos_norm(oos_feat)
         oos_logit = self.oos_head(oos_feat).squeeze(-1)
 
-        # -------- set-wise context scorer (v2b: loo + selector features) --------
-        sum_h = (base_h * mask3).sum(dim=1, keepdim=True)
-        cnt_h = mask3.sum(dim=1, keepdim=True)
+        selector_probs = torch.softmax(selector_logits, dim=-1)
+        selector_probs = selector_probs * formulae_mask
+        selector_probs = selector_probs / selector_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
 
-        loo_ctx = (sum_h - base_h) / (cnt_h - 1.0).clamp_min(1.0)
-        single_mask = (cnt_h <= 1.5).expand_as(base_h)
-        loo_ctx = torch.where(single_mask, torch.zeros_like(base_h), loo_ctx)
+        raw_rerank_topk = os.environ.get("RERANK_TOPK", "").strip()
+        try:
+            if raw_rerank_topk:
+                selector_topk = int(raw_rerank_topk)
+            else:
+                selector_topk = int(os.environ.get("SELECTOR_TOPK", "256"))
+        except Exception:
+            selector_topk = 256
+        pool_k = max(1, min(int(selector_topk), int(formula_n)))
+        pool_idx = torch.topk(selector_logits, k=pool_k, dim=1).indices
 
-        set_delta = base_h - loo_ctx
-        set_prod = base_h * loo_ctx
+        pool_hidden = self._gather_candidates_3d(base_h, pool_idx)
+        pool_selector_logits = torch.gather(selector_logits, 1, pool_idx)
 
-        score_in = torch.cat(
-            [base_h, loo_ctx, set_delta, set_prod, selector_logit_feat, selector_prob_feat],
+        if os.environ.get("RERANK_DETACH_SELECTOR", "0") == "1":
+            pool_hidden_for_rerank = pool_hidden.detach()
+        else:
+            pool_hidden_for_rerank = pool_hidden
+
+        pool_mean = pool_hidden_for_rerank.mean(dim=1, keepdim=True).expand_as(pool_hidden_for_rerank)
+        pool_max = pool_hidden_for_rerank.max(dim=1, keepdim=True).values.expand_as(pool_hidden_for_rerank)
+
+        rank_pos = torch.arange(pool_k, device=device).float()
+        rank_pos = rank_pos.view(1, pool_k, 1).expand(batch_n, pool_k, 1) / max(1.0, float(pool_k - 1))
+
+        selector_logit_feat = pool_selector_logits.unsqueeze(-1)
+
+        set_in = torch.cat(
+            [
+                pool_hidden_for_rerank,
+                pool_mean,
+                pool_max,
+                pool_hidden_for_rerank - pool_mean,
+                selector_logit_feat,
+                rank_pos,
+            ],
             dim=-1,
         )
 
-        score_in = self.set_score_norm(score_in)
-        score_h = F.relu(self.set_score_l1(score_in))
+        set_in = self.set_score_norm(set_in)
+        score_h = F.relu(self.set_score_l1(set_in))
         score_h = F.relu(self.set_score_l2(score_h))
-        formulae_scores_raw = self.set_score_out(score_h).squeeze(-1)
+        rerank_delta_pool = self.set_score_out(score_h).squeeze(-1)
+        rerank_delta_pool_mean = rerank_delta_pool.mean().detach()
+        rerank_delta_pool_std = rerank_delta_pool.std().detach()
+        selector_logits_pool_std = pool_selector_logits.std().detach()
 
-        formulae_scores_raw_setwise = formulae_scores_raw
+        final_pool_logits = pool_selector_logits + rerank_delta_pool
 
+        neg_fill = _neg_mask_fill_value(selector_logits)
+        final_logits = selector_logits.new_full(selector_logits.shape, neg_fill)
+        final_logits.scatter_(1, pool_idx, final_pool_logits)
 
-        base_score_raw = formulae_scores_raw
+        rerank_logits_full = selector_logits.new_full(selector_logits.shape, neg_fill)
+        rerank_logits_full.scatter_(1, pool_idx, rerank_delta_pool)
+
+        formulae_scores_raw = final_logits
+        formulae_scores_raw_setwise = rerank_logits_full
+        base_score_raw = final_logits
 
         # peak head must use non-aggregated official peaks to preserve the
         # original per-candidate peak order. Aggregated peaks remain available
@@ -1918,11 +2118,18 @@ class MolAttentionGRUNewSparse(nn.Module):
             'spect_out_official': spect_out_official,
             'formulae_probs': formulae_probs,
             'formulae_probs_render': formulae_probs_render,
+            'formulae_logits': formulae_scores,
             'formulae_scores': formulae_scores,
             'formulae_scores_raw': formulae_scores_raw,
             'formulae_scores_raw_setwise': formulae_scores_raw_setwise,
             'formulae_scores_train': formulae_scores_train,
             'selector_logits': selector_logits,
+            'selector_probs': selector_probs,
+            'selector_pool_idx': pool_idx,
+            'rerank_logits_pool': rerank_delta_pool,
+            'rerank_delta_pool_mean': rerank_delta_pool_mean,
+            'rerank_delta_pool_std': rerank_delta_pool_std,
+            'selector_logits_pool_std': selector_logits_pool_std,
             'base_score_raw': base_score_raw,
             'formulae_encoded': formulae_encoded,
             'vert_att_reduce': vert_att_reduce,
@@ -1944,6 +2151,15 @@ class MolAttentionGRUNewSparse(nn.Module):
             'fragment_node_logits': fragment_node_logits,
             'fn_based_formula_logits': fn_based_formula_logits,  # 🌟 必须加这一行，让外面的训练脚本能拿到！
         }
+        if torch.is_tensor(frag_has_source):
+            out['frag_aux_has_source_ratio'] = frag_has_source.mean().detach()
+        else:
+            out['frag_aux_has_source_ratio'] = torch.tensor(0.0, device=device, dtype=torch.float32)
+        out['frag_aux_scale'] = torch.tensor(
+            float(self.fragment_local_aux_scale),
+            device=device,
+            dtype=torch.float32,
+        )
         return out
 
 

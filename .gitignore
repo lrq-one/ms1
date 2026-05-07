@@ -1,9 +1,45 @@
-*.pth
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+
+# Build / Cython
+/build
+*.so
+*.c
+*.cpp
+
+# Data / cache
 /data
+*.cache/
+*.pkl
+*.err
+*.jsonl
+
+# Outputs
 /outputs
 /logs
 /checkpoints
-/tests
-/__pycache__
-/build
-*.pyc
+/runs
+/wandb
+/results.metrics
+/forward.preds
+
+# Model weights
+*.pth
+*.pt
+*.state
+*.model
+*.ckpt
+
+# Arrays
+*.npy
+*.npz
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

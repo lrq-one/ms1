@@ -1,7 +1,7 @@
 # File overview: This module is part of the MassSpecGym/RASSP codebase.
 # Purpose: Project packaging/setup configuration for installation and dependency integration.
 
-from setuptools import setup, Extension
+from setuptools import setup, Extension, find_packages
 from Cython.Build import cythonize
 import numpy as np
 
@@ -45,9 +45,7 @@ setup(
     description='RASSP: EI-MS prediction',
     author='The Jonas Lab',
     author_email='jonaslab@uchicago.edu',
-    packages=['rassp', 'rassp.model', 'rassp.msutil',
-              'rassp.featurize',
-              'rassp.dataset'],
+    packages=find_packages(),
     install_requires=['wheel'],
     ext_modules=cythonize(extensions)
 )
