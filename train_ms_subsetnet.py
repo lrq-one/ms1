@@ -2463,9 +2463,84 @@ def build_candidate_local_quality_target(
     pool_pos_label.scatter_(1, pool_idx, 1.0)
     pool_pos_label = pool_pos_label * pool_keep.float()
 
-    # Final BCE positives = clean positives + pool positives.
-    # KL still uses selector_quality, so clean candidates dominate listwise distribution.
-    pos_label = torch.maximum(clean_pos_label, pool_pos_label)
+    # ------------------------------------------------------------------
+    # Cached teacher / set-cover teacher target.
+    # This is the real spectrum-level supervision. Hand-crafted pool target
+    # is only a fallback; teacher target should dominate selector recall.
+    # ------------------------------------------------------------------
+    teacher_pos_label = torch.zeros_like(pos_label)
+    teacher_dist = torch.zeros_like(pos_label)
+
+    use_cached_teacher = os.environ.get("SELECTOR_USE_CACHED_TEACHER_TARGET", "1") == "1"
+    if use_cached_teacher:
+        teacher = batch.get("teacher_formula_probs", None)
+
+        if torch.is_tensor(teacher):
+            teacher = teacher.to(device=device, dtype=torch.float32)
+
+            if teacher.dim() == 1:
+                teacher = teacher.unsqueeze(0)
+            elif teacher.dim() > 2:
+                teacher = teacher.reshape(teacher.shape[0], -1)
+
+            if teacher.shape[0] < B:
+                pad = torch.zeros(
+                    (B - teacher.shape[0], teacher.shape[1]),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                teacher = torch.cat([teacher, pad], dim=0)
+            teacher = teacher[:B]
+
+            if teacher.shape[1] < M:
+                pad = torch.zeros(
+                    (B, M - teacher.shape[1]),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                teacher = torch.cat([teacher, pad], dim=1)
+            teacher = teacher[:, :M]
+
+            teacher = torch.nan_to_num(teacher, nan=0.0, posinf=0.0, neginf=0.0)
+            teacher = teacher.clamp_min(0.0) * formulae_mask.float()
+
+            teacher_sum = teacher.sum(dim=1, keepdim=True)
+            teacher_dist = teacher / teacher_sum.clamp_min(eps)
+            teacher_dist = torch.where(
+                teacher_sum > eps,
+                teacher_dist,
+                torch.zeros_like(teacher_dist),
+            )
+
+            try:
+                teacher_pos_topk = int(os.environ.get("SELECTOR_TEACHER_POS_TOPK", "32"))
+            except Exception:
+                teacher_pos_topk = 32
+
+            try:
+                teacher_min_prob = float(os.environ.get("SELECTOR_TEACHER_MIN_PROB", "1e-8"))
+            except Exception:
+                teacher_min_prob = 1e-8
+
+            tk = max(1, min(int(teacher_pos_topk), M))
+            teacher_idx = torch.topk(
+                teacher_dist.masked_fill(formulae_mask <= 0.5, -1e9),
+                k=tk,
+                dim=1,
+            ).indices
+
+            teacher_pos_label.scatter_(1, teacher_idx, 1.0)
+            teacher_pos_label = teacher_pos_label * (teacher_dist > teacher_min_prob).float()
+            teacher_pos_label = teacher_pos_label * formulae_mask.float()
+
+    # Final BCE positives:
+    # clean = very high precision
+    # teacher = real spectrum-level/set-cover supervision
+    # pool = fallback local target
+    if os.environ.get("SELECTOR_DISABLE_HAND_POOL_TARGET", "1") == "1":
+        pos_label = torch.maximum(clean_pos_label, teacher_pos_label)
+    else:
+        pos_label = torch.maximum(torch.maximum(clean_pos_label, teacher_pos_label), pool_pos_label)
 
     has_signal = (pos_label.sum(dim=1, keepdim=True) > 0).float()
     valid_mask = formulae_mask.float() * has_signal
@@ -2485,6 +2560,8 @@ def build_candidate_local_quality_target(
         'pool_pos_label': pool_pos_label.detach(),
         'pool_keep': pool_keep.float().detach(),
         'pool_score': pool_score.detach(),
+        'teacher_pos_label': teacher_pos_label.detach(),
+        'teacher_dist': teacher_dist.detach(),
     }
 
 
@@ -4691,6 +4768,8 @@ def train_mssubsetnet():
         'train_target_pool_pos_rate': [],
         'train_target_pool_pos_false_mass': [],
         'train_target_pool_pos_overlap_tol': [],
+        'train_target_teacher_pos_rate': [],
+        'train_target_teacher_dist_n': [],
         'train_selector_dyn_pos_weight': [],
         'train_use_rerank_delta': [],
         'val_selector_loss': [],
@@ -4707,6 +4786,8 @@ def train_mssubsetnet():
         'val_target_pool_pos_rate': [],
         'val_target_pool_pos_false_mass': [],
         'val_target_pool_pos_overlap_tol': [],
+        'val_target_teacher_pos_rate': [],
+        'val_target_teacher_dist_n': [],
         'val_selector_dyn_pos_weight': [],
         'val_use_rerank_delta': [],
         'val_model_topk_teacher_recall': [],
@@ -4773,6 +4854,8 @@ def train_mssubsetnet():
         train_target_pool_pos_rate_vals = []
         train_target_pool_pos_false_mass_vals = []
         train_target_pool_pos_overlap_tol_vals = []
+        train_target_teacher_pos_rate_vals = []
+        train_target_teacher_dist_n_vals = []
         train_selector_dyn_pos_weight_vals = []
         train_use_rerank_delta_vals = []
         train_rerank_kl_vals = []
@@ -4965,35 +5048,66 @@ def train_mssubsetnet():
                     except Exception:
                         gamma = 2.0
 
-                    clean_pos_for_kl = selector_pos_label.float()
-                    if isinstance(selector_extra, dict) and torch.is_tensor(selector_extra.get('clean_pos_label', None)):
-                        clean_pos_for_kl = selector_extra['clean_pos_label'].to(
-                            device=selector_pos_label.device,
-                            dtype=selector_pos_label.dtype,
+                    use_teacher_kl = os.environ.get("SELECTOR_USE_TEACHER_KL", "1") == "1"
+
+                    if (
+                        use_teacher_kl
+                        and isinstance(selector_extra, dict)
+                        and torch.is_tensor(selector_extra.get("teacher_dist", None))
+                    ):
+                        teacher_dist_t = selector_extra["teacher_dist"].to(
+                            device=selector_logits_for_loss.device,
+                            dtype=selector_logits_for_loss.dtype,
+                        )
+                        target_dist = teacher_dist_t * selector_valid_mask.float()
+                        target_sum = target_dist.sum(dim=1, keepdim=True)
+                        target_dist = target_dist / target_sum.clamp_min(1e-8)
+
+                        clean_pos_for_kl = selector_pos_label.float()
+                        if torch.is_tensor(selector_extra.get("clean_pos_label", None)):
+                            clean_pos_for_kl = selector_extra["clean_pos_label"].to(
+                                device=selector_pos_label.device,
+                                dtype=selector_pos_label.dtype,
+                            )
+
+                        fallback_dist = clean_pos_for_kl.float() * selector_valid_mask.float()
+                        fallback_dist = fallback_dist / fallback_dist.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+                        target_dist = torch.where(
+                            target_sum > 1e-8,
+                            target_dist,
+                            fallback_dist,
+                        )
+                    else:
+                        clean_pos_for_kl = selector_pos_label.float()
+                        if isinstance(selector_extra, dict) and torch.is_tensor(selector_extra.get('clean_pos_label', None)):
+                            clean_pos_for_kl = selector_extra['clean_pos_label'].to(
+                                device=selector_pos_label.device,
+                                dtype=selector_pos_label.dtype,
+                            )
+
+                        target_dist = selector_quality.clamp_min(0.0) ** gamma
+                        target_dist = target_dist * clean_pos_for_kl.float() * selector_valid_mask.float()
+
+                        target_sum = target_dist.sum(dim=1, keepdim=True)
+
+                        uniform_pos = clean_pos_for_kl.float() * selector_valid_mask.float()
+                        uniform_pos = uniform_pos / uniform_pos.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+                        uniform_all_pos = selector_pos_label.float() * selector_valid_mask.float()
+                        uniform_all_pos = uniform_all_pos / uniform_all_pos.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+                        uniform_pos = torch.where(
+                            uniform_pos.sum(dim=1, keepdim=True) > 1e-8,
+                            uniform_pos,
+                            uniform_all_pos,
                         )
 
-                    target_dist = selector_quality.clamp_min(0.0) ** gamma
-                    target_dist = target_dist * clean_pos_for_kl.float() * selector_valid_mask.float()
-
-                    target_sum = target_dist.sum(dim=1, keepdim=True)
-
-                    uniform_pos = clean_pos_for_kl.float() * selector_valid_mask.float()
-                    uniform_pos = uniform_pos / uniform_pos.sum(dim=1, keepdim=True).clamp_min(1e-8)
-
-                    uniform_all_pos = selector_pos_label.float() * selector_valid_mask.float()
-                    uniform_all_pos = uniform_all_pos / uniform_all_pos.sum(dim=1, keepdim=True).clamp_min(1e-8)
-
-                    uniform_pos = torch.where(
-                        uniform_pos.sum(dim=1, keepdim=True) > 1e-8,
-                        uniform_pos,
-                        uniform_all_pos,
-                    )
-
-                    target_dist = torch.where(
-                        target_sum > 1e-8,
-                        target_dist / target_sum.clamp_min(1e-8),
-                        uniform_pos,
-                    )
+                        target_dist = torch.where(
+                            target_sum > 1e-8,
+                            target_dist / target_sum.clamp_min(1e-8),
+                            uniform_pos,
+                        )
 
                     log_probs = F.log_softmax(
                         selector_logits_for_loss.masked_fill(
@@ -5026,6 +5140,8 @@ def train_mssubsetnet():
                 target_pool_pos_rate = res_full['spect'].sum() * 0.0
                 target_pool_pos_false_mass = res_full['spect'].sum() * 0.0
                 target_pool_pos_overlap_tol = res_full['spect'].sum() * 0.0
+                target_teacher_pos_rate = res_full['spect'].sum() * 0.0
+                target_teacher_dist_n = res_full['spect'].sum() * 0.0
                 if (
                     isinstance(selector_extra, dict)
                     and torch.is_tensor(selector_pos_label)
@@ -5077,6 +5193,22 @@ def train_mssubsetnet():
                                     dtype=pool_pos.dtype,
                                 ) * pool_pos
                             ).sum() / pool_den
+                    if torch.is_tensor(selector_extra.get("teacher_pos_label", None)):
+                        teacher_pos = selector_extra["teacher_pos_label"].to(
+                            device=selector_pos_label.device,
+                            dtype=selector_pos_label.dtype,
+                        )
+                        target_teacher_pos_rate = (
+                            teacher_pos * formulae_mask.float()
+                        ).sum() / formulae_mask.float().sum().clamp_min(1.0)
+                    if torch.is_tensor(selector_extra.get("teacher_dist", None)):
+                        teacher_dist_t = selector_extra["teacher_dist"].to(
+                            device=selector_pos_label.device,
+                            dtype=selector_pos_label.dtype,
+                        )
+                        target_teacher_dist_n = (
+                            teacher_dist_t > 0
+                        ).float().sum(dim=1).mean()
 
                 selector_loss = (
                     float(selector_bce_weight) * selector_bce_loss
@@ -5440,6 +5572,12 @@ def train_mssubsetnet():
             train_target_pool_pos_overlap_tol_vals.append(
                 float(target_pool_pos_overlap_tol.detach().item())
             )
+            train_target_teacher_pos_rate_vals.append(
+                float(target_teacher_pos_rate.detach().item())
+            )
+            train_target_teacher_dist_n_vals.append(
+                float(target_teacher_dist_n.detach().item())
+            )
             train_selector_dyn_pos_weight_vals.append(
                 float(selector_dyn_pos_weight.detach().item())
             )
@@ -5496,6 +5634,8 @@ def train_mssubsetnet():
         val_target_pool_pos_rate_vals = []
         val_target_pool_pos_false_mass_vals = []
         val_target_pool_pos_overlap_tol_vals = []
+        val_target_teacher_pos_rate_vals = []
+        val_target_teacher_dist_n_vals = []
         val_selector_dyn_pos_weight_vals = []
         val_use_rerank_delta_vals = []
         val_rerank_kl_vals = []
@@ -5764,35 +5904,66 @@ def train_mssubsetnet():
                         except Exception:
                             gamma = 2.0
 
-                        clean_pos_for_kl = selector_pos_label.float()
-                        if isinstance(selector_extra, dict) and torch.is_tensor(selector_extra.get('clean_pos_label', None)):
-                            clean_pos_for_kl = selector_extra['clean_pos_label'].to(
-                                device=selector_pos_label.device,
-                                dtype=selector_pos_label.dtype,
+                        use_teacher_kl = os.environ.get("SELECTOR_USE_TEACHER_KL", "1") == "1"
+
+                        if (
+                            use_teacher_kl
+                            and isinstance(selector_extra, dict)
+                            and torch.is_tensor(selector_extra.get("teacher_dist", None))
+                        ):
+                            teacher_dist_t = selector_extra["teacher_dist"].to(
+                                device=selector_logits_for_loss.device,
+                                dtype=selector_logits_for_loss.dtype,
+                            )
+                            target_dist = teacher_dist_t * selector_valid_mask.float()
+                            target_sum = target_dist.sum(dim=1, keepdim=True)
+                            target_dist = target_dist / target_sum.clamp_min(1e-8)
+
+                            clean_pos_for_kl = selector_pos_label.float()
+                            if torch.is_tensor(selector_extra.get("clean_pos_label", None)):
+                                clean_pos_for_kl = selector_extra["clean_pos_label"].to(
+                                    device=selector_pos_label.device,
+                                    dtype=selector_pos_label.dtype,
+                                )
+
+                            fallback_dist = clean_pos_for_kl.float() * selector_valid_mask.float()
+                            fallback_dist = fallback_dist / fallback_dist.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+                            target_dist = torch.where(
+                                target_sum > 1e-8,
+                                target_dist,
+                                fallback_dist,
+                            )
+                        else:
+                            clean_pos_for_kl = selector_pos_label.float()
+                            if isinstance(selector_extra, dict) and torch.is_tensor(selector_extra.get('clean_pos_label', None)):
+                                clean_pos_for_kl = selector_extra['clean_pos_label'].to(
+                                    device=selector_pos_label.device,
+                                    dtype=selector_pos_label.dtype,
+                                )
+
+                            target_dist = selector_quality.clamp_min(0.0) ** gamma
+                            target_dist = target_dist * clean_pos_for_kl.float() * selector_valid_mask.float()
+
+                            target_sum = target_dist.sum(dim=1, keepdim=True)
+
+                            uniform_pos = clean_pos_for_kl.float() * selector_valid_mask.float()
+                            uniform_pos = uniform_pos / uniform_pos.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+                            uniform_all_pos = selector_pos_label.float() * selector_valid_mask.float()
+                            uniform_all_pos = uniform_all_pos / uniform_all_pos.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+                            uniform_pos = torch.where(
+                                uniform_pos.sum(dim=1, keepdim=True) > 1e-8,
+                                uniform_pos,
+                                uniform_all_pos,
                             )
 
-                        target_dist = selector_quality.clamp_min(0.0) ** gamma
-                        target_dist = target_dist * clean_pos_for_kl.float() * selector_valid_mask.float()
-
-                        target_sum = target_dist.sum(dim=1, keepdim=True)
-
-                        uniform_pos = clean_pos_for_kl.float() * selector_valid_mask.float()
-                        uniform_pos = uniform_pos / uniform_pos.sum(dim=1, keepdim=True).clamp_min(1e-8)
-
-                        uniform_all_pos = selector_pos_label.float() * selector_valid_mask.float()
-                        uniform_all_pos = uniform_all_pos / uniform_all_pos.sum(dim=1, keepdim=True).clamp_min(1e-8)
-
-                        uniform_pos = torch.where(
-                            uniform_pos.sum(dim=1, keepdim=True) > 1e-8,
-                            uniform_pos,
-                            uniform_all_pos,
-                        )
-
-                        target_dist = torch.where(
-                            target_sum > 1e-8,
-                            target_dist / target_sum.clamp_min(1e-8),
-                            uniform_pos,
-                        )
+                            target_dist = torch.where(
+                                target_sum > 1e-8,
+                                target_dist / target_sum.clamp_min(1e-8),
+                                uniform_pos,
+                            )
 
                         log_probs = F.log_softmax(
                             selector_logits_for_loss.masked_fill(
@@ -5828,6 +5999,8 @@ def train_mssubsetnet():
                     val_target_pool_pos_rate = res_full['spect'].sum() * 0.0
                     val_target_pool_pos_false_mass = res_full['spect'].sum() * 0.0
                     val_target_pool_pos_overlap_tol = res_full['spect'].sum() * 0.0
+                    val_target_teacher_pos_rate = res_full['spect'].sum() * 0.0
+                    val_target_teacher_dist_n = res_full['spect'].sum() * 0.0
                     if (
                         isinstance(selector_extra, dict)
                         and torch.is_tensor(selector_pos_label)
@@ -5900,6 +6073,22 @@ def train_mssubsetnet():
                                         dtype=pool_pos.dtype,
                                     ) * pool_pos
                                 ).sum() / pool_den
+                        if torch.is_tensor(selector_extra.get("teacher_pos_label", None)):
+                            teacher_pos = selector_extra["teacher_pos_label"].to(
+                                device=selector_pos_label.device,
+                                dtype=selector_pos_label.dtype,
+                            )
+                            val_target_teacher_pos_rate = (
+                                teacher_pos * formulae_mask.float()
+                            ).sum() / formulae_mask.float().sum().clamp_min(1.0)
+                        if torch.is_tensor(selector_extra.get("teacher_dist", None)):
+                            teacher_dist_t = selector_extra["teacher_dist"].to(
+                                device=selector_pos_label.device,
+                                dtype=selector_pos_label.dtype,
+                            )
+                            val_target_teacher_dist_n = (
+                                teacher_dist_t > 0
+                            ).float().sum(dim=1).mean()
 
                     val_selector_loss = (
                         float(selector_bce_weight) * val_selector_bce
@@ -6302,6 +6491,12 @@ def train_mssubsetnet():
                 val_target_pool_pos_overlap_tol_vals.append(
                     float(val_target_pool_pos_overlap_tol.detach().item())
                 )
+                val_target_teacher_pos_rate_vals.append(
+                    float(val_target_teacher_pos_rate.detach().item())
+                )
+                val_target_teacher_dist_n_vals.append(
+                    float(val_target_teacher_dist_n.detach().item())
+                )
                 val_selector_dyn_pos_weight_vals.append(
                     float(val_selector_dyn_pos_weight.detach().item())
                 )
@@ -6379,6 +6574,8 @@ def train_mssubsetnet():
         avg_train_target_pool_pos_rate = _finite_mean(train_target_pool_pos_rate_vals)
         avg_train_target_pool_pos_false_mass = _finite_mean(train_target_pool_pos_false_mass_vals)
         avg_train_target_pool_pos_overlap_tol = _finite_mean(train_target_pool_pos_overlap_tol_vals)
+        avg_train_target_teacher_pos_rate = _finite_mean(train_target_teacher_pos_rate_vals)
+        avg_train_target_teacher_dist_n = _finite_mean(train_target_teacher_dist_n_vals)
         avg_train_selector_dyn_pos_weight = _finite_mean(train_selector_dyn_pos_weight_vals)
         avg_train_use_rerank_delta = _finite_mean(train_use_rerank_delta_vals)
         avg_val_selector_loss = _finite_mean(val_selector_loss_vals)
@@ -6395,6 +6592,8 @@ def train_mssubsetnet():
         avg_val_target_pool_pos_rate = _finite_mean(val_target_pool_pos_rate_vals)
         avg_val_target_pool_pos_false_mass = _finite_mean(val_target_pool_pos_false_mass_vals)
         avg_val_target_pool_pos_overlap_tol = _finite_mean(val_target_pool_pos_overlap_tol_vals)
+        avg_val_target_teacher_pos_rate = _finite_mean(val_target_teacher_pos_rate_vals)
+        avg_val_target_teacher_dist_n = _finite_mean(val_target_teacher_dist_n_vals)
         avg_val_selector_dyn_pos_weight = _finite_mean(val_selector_dyn_pos_weight_vals)
         avg_val_use_rerank_delta = _finite_mean(val_use_rerank_delta_vals)
         avg_val_model_topk_teacher_recall = _finite_mean(val_model_topk_teacher_recall_vals)
@@ -6603,6 +6802,8 @@ def train_mssubsetnet():
             f'train_target_pool_pos_rate={avg_train_target_pool_pos_rate:.4f} | '
             f'train_target_pool_pos_false_mass={avg_train_target_pool_pos_false_mass:.4f} | '
             f'train_target_pool_pos_overlap_tol={avg_train_target_pool_pos_overlap_tol:.4f} | '
+            f'train_target_teacher_pos_rate={avg_train_target_teacher_pos_rate:.4f} | '
+            f'train_target_teacher_dist_n={avg_train_target_teacher_dist_n:.4f} | '
             f'train_selector_dyn_pos_weight={avg_train_selector_dyn_pos_weight:.4f} | '
             f'train_use_rerank_delta={avg_train_use_rerank_delta:.1f} | '
             f'train_main_candidate_kl={avg_train_main_kl:.4f} | '
@@ -6631,6 +6832,8 @@ def train_mssubsetnet():
             f'val_target_pool_pos_rate={avg_val_target_pool_pos_rate:.4f} | '
             f'val_target_pool_pos_false_mass={avg_val_target_pool_pos_false_mass:.4f} | '
             f'val_target_pool_pos_overlap_tol={avg_val_target_pool_pos_overlap_tol:.4f} | '
+            f'val_target_teacher_pos_rate={avg_val_target_teacher_pos_rate:.4f} | '
+            f'val_target_teacher_dist_n={avg_val_target_teacher_dist_n:.4f} | '
             f'val_selector_dyn_pos_weight={avg_val_selector_dyn_pos_weight:.4f} | '
             f'val_use_rerank_delta={avg_val_use_rerank_delta:.1f} | '
             f'val_model_topk_teacher_recall@{model_topk_eval}={avg_val_model_topk_teacher_recall:.4f} | '
@@ -6731,6 +6934,8 @@ def train_mssubsetnet():
         history['train_target_pool_pos_rate'].append(avg_train_target_pool_pos_rate)
         history['train_target_pool_pos_false_mass'].append(avg_train_target_pool_pos_false_mass)
         history['train_target_pool_pos_overlap_tol'].append(avg_train_target_pool_pos_overlap_tol)
+        history['train_target_teacher_pos_rate'].append(avg_train_target_teacher_pos_rate)
+        history['train_target_teacher_dist_n'].append(avg_train_target_teacher_dist_n)
         history['train_selector_dyn_pos_weight'].append(avg_train_selector_dyn_pos_weight)
         history['train_use_rerank_delta'].append(avg_train_use_rerank_delta)
         history['val_selector_bce'].append(avg_val_selector_bce)
@@ -6746,6 +6951,8 @@ def train_mssubsetnet():
         history['val_target_pool_pos_rate'].append(avg_val_target_pool_pos_rate)
         history['val_target_pool_pos_false_mass'].append(avg_val_target_pool_pos_false_mass)
         history['val_target_pool_pos_overlap_tol'].append(avg_val_target_pool_pos_overlap_tol)
+        history['val_target_teacher_pos_rate'].append(avg_val_target_teacher_pos_rate)
+        history['val_target_teacher_dist_n'].append(avg_val_target_teacher_dist_n)
         history['val_selector_dyn_pos_weight'].append(avg_val_selector_dyn_pos_weight)
         history['val_use_rerank_delta'].append(avg_val_use_rerank_delta)
         history['val_selector_loss'].append(avg_val_selector_loss)
