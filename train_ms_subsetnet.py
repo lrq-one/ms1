@@ -2408,37 +2408,39 @@ def build_candidate_local_quality_target(
         pool_pos_topk = 96
 
     try:
-        pool_min_tol_support = float(os.environ.get("SELECTOR_POOL_MIN_TOL_SUPPORT", "0.03"))
+        pool_min_overlap_tol = float(os.environ.get("SELECTOR_POOL_MIN_OVERLAP_TOL", "0.0005"))
     except Exception:
-        pool_min_tol_support = 0.03
+        pool_min_overlap_tol = 0.0005
 
     try:
-        pool_min_top20 = float(os.environ.get("SELECTOR_POOL_MIN_TOP20", "0.005"))
+        pool_min_overlap_exact = float(os.environ.get("SELECTOR_POOL_MIN_OVERLAP_EXACT", "0.0001"))
     except Exception:
-        pool_min_top20 = 0.005
+        pool_min_overlap_exact = 0.0001
 
     try:
-        pool_min_exact_support = float(os.environ.get("SELECTOR_POOL_MIN_EXACT_SUPPORT", "0.03"))
+        pool_min_top20 = float(os.environ.get("SELECTOR_POOL_MIN_TOP20", "0.0005"))
     except Exception:
-        pool_min_exact_support = 0.03
+        pool_min_top20 = 0.0005
 
     try:
-        pool_max_false_support = float(os.environ.get("SELECTOR_POOL_MAX_FALSE_SUPPORT", "0.98"))
+        pool_max_false_support = float(os.environ.get("SELECTOR_POOL_MAX_FALSE_SUPPORT", "0.97"))
     except Exception:
-        pool_max_false_support = 0.98
+        pool_max_false_support = 0.97
 
+    # Pool target should be intensity-overlap driven.
+    # Do not let exact_support_mass dominate, because it rewards weak support hits.
     pool_score = (
-        0.40 * hit_support_mass_tol
-        + 0.35 * hit_top20_mass
-        + 0.20 * overlap_intensity_tol
-        + 0.20 * exact_support_mass
-        - 0.10 * false_support_mass_exact
+        3.00 * overlap_intensity_tol
+        + 1.50 * overlap_intensity_exact
+        + 2.00 * hit_top20_mass
+        + 0.25 * hit_support_mass_tol
+        - 0.35 * false_support_mass_exact
     )
 
     pool_signal = (
-        (hit_support_mass_tol >= pool_min_tol_support)
+        (overlap_intensity_tol >= pool_min_overlap_tol)
+        | (overlap_intensity_exact >= pool_min_overlap_exact)
         | (hit_top20_mass >= pool_min_top20)
-        | (exact_support_mass >= pool_min_exact_support)
     )
 
     pool_keep = (
@@ -4687,6 +4689,8 @@ def train_mssubsetnet():
         'train_target_fallback_rate': [],
         'train_target_clean_pos_rate': [],
         'train_target_pool_pos_rate': [],
+        'train_target_pool_pos_false_mass': [],
+        'train_target_pool_pos_overlap_tol': [],
         'train_selector_dyn_pos_weight': [],
         'train_use_rerank_delta': [],
         'val_selector_loss': [],
@@ -4701,6 +4705,8 @@ def train_mssubsetnet():
         'val_target_fallback_rate': [],
         'val_target_clean_pos_rate': [],
         'val_target_pool_pos_rate': [],
+        'val_target_pool_pos_false_mass': [],
+        'val_target_pool_pos_overlap_tol': [],
         'val_selector_dyn_pos_weight': [],
         'val_use_rerank_delta': [],
         'val_model_topk_teacher_recall': [],
@@ -4765,6 +4771,8 @@ def train_mssubsetnet():
         train_target_fallback_rate_vals = []
         train_target_clean_pos_rate_vals = []
         train_target_pool_pos_rate_vals = []
+        train_target_pool_pos_false_mass_vals = []
+        train_target_pool_pos_overlap_tol_vals = []
         train_selector_dyn_pos_weight_vals = []
         train_use_rerank_delta_vals = []
         train_rerank_kl_vals = []
@@ -4920,7 +4928,18 @@ def train_mssubsetnet():
                     if os.environ.get("SELECTOR_DYNAMIC_POS_WEIGHT", "1") == "1":
                         pos_n = (selector_pos_label * selector_valid_mask).sum()
                         neg_n = ((1.0 - selector_pos_label) * selector_valid_mask).sum()
-                        dyn_pos_weight = (neg_n / pos_n.clamp_min(1.0)).clamp(3.0, 20.0)
+                        try:
+                            dyn_pos_weight_min = float(os.environ.get("SELECTOR_DYN_POS_WEIGHT_MIN", "3.0"))
+                        except Exception:
+                            dyn_pos_weight_min = 3.0
+                        try:
+                            dyn_pos_weight_max = float(os.environ.get("SELECTOR_DYN_POS_WEIGHT_MAX", "50.0"))
+                        except Exception:
+                            dyn_pos_weight_max = 50.0
+                        dyn_pos_weight = (neg_n / pos_n.clamp_min(1.0)).clamp(
+                            dyn_pos_weight_min,
+                            dyn_pos_weight_max,
+                        )
                     else:
                         dyn_pos_weight = torch.tensor(
                             float(selector_pos_weight),
@@ -5005,6 +5024,8 @@ def train_mssubsetnet():
                 target_pos_overlap_exact = res_full['spect'].sum() * 0.0
                 target_clean_pos_rate = res_full['spect'].sum() * 0.0
                 target_pool_pos_rate = res_full['spect'].sum() * 0.0
+                target_pool_pos_false_mass = res_full['spect'].sum() * 0.0
+                target_pool_pos_overlap_tol = res_full['spect'].sum() * 0.0
                 if (
                     isinstance(selector_extra, dict)
                     and torch.is_tensor(selector_pos_label)
@@ -5037,6 +5058,25 @@ def train_mssubsetnet():
                             selector_extra['pool_pos_label'].to(device=selector_pos_label.device).float()
                             * formulae_mask.float()
                         ).sum() / formulae_mask.float().sum().clamp_min(1.0)
+                        pool_pos = selector_extra['pool_pos_label'].to(
+                            device=selector_pos_label.device,
+                            dtype=selector_pos_label.dtype,
+                        )
+                        pool_den = pool_pos.sum().clamp_min(1.0)
+                        if torch.is_tensor(selector_extra.get('false_support_mass_exact', None)):
+                            target_pool_pos_false_mass = (
+                                selector_extra['false_support_mass_exact'].to(
+                                    device=pool_pos.device,
+                                    dtype=pool_pos.dtype,
+                                ) * pool_pos
+                            ).sum() / pool_den
+                        if torch.is_tensor(selector_extra.get('overlap_intensity_tol', None)):
+                            target_pool_pos_overlap_tol = (
+                                selector_extra['overlap_intensity_tol'].to(
+                                    device=pool_pos.device,
+                                    dtype=pool_pos.dtype,
+                                ) * pool_pos
+                            ).sum() / pool_den
 
                 selector_loss = (
                     float(selector_bce_weight) * selector_bce_loss
@@ -5394,6 +5434,12 @@ def train_mssubsetnet():
             train_target_pool_pos_rate_vals.append(
                 float(target_pool_pos_rate.detach().item())
             )
+            train_target_pool_pos_false_mass_vals.append(
+                float(target_pool_pos_false_mass.detach().item())
+            )
+            train_target_pool_pos_overlap_tol_vals.append(
+                float(target_pool_pos_overlap_tol.detach().item())
+            )
             train_selector_dyn_pos_weight_vals.append(
                 float(selector_dyn_pos_weight.detach().item())
             )
@@ -5448,6 +5494,8 @@ def train_mssubsetnet():
         val_target_fallback_rate_vals = []
         val_target_clean_pos_rate_vals = []
         val_target_pool_pos_rate_vals = []
+        val_target_pool_pos_false_mass_vals = []
+        val_target_pool_pos_overlap_tol_vals = []
         val_selector_dyn_pos_weight_vals = []
         val_use_rerank_delta_vals = []
         val_rerank_kl_vals = []
@@ -5679,7 +5727,18 @@ def train_mssubsetnet():
                         if os.environ.get("SELECTOR_DYNAMIC_POS_WEIGHT", "1") == "1":
                             pos_n = (selector_pos_label * selector_valid_mask).sum()
                             neg_n = ((1.0 - selector_pos_label) * selector_valid_mask).sum()
-                            dyn_pos_weight = (neg_n / pos_n.clamp_min(1.0)).clamp(3.0, 20.0)
+                            try:
+                                dyn_pos_weight_min = float(os.environ.get("SELECTOR_DYN_POS_WEIGHT_MIN", "3.0"))
+                            except Exception:
+                                dyn_pos_weight_min = 3.0
+                            try:
+                                dyn_pos_weight_max = float(os.environ.get("SELECTOR_DYN_POS_WEIGHT_MAX", "50.0"))
+                            except Exception:
+                                dyn_pos_weight_max = 50.0
+                            dyn_pos_weight = (neg_n / pos_n.clamp_min(1.0)).clamp(
+                                dyn_pos_weight_min,
+                                dyn_pos_weight_max,
+                            )
                         else:
                             dyn_pos_weight = torch.tensor(
                                 float(selector_pos_weight),
@@ -5767,6 +5826,8 @@ def train_mssubsetnet():
                     val_target_fallback_rate = res_full['spect'].sum() * 0.0
                     val_target_clean_pos_rate = res_full['spect'].sum() * 0.0
                     val_target_pool_pos_rate = res_full['spect'].sum() * 0.0
+                    val_target_pool_pos_false_mass = res_full['spect'].sum() * 0.0
+                    val_target_pool_pos_overlap_tol = res_full['spect'].sum() * 0.0
                     if (
                         isinstance(selector_extra, dict)
                         and torch.is_tensor(selector_pos_label)
@@ -5820,6 +5881,25 @@ def train_mssubsetnet():
                                 selector_extra['pool_pos_label'].to(device=selector_pos_label.device).float()
                                 * formulae_mask.float()
                             ).sum() / formulae_mask.float().sum().clamp_min(1.0)
+                            pool_pos = selector_extra['pool_pos_label'].to(
+                                device=selector_pos_label.device,
+                                dtype=selector_pos_label.dtype,
+                            )
+                            pool_den = pool_pos.sum().clamp_min(1.0)
+                            if torch.is_tensor(selector_extra.get('false_support_mass_exact', None)):
+                                val_target_pool_pos_false_mass = (
+                                    selector_extra['false_support_mass_exact'].to(
+                                        device=pool_pos.device,
+                                        dtype=pool_pos.dtype,
+                                    ) * pool_pos
+                                ).sum() / pool_den
+                            if torch.is_tensor(selector_extra.get('overlap_intensity_tol', None)):
+                                val_target_pool_pos_overlap_tol = (
+                                    selector_extra['overlap_intensity_tol'].to(
+                                        device=pool_pos.device,
+                                        dtype=pool_pos.dtype,
+                                    ) * pool_pos
+                                ).sum() / pool_den
 
                     val_selector_loss = (
                         float(selector_bce_weight) * val_selector_bce
@@ -6216,6 +6296,12 @@ def train_mssubsetnet():
                 val_target_pool_pos_rate_vals.append(
                     float(val_target_pool_pos_rate.detach().item())
                 )
+                val_target_pool_pos_false_mass_vals.append(
+                    float(val_target_pool_pos_false_mass.detach().item())
+                )
+                val_target_pool_pos_overlap_tol_vals.append(
+                    float(val_target_pool_pos_overlap_tol.detach().item())
+                )
                 val_selector_dyn_pos_weight_vals.append(
                     float(val_selector_dyn_pos_weight.detach().item())
                 )
@@ -6291,6 +6377,8 @@ def train_mssubsetnet():
         avg_train_target_fallback_rate = _finite_mean(train_target_fallback_rate_vals)
         avg_train_target_clean_pos_rate = _finite_mean(train_target_clean_pos_rate_vals)
         avg_train_target_pool_pos_rate = _finite_mean(train_target_pool_pos_rate_vals)
+        avg_train_target_pool_pos_false_mass = _finite_mean(train_target_pool_pos_false_mass_vals)
+        avg_train_target_pool_pos_overlap_tol = _finite_mean(train_target_pool_pos_overlap_tol_vals)
         avg_train_selector_dyn_pos_weight = _finite_mean(train_selector_dyn_pos_weight_vals)
         avg_train_use_rerank_delta = _finite_mean(train_use_rerank_delta_vals)
         avg_val_selector_loss = _finite_mean(val_selector_loss_vals)
@@ -6305,6 +6393,8 @@ def train_mssubsetnet():
         avg_val_target_fallback_rate = _finite_mean(val_target_fallback_rate_vals)
         avg_val_target_clean_pos_rate = _finite_mean(val_target_clean_pos_rate_vals)
         avg_val_target_pool_pos_rate = _finite_mean(val_target_pool_pos_rate_vals)
+        avg_val_target_pool_pos_false_mass = _finite_mean(val_target_pool_pos_false_mass_vals)
+        avg_val_target_pool_pos_overlap_tol = _finite_mean(val_target_pool_pos_overlap_tol_vals)
         avg_val_selector_dyn_pos_weight = _finite_mean(val_selector_dyn_pos_weight_vals)
         avg_val_use_rerank_delta = _finite_mean(val_use_rerank_delta_vals)
         avg_val_model_topk_teacher_recall = _finite_mean(val_model_topk_teacher_recall_vals)
@@ -6511,6 +6601,8 @@ def train_mssubsetnet():
             f'train_target_fallback_rate={avg_train_target_fallback_rate:.4f} | '
             f'train_target_clean_pos_rate={avg_train_target_clean_pos_rate:.4f} | '
             f'train_target_pool_pos_rate={avg_train_target_pool_pos_rate:.4f} | '
+            f'train_target_pool_pos_false_mass={avg_train_target_pool_pos_false_mass:.4f} | '
+            f'train_target_pool_pos_overlap_tol={avg_train_target_pool_pos_overlap_tol:.4f} | '
             f'train_selector_dyn_pos_weight={avg_train_selector_dyn_pos_weight:.4f} | '
             f'train_use_rerank_delta={avg_train_use_rerank_delta:.1f} | '
             f'train_main_candidate_kl={avg_train_main_kl:.4f} | '
@@ -6537,6 +6629,8 @@ def train_mssubsetnet():
             f'val_target_fallback_rate={avg_val_target_fallback_rate:.4f} | '
             f'val_target_clean_pos_rate={avg_val_target_clean_pos_rate:.4f} | '
             f'val_target_pool_pos_rate={avg_val_target_pool_pos_rate:.4f} | '
+            f'val_target_pool_pos_false_mass={avg_val_target_pool_pos_false_mass:.4f} | '
+            f'val_target_pool_pos_overlap_tol={avg_val_target_pool_pos_overlap_tol:.4f} | '
             f'val_selector_dyn_pos_weight={avg_val_selector_dyn_pos_weight:.4f} | '
             f'val_use_rerank_delta={avg_val_use_rerank_delta:.1f} | '
             f'val_model_topk_teacher_recall@{model_topk_eval}={avg_val_model_topk_teacher_recall:.4f} | '
@@ -6635,6 +6729,8 @@ def train_mssubsetnet():
         history['train_target_fallback_rate'].append(avg_train_target_fallback_rate)
         history['train_target_clean_pos_rate'].append(avg_train_target_clean_pos_rate)
         history['train_target_pool_pos_rate'].append(avg_train_target_pool_pos_rate)
+        history['train_target_pool_pos_false_mass'].append(avg_train_target_pool_pos_false_mass)
+        history['train_target_pool_pos_overlap_tol'].append(avg_train_target_pool_pos_overlap_tol)
         history['train_selector_dyn_pos_weight'].append(avg_train_selector_dyn_pos_weight)
         history['train_use_rerank_delta'].append(avg_train_use_rerank_delta)
         history['val_selector_bce'].append(avg_val_selector_bce)
@@ -6648,6 +6744,8 @@ def train_mssubsetnet():
         history['val_target_fallback_rate'].append(avg_val_target_fallback_rate)
         history['val_target_clean_pos_rate'].append(avg_val_target_clean_pos_rate)
         history['val_target_pool_pos_rate'].append(avg_val_target_pool_pos_rate)
+        history['val_target_pool_pos_false_mass'].append(avg_val_target_pool_pos_false_mass)
+        history['val_target_pool_pos_overlap_tol'].append(avg_val_target_pool_pos_overlap_tol)
         history['val_selector_dyn_pos_weight'].append(avg_val_selector_dyn_pos_weight)
         history['val_use_rerank_delta'].append(avg_val_use_rerank_delta)
         history['val_selector_loss'].append(avg_val_selector_loss)
