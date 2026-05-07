@@ -4588,6 +4588,8 @@ def train_mssubsetnet():
         'train_selector_pos_rate': [],
         'train_target_pos_false_mass': [],
         'train_target_pos_overlap_exact': [],
+        'train_target_pos_exact_support_mass': [],
+        'train_target_strict_keep_rate': [],
         'train_use_rerank_delta': [],
         'val_selector_loss': [],
         'val_selector_bce': [],
@@ -4596,6 +4598,8 @@ def train_mssubsetnet():
         'val_selector_pos_rate': [],
         'val_target_pos_false_mass': [],
         'val_target_pos_overlap_exact': [],
+        'val_target_pos_exact_support_mass': [],
+        'val_target_strict_keep_rate': [],
         'val_use_rerank_delta': [],
         'val_model_topk_teacher_recall': [],
         'train_precursor_loss': [],
@@ -4654,6 +4658,8 @@ def train_mssubsetnet():
         train_selector_pos_rate_vals = []
         train_target_pos_false_mass_vals = []
         train_target_pos_overlap_exact_vals = []
+        train_target_pos_exact_support_mass_vals = []
+        train_target_strict_keep_rate_vals = []
         train_use_rerank_delta_vals = []
         train_rerank_kl_vals = []
         train_rerank_bce_vals = []
@@ -5214,6 +5220,12 @@ def train_mssubsetnet():
             train_selector_pos_rate_vals.append(float(selector_pos_rate.detach().item()))
             train_target_pos_false_mass_vals.append(float(target_pos_false_mass.detach().item()))
             train_target_pos_overlap_exact_vals.append(float(target_pos_overlap_exact.detach().item()))
+            train_target_pos_exact_support_mass_vals.append(
+                float(target_pos_exact_support_mass.detach().item())
+            )
+            train_target_strict_keep_rate_vals.append(
+                float(target_strict_keep_rate.detach().item())
+            )
             use_rerank_delta_val = 0.0
             if isinstance(res_full, dict):
                 v = res_full.get('use_rerank_delta', 0.0)
@@ -5260,6 +5272,8 @@ def train_mssubsetnet():
         val_selector_pos_rate_vals = []
         val_target_pos_false_mass_vals = []
         val_target_pos_overlap_exact_vals = []
+        val_target_pos_exact_support_mass_vals = []
+        val_target_strict_keep_rate_vals = []
         val_use_rerank_delta_vals = []
         val_rerank_kl_vals = []
         val_rerank_bce_vals = []
@@ -5937,6 +5951,12 @@ def train_mssubsetnet():
                 val_selector_pos_rate_vals.append(float(val_selector_pos_rate.detach().item()))
                 val_target_pos_false_mass_vals.append(float(val_target_pos_false_mass.detach().item()))
                 val_target_pos_overlap_exact_vals.append(float(val_target_pos_overlap_exact.detach().item()))
+                val_target_pos_exact_support_mass_vals.append(
+                    float(val_target_pos_exact_support_mass.detach().item())
+                )
+                val_target_strict_keep_rate_vals.append(
+                    float(val_target_strict_keep_rate.detach().item())
+                )
                 use_rerank_delta_val = 0.0
                 if isinstance(res_full, dict):
                     v = res_full.get('use_rerank_delta', 0.0)
@@ -6004,6 +6024,8 @@ def train_mssubsetnet():
         avg_train_selector_pos_rate = _finite_mean(train_selector_pos_rate_vals)
         avg_train_target_pos_false_mass = _finite_mean(train_target_pos_false_mass_vals)
         avg_train_target_pos_overlap_exact = _finite_mean(train_target_pos_overlap_exact_vals)
+        avg_train_target_pos_exact_support_mass = _finite_mean(train_target_pos_exact_support_mass_vals)
+        avg_train_target_strict_keep_rate = _finite_mean(train_target_strict_keep_rate_vals)
         avg_train_use_rerank_delta = _finite_mean(train_use_rerank_delta_vals)
         avg_val_selector_loss = _finite_mean(val_selector_loss_vals)
         avg_val_selector_bce = _finite_mean(val_selector_bce_vals)
@@ -6012,6 +6034,8 @@ def train_mssubsetnet():
         avg_val_selector_pos_rate = _finite_mean(val_selector_pos_rate_vals)
         avg_val_target_pos_false_mass = _finite_mean(val_target_pos_false_mass_vals)
         avg_val_target_pos_overlap_exact = _finite_mean(val_target_pos_overlap_exact_vals)
+        avg_val_target_pos_exact_support_mass = _finite_mean(val_target_pos_exact_support_mass_vals)
+        avg_val_target_strict_keep_rate = _finite_mean(val_target_strict_keep_rate_vals)
         avg_val_use_rerank_delta = _finite_mean(val_use_rerank_delta_vals)
         avg_val_model_topk_teacher_recall = _finite_mean(val_model_topk_teacher_recall_vals)
         avg_val_active_teacher_recall = _finite_mean(val_active_teacher_recall_vals)
@@ -6212,6 +6236,8 @@ def train_mssubsetnet():
             f'train_selector_pos_rate={avg_train_selector_pos_rate:.4f} | '
             f'train_target_pos_false_mass={avg_train_target_pos_false_mass:.4f} | '
             f'train_target_pos_overlap_exact={avg_train_target_pos_overlap_exact:.4f} | '
+            f'train_target_pos_exact_support_mass={avg_train_target_pos_exact_support_mass:.4f} | '
+            f'train_target_strict_keep_rate={avg_train_target_strict_keep_rate:.4f} | ' 
             f'train_use_rerank_delta={avg_train_use_rerank_delta:.1f} | '
             f'train_main_candidate_kl={avg_train_main_kl:.4f} | '
             f'train_rerank_kl={avg_train_rerank_kl:.4f} | '
@@ -6232,6 +6258,8 @@ def train_mssubsetnet():
             f'val_selector_pos_rate={avg_val_selector_pos_rate:.4f} | '
             f'val_target_pos_false_mass={avg_val_target_pos_false_mass:.4f} | '
             f'val_target_pos_overlap_exact={avg_val_target_pos_overlap_exact:.4f} | '
+            f'val_target_pos_exact_support_mass={avg_val_target_pos_exact_support_mass:.4f} | '
+            f'val_target_strict_keep_rate={avg_val_target_strict_keep_rate:.4f} | '
             f'val_use_rerank_delta={avg_val_use_rerank_delta:.1f} | '
             f'val_model_topk_teacher_recall@{model_topk_eval}={avg_val_model_topk_teacher_recall:.4f} | '
             f'val_active_teacher_recall={avg_val_active_teacher_recall:.4f} | '
@@ -6324,6 +6352,8 @@ def train_mssubsetnet():
         history['train_selector_pos_rate'].append(avg_train_selector_pos_rate)
         history['train_target_pos_false_mass'].append(avg_train_target_pos_false_mass)
         history['train_target_pos_overlap_exact'].append(avg_train_target_pos_overlap_exact)
+        history['train_target_pos_exact_support_mass'].append(avg_train_target_pos_exact_support_mass)
+        history['train_target_strict_keep_rate'].append(avg_train_target_strict_keep_rate)
         history['train_use_rerank_delta'].append(avg_train_use_rerank_delta)
         history['val_selector_bce'].append(avg_val_selector_bce)
         history['val_selector_kl'].append(avg_val_selector_kl)
@@ -6331,6 +6361,8 @@ def train_mssubsetnet():
         history['val_selector_pos_rate'].append(avg_val_selector_pos_rate)
         history['val_target_pos_false_mass'].append(avg_val_target_pos_false_mass)
         history['val_target_pos_overlap_exact'].append(avg_val_target_pos_overlap_exact)
+        history['val_target_pos_exact_support_mass'].append(avg_val_target_pos_exact_support_mass)
+        history['val_target_strict_keep_rate'].append(avg_val_target_strict_keep_rate)
         history['val_use_rerank_delta'].append(avg_val_use_rerank_delta)
         history['val_selector_loss'].append(avg_val_selector_loss)
         history['val_model_topk_teacher_recall'].append(avg_val_model_topk_teacher_recall)
