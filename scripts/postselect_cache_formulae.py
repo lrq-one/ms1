@@ -26,6 +26,7 @@ def _get_features(obj):
         return obj
     return {}
 
+
 def _select_indices(features, max_keep=4096, low_mz_max=220.0):
     mask = np.asarray(features.get("formulae_mask", []), dtype=np.float32).reshape(-1) > 0.5
     M = int(mask.shape[0])
@@ -60,114 +61,215 @@ def _select_indices(features, max_keep=4096, low_mz_max=220.0):
     valid_peak = (off_idx >= 0) & np.isfinite(off_int) & (off_int > 0)
     peak_n = valid_peak.sum(axis=1).astype(np.float32)
 
+    def _as1d_local(x, default=0.0, dtype=np.float32):
+        if x is None:
+            return np.full((n,), default, dtype=dtype)
+        arr = np.asarray(x, dtype=dtype).reshape(-1)
+        if arr.shape[0] < n:
+            arr = np.concatenate([arr, np.full((n - arr.shape[0],), default, dtype=dtype)], axis=0)
+        return arr[:n]
+
+    source = _as1d_local(features.get("formulae_source_flag", None), 0.0)
+    active = _as1d_local(features.get("formulae_active_mask", None), 0.0)
+    prior = _as1d_local(features.get("formulae_prior_score", None), 0.0)
+    break_depth = _as1d_local(features.get("formulae_break_depth", None), 9.0)
+    ring_cut = _as1d_local(features.get("formulae_ring_cut_flag", None), 0.0)
+
+    bw = float(os.environ.get("OFFICIAL_BIN_WIDTH", "0.01"))
+    low_bin_max = int(float(low_mz_max) / max(1e-6, bw))
+
+    # 每个 candidate 的 support bins
+    cand_bins = []
+    cand_low_bins = []
     min_bin = np.full((n,), 10**9, dtype=np.int64)
-    max_bin = np.full((n,), -1, dtype=np.int64)
 
     for i in range(n):
-        if mask[i] and np.any(valid_peak[i]):
-            vals = off_idx[i][valid_peak[i]]
-            min_bin[i] = int(np.min(vals))
-            max_bin[i] = int(np.max(vals))
-
-    source = _as1d(features.get("formulae_source_flag", None), n, 0.0)
-    active = _as1d(features.get("formulae_active_mask", None), n, 0.0)
-    prior = _as1d(features.get("formulae_prior_score", None), n, 0.0)
-    break_depth = _as1d(features.get("formulae_break_depth", None), n, 9.0)
-    ring_cut = _as1d(features.get("formulae_ring_cut_flag", None), n, 0.0)
+        if not mask[i] or not np.any(valid_peak[i]):
+            cand_bins.append(())
+            cand_low_bins.append(())
+            continue
+        bins = np.unique(off_idx[i][valid_peak[i]].astype(np.int64))
+        bins = bins[bins >= 0]
+        cand_bins.append(tuple(int(x) for x in bins.tolist()))
+        low_bins = bins[bins <= low_bin_max]
+        cand_low_bins.append(tuple(int(x) for x in low_bins.tolist()))
+        if bins.size > 0:
+            min_bin[i] = int(np.min(bins))
 
     selected = []
     selected_set = set()
 
+    def add_one(ci):
+        ci = int(ci)
+        if ci < 0 or ci >= n:
+            return False
+        if not mask[ci]:
+            return False
+        if ci in selected_set:
+            return False
+        selected.append(ci)
+        selected_set.add(ci)
+        return True
+
     def add_many(cands, limit):
-        nonlocal selected, selected_set
         if limit <= 0:
             return
         for ci in cands:
-            ci = int(ci)
-            if ci < 0 or ci >= n:
-                continue
-            if not mask[ci]:
-                continue
-            if ci in selected_set:
-                continue
-            selected.append(ci)
-            selected_set.add(ci)
             if len(selected) >= max_keep:
                 return
-            limit -= 1
-            if limit <= 0:
-                return
+            if add_one(ci):
+                limit -= 1
+                if limit <= 0:
+                    return
 
-    source_budget = int(os.environ.get("POSTSELECT_SOURCE_BUDGET", "1024"))
-    low_budget = int(os.environ.get("POSTSELECT_LOW_MZ_BUDGET", "1536"))
-    diverse_budget = int(os.environ.get("POSTSELECT_DIVERSE_BUDGET", "1024"))
-
-    # 1. source / active / prior-supported candidates
-    source_score = (
-        8.0 * (source > 0).astype(np.float32)
-        + 4.0 * (active > 0).astype(np.float32)
-        + prior
-        + 0.05 * peak_n
-        - 0.10 * np.clip(break_depth, 0, 10)
-        - 0.30 * (ring_cut > 0).astype(np.float32)
-    )
-    source_ids = valid_ids[np.argsort(-source_score[valid_ids], kind="stable")]
-    add_many(source_ids, source_budget)
-
-    # 2. low-mz candidates: 修复 72/86/96/110 这种高能 HCD 小离子
-    bw = float(os.environ.get("OFFICIAL_BIN_WIDTH", "0.01"))
-    low_bin_max = int(float(low_mz_max) / max(1e-6, bw))
-    low_ids = valid_ids[min_bin[valid_ids] <= low_bin_max]
-
-    low_score = (
-        2.0 * (source[low_ids] > 0).astype(np.float32)
-        + 1.0 * (active[low_ids] > 0).astype(np.float32)
-        + prior[low_ids]
-        + 0.05 * peak_n[low_ids]
-        - 0.00002 * min_bin[low_ids].astype(np.float32)
-    )
-    low_ids = low_ids[np.argsort(-low_score, kind="stable")]
-    add_many(low_ids, low_budget)
-
-    # 3. mass-diverse candidates: 避免只保留低 m/z，保留中高 m/z 结构峰
-    bucket_da = float(os.environ.get("POSTSELECT_BUCKET_DA", "25.0"))
-    bucket_size = max(1, int(bucket_da / max(1e-6, bw)))
-    bucket = np.floor_divide(np.maximum(min_bin, 0), bucket_size)
-
-    diverse_order = []
-    per_bucket = int(os.environ.get("POSTSELECT_PER_BUCKET", "32"))
-
-    for b in sorted(set(bucket[valid_ids].tolist())):
-        ids_b = valid_ids[bucket[valid_ids] == b]
-        if ids_b.size <= 0:
-            continue
-
-        score_b = (
-            4.0 * (source[ids_b] > 0).astype(np.float32)
-            + 2.0 * (active[ids_b] > 0).astype(np.float32)
-            + prior[ids_b]
-            + 0.03 * peak_n[ids_b]
+    def candidate_base_score(ids):
+        ids = np.asarray(ids, dtype=np.int64)
+        return (
+            5.0 * (source[ids] > 0).astype(np.float32)
+            + 2.0 * (active[ids] > 0).astype(np.float32)
+            + prior[ids]
+            + 0.03 * peak_n[ids]
+            - 0.08 * np.clip(break_depth[ids], 0, 10)
+            - 0.20 * (ring_cut[ids] > 0).astype(np.float32)
         )
-        ids_b = ids_b[np.argsort(-score_b, kind="stable")]
-        diverse_order.extend(ids_b[:per_bucket].tolist())
 
-        if len(diverse_order) >= diverse_budget:
+    # -----------------------------
+    # 1. 小预算保留 source/active
+    # -----------------------------
+    source_budget = int(os.environ.get("POSTSELECT_SOURCE_BUDGET", "512"))
+    source_score = candidate_base_score(valid_ids)
+    source_order = valid_ids[np.argsort(-source_score, kind="stable")]
+    add_many(source_order, source_budget)
+
+    # -----------------------------
+    # 2. low-mz exact-bin set cover
+    # -----------------------------
+    low_budget = int(os.environ.get("POSTSELECT_LOW_MZ_BUDGET", "2048"))
+
+    low_candidates = np.asarray(
+        [i for i in valid_ids if len(cand_low_bins[int(i)]) > 0],
+        dtype=np.int64,
+    )
+
+    covered_low = set()
+    # 先把已选候选的 low bins 计入
+    for ci in selected:
+        covered_low.update(cand_low_bins[int(ci)])
+
+    remaining = set(int(x) for x in low_candidates.tolist()) - selected_set
+
+    # 为了速度，不每次全量排序太复杂；每轮选 new_bin_count 最大的 candidate
+    while len(selected) < max_keep and low_budget > 0 and remaining:
+        best_ci = None
+        best_tuple = None
+
+        # 对 100k/25k 规模足够快，候选每个只有少量 peaks
+        for ci in list(remaining):
+            new_bins = 0
+            for b in cand_low_bins[ci]:
+                if b not in covered_low:
+                    new_bins += 1
+            if new_bins <= 0:
+                continue
+
+            # 先最大化新增 bins，再用 source/prior 打破平局
+            tie_score = (
+                5.0 * float(source[ci] > 0)
+                + 2.0 * float(active[ci] > 0)
+                + float(prior[ci])
+                + 0.03 * float(peak_n[ci])
+                - 0.05 * float(min(max(break_depth[ci], 0), 10))
+            )
+            tup = (int(new_bins), float(tie_score), -int(min_bin[ci]))
+            if best_tuple is None or tup > best_tuple:
+                best_tuple = tup
+                best_ci = ci
+
+        if best_ci is None:
             break
 
-    add_many(diverse_order, diverse_budget)
+        add_one(best_ci)
+        remaining.remove(best_ci)
+        covered_low.update(cand_low_bins[int(best_ci)])
+        low_budget -= 1
 
-    # 4. fill: 先验 + source + active
-    fill_score = (
-        4.0 * (source > 0).astype(np.float32)
-        + 2.0 * (active > 0).astype(np.float32)
-        + prior
-        + 0.03 * peak_n
-        - 0.05 * np.clip(break_depth, 0, 10)
-    )
-    fill_ids = valid_ids[np.argsort(-fill_score[valid_ids], kind="stable")]
-    add_many(fill_ids, max_keep - len(selected))
+    # 如果 low budget 还没用完，用低 m/z candidate 的 base score 补一些
+    if low_budget > 0 and len(selected) < max_keep:
+        rest = np.asarray([x for x in low_candidates if int(x) not in selected_set], dtype=np.int64)
+        if rest.size > 0:
+            rest_score = candidate_base_score(rest)
+            rest = rest[np.argsort(-rest_score, kind="stable")]
+            add_many(rest, low_budget)
 
-    # 5. 如果还没满，按原始顺序补
+    # -----------------------------
+    # 3. 全局 bucket set cover
+    # -----------------------------
+    diverse_budget = int(os.environ.get("POSTSELECT_DIVERSE_BUDGET", "1024"))
+    bucket_da = float(os.environ.get("POSTSELECT_BUCKET_DA", "25.0"))
+    bucket_size = max(1, int(bucket_da / max(1e-6, bw)))
+    per_bucket = int(os.environ.get("POSTSELECT_PER_BUCKET", "48"))
+
+    bucket_to_ids = {}
+    for ci in valid_ids:
+        ci = int(ci)
+        if ci in selected_set or len(cand_bins[ci]) == 0:
+            continue
+        b = int(min_bin[ci] // bucket_size)
+        bucket_to_ids.setdefault(b, []).append(ci)
+
+    global_covered = set()
+    for ci in selected:
+        global_covered.update(cand_bins[int(ci)])
+
+    # 每个 bucket 内做 small greedy
+    for b in sorted(bucket_to_ids.keys()):
+        if len(selected) >= max_keep or diverse_budget <= 0:
+            break
+
+        ids_b = set(bucket_to_ids[b])
+        take_b = min(per_bucket, diverse_budget)
+        local_taken = 0
+
+        while ids_b and local_taken < take_b and diverse_budget > 0:
+            best_ci = None
+            best_tuple = None
+            for ci in list(ids_b):
+                new_bins = 0
+                for bb in cand_bins[ci]:
+                    if bb not in global_covered:
+                        new_bins += 1
+                if new_bins <= 0:
+                    continue
+                tie_score = (
+                    4.0 * float(source[ci] > 0)
+                    + 2.0 * float(active[ci] > 0)
+                    + float(prior[ci])
+                    + 0.02 * float(peak_n[ci])
+                )
+                tup = (int(new_bins), float(tie_score))
+                if best_tuple is None or tup > best_tuple:
+                    best_tuple = tup
+                    best_ci = ci
+
+            if best_ci is None:
+                break
+
+            add_one(best_ci)
+            ids_b.remove(best_ci)
+            global_covered.update(cand_bins[int(best_ci)])
+            diverse_budget -= 1
+            local_taken += 1
+
+    # -----------------------------
+    # 4. fill：prior/source/active 补满
+    # -----------------------------
+    fill_ids = np.asarray([i for i in valid_ids if int(i) not in selected_set], dtype=np.int64)
+    if fill_ids.size > 0 and len(selected) < max_keep:
+        fill_score = candidate_base_score(fill_ids)
+        fill_ids = fill_ids[np.argsort(-fill_score, kind="stable")]
+        add_many(fill_ids, max_keep - len(selected))
+
+    # 兜底
     if len(selected) < max_keep:
         add_many(valid_ids, max_keep - len(selected))
 
