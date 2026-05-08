@@ -1807,6 +1807,31 @@ def main():
         out_dir = os.path.join('data', f'nist20_{split}.cache_formula{args.max_formulae}_condv2')
     os.makedirs(out_dir, exist_ok=True)
 
+    def _cleanup_stale_cache_outputs(out_dir):
+        import glob
+        import os
+
+        patterns = [
+            "*.pkl",
+            "*.pkl.tmp.*",
+            "selected_row_indices.json",
+            "cache_manifest.json",
+            "cache_diag_summary.json",
+            "candidate_peak_audit_summary.json",
+        ]
+
+        for pat in patterns:
+            for p in glob.glob(os.path.join(out_dir, pat)):
+                try:
+                    if os.path.isfile(p):
+                        os.remove(p)
+                except Exception as e:
+                    print(f"[cache-condv2][warn] failed to remove stale file {p}: {e}", flush=True)
+
+
+    if bool(getattr(args, "overwrite", False)):
+        _cleanup_stale_cache_outputs(args.out_dir)
+
     cache_diag_path = ''
     raw_diag = str(args.cache_diag_jsonl or '').strip()
     if raw_diag and raw_diag.lower() not in ('none', 'off', 'false', '0'):
