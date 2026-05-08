@@ -513,7 +513,12 @@ def load_nist20_records(
         soft_inchikey_match = None
         if msp_inchikey is not None and inchikey is not None:
             soft_inchikey_match = int(_norm_inchikey(inchikey) == msp_inchikey)
-
+        if (
+            os.environ.get("NIST20_REJECT_INCHIKEY_MISMATCH", "1") == "1"
+            and soft_inchikey_match == 0
+        ):
+            stats["hard_inchikey_mismatch"] += 1
+            continue
         record = {
             "identifier": f"nist20:{mol_id}",
             "rdmol": mol,
