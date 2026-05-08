@@ -28,6 +28,10 @@ def _get_features(obj):
 
 
 def _select_indices(features, max_keep=4096, low_mz_max=220.0):
+    import os
+    import heapq
+    import numpy as np
+
     mask = np.asarray(features.get("formulae_mask", []), dtype=np.float32).reshape(-1) > 0.5
     M = int(mask.shape[0])
     if M <= 0:
@@ -66,7 +70,10 @@ def _select_indices(features, max_keep=4096, low_mz_max=220.0):
             return np.full((n,), default, dtype=dtype)
         arr = np.asarray(x, dtype=dtype).reshape(-1)
         if arr.shape[0] < n:
-            arr = np.concatenate([arr, np.full((n - arr.shape[0],), default, dtype=dtype)], axis=0)
+            arr = np.concatenate(
+                [arr, np.full((n - arr.shape[0],), default, dtype=dtype)],
+                axis=0,
+            )
         return arr[:n]
 
     source = _as1d_local(features.get("formulae_source_flag", None), 0.0)
@@ -84,9 +91,12 @@ def _select_indices(features, max_keep=4096, low_mz_max=220.0):
         if not mask[i] or not np.any(valid_peak[i]):
             cand_bins.append(())
             continue
+
         bins = np.unique(off_idx[i][valid_peak[i]].astype(np.int64))
         bins = bins[bins >= 0]
-        cand_bins.append(tuple(int(x) for x in bins.tolist()))
+        tup = tuple(int(x) for x in bins.tolist())
+        cand_bins.append(tup)
+
         if bins.size > 0:
             min_bin[i] = int(np.min(bins))
 
@@ -117,6 +127,7 @@ def _select_indices(features, max_keep=4096, low_mz_max=220.0):
                     return
 
     def base_score(ci):
+        ci = int(ci)
         return (
             5.0 * float(source[ci] > 0)
             + 2.0 * float(active[ci] > 0)
@@ -126,14 +137,14 @@ def _select_indices(features, max_keep=4096, low_mz_max=220.0):
             - 0.20 * float(ring_cut[ci] > 0)
         )
 
-    def region_bins(ci, lo_bin, hi_bin):
+    def region_bins_tuple(ci, lo_bin, hi_bin):
         out = []
         for b in cand_bins[int(ci)]:
             if b >= lo_bin and b < hi_bin:
                 out.append(int(b))
         return tuple(out)
 
-    def greedy_region_setcover(lo_mz, hi_mz, budget, name="region"):
+    def lazy_greedy_region_setcover(lo_mz, hi_mz, budget, name="region"):
         if budget <= 0 or len(selected) >= max_keep:
             return
 
@@ -141,72 +152,87 @@ def _select_indices(features, max_keep=4096, low_mz_max=220.0):
         hi_bin = int(float(hi_mz) / max(1e-6, bw))
 
         region_cache = {}
-        candidates = []
+        heap = []
+
+        # 已选候选也算覆盖，避免区域间重复浪费
+        covered = set()
+        for ci in selected:
+            for b in region_bins_tuple(ci, lo_bin, hi_bin):
+                covered.add(int(b))
+
         for ci in valid_ids:
             ci = int(ci)
             if ci in selected_set:
                 continue
-            rb = region_bins(ci, lo_bin, hi_bin)
+
+            rb = region_bins_tuple(ci, lo_bin, hi_bin)
             if len(rb) <= 0:
                 continue
+
             region_cache[ci] = rb
-            candidates.append(ci)
+            gain = len(rb)
+            tie = base_score(ci)
 
-        remaining = set(candidates)
-        covered = set()
+            # Python heap 是小根堆，所以用负号实现最大堆
+            heapq.heappush(heap, (-gain, -tie, int(min_bin[ci]), ci))
 
-        # 已选候选也算覆盖，避免重复浪费
-        for ci in selected:
-            for b in region_bins(ci, lo_bin, hi_bin):
+        picked = 0
+
+        while heap and picked < budget and len(selected) < max_keep:
+            neg_gain_old, neg_tie, mb, ci = heapq.heappop(heap)
+            ci = int(ci)
+
+            if ci in selected_set:
+                continue
+
+            rb = region_cache.get(ci, ())
+            if not rb:
+                continue
+
+            true_gain = 0
+            for b in rb:
+                if b not in covered:
+                    true_gain += 1
+
+            if true_gain <= 0:
+                continue
+
+            # lazy greedy:
+            # 如果重新计算后的 gain 仍然足够，就选它；
+            # 否则把更新后的 gain 放回堆，等待下一轮比较。
+            old_gain = -int(neg_gain_old)
+            if true_gain < old_gain:
+                heapq.heappush(heap, (-true_gain, neg_tie, mb, ci))
+                continue
+
+            add_one(ci)
+            for b in rb:
                 covered.add(int(b))
+            picked += 1
 
-        while remaining and budget > 0 and len(selected) < max_keep:
-            best_ci = None
-            best_tuple = None
-
-            # 贪心：先最大化新增 bins，再看先验/source
-            for ci in list(remaining):
-                rb = region_cache[ci]
-                new_n = 0
-                for b in rb:
-                    if b not in covered:
-                        new_n += 1
-
-                if new_n <= 0:
+        # 如果 set cover 没用完预算，用 region 内 base score 补足
+        if picked < budget and len(selected) < max_keep:
+            rest = []
+            for ci, rb in region_cache.items():
+                if ci in selected_set:
                     continue
+                if not rb:
+                    continue
+                rest.append(ci)
 
-                # 中 m/z 区域的 candidate 往往 peak 更复杂，不能只看 source
-                tie = base_score(ci)
-                tup = (int(new_n), float(tie), -int(min_bin[ci]))
-
-                if best_tuple is None or tup > best_tuple:
-                    best_tuple = tup
-                    best_ci = ci
-
-            if best_ci is None:
-                break
-
-            add_one(best_ci)
-            remaining.remove(best_ci)
-            for b in region_cache[best_ci]:
-                covered.add(int(b))
-            budget -= 1
-
-        # 如果 setcover 没用完预算，用 region 内 base score 补
-        if budget > 0 and len(selected) < max_keep:
-            rest = np.asarray([ci for ci in candidates if ci not in selected_set], dtype=np.int64)
-            if rest.size > 0:
+            if rest:
+                rest = np.asarray(rest, dtype=np.int64)
                 scores = np.asarray([base_score(int(ci)) for ci in rest], dtype=np.float32)
                 rest = rest[np.argsort(-scores, kind="stable")]
-                add_many(rest, budget)
+                add_many(rest, budget - picked)
 
-    # 1. source/active 只保少量，避免挤掉 coverage
+    # 1. source / active 只保少量，避免挤掉 coverage
     source_budget = int(os.environ.get("POSTSELECT_SOURCE_BUDGET", "256"))
     source_scores = np.asarray([base_score(int(ci)) for ci in valid_ids], dtype=np.float32)
     source_order = valid_ids[np.argsort(-source_scores, kind="stable")]
     add_many(source_order, source_budget)
 
-    # 2. 分区 support set cover
+    # 2. 分区 lazy set cover
     low_budget = int(os.environ.get("POSTSELECT_LOW_MZ_BUDGET", "1024"))
     mid_budget = int(os.environ.get("POSTSELECT_MID_MZ_BUDGET", "1536"))
     high_budget = int(os.environ.get("POSTSELECT_HIGH_MZ_BUDGET", "768"))
@@ -215,9 +241,9 @@ def _select_indices(features, max_keep=4096, low_mz_max=220.0):
     mid_hi = float(os.environ.get("POSTSELECT_MID_MZ_MAX", "500.0"))
     high_hi = float(os.environ.get("POSTSELECT_HIGH_MZ_MAX", "1500.0"))
 
-    greedy_region_setcover(0.0, low_hi, low_budget, name="low")
-    greedy_region_setcover(low_hi, mid_hi, mid_budget, name="mid")
-    greedy_region_setcover(mid_hi, high_hi, high_budget, name="high")
+    lazy_greedy_region_setcover(0.0, low_hi, low_budget, name="low")
+    lazy_greedy_region_setcover(low_hi, mid_hi, mid_budget, name="mid")
+    lazy_greedy_region_setcover(mid_hi, high_hi, high_budget, name="high")
 
     # 3. fill：补满 4096
     if len(selected) < max_keep:
@@ -324,12 +350,21 @@ def main():
     paths = sorted(glob.glob(os.path.join(args.in_dir, "*.pkl")))
     print("input pkl:", len(paths))
 
-    for p in paths:
+    try:
+        from tqdm import tqdm
+        iterator = tqdm(paths, desc="postselect", ncols=120)
+    except Exception:
+        iterator = paths
+
+    for ii, p in enumerate(iterator, 1):
         obj = pickle.load(open(p, "rb"))
         obj2 = postselect_one(obj, max_keep=args.max_keep, low_mz_max=args.low_mz_max)
         out_p = os.path.join(args.out_dir, os.path.basename(p))
         with open(out_p, "wb") as f:
             pickle.dump(obj2, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        if not hasattr(iterator, "set_description") and ii % 50 == 0:
+            print(f"[postselect] processed={ii}/{len(paths)}", flush=True)
 
     print("written:", args.out_dir)
 
