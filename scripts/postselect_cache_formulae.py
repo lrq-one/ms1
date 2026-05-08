@@ -76,23 +76,17 @@ def _select_indices(features, max_keep=4096, low_mz_max=220.0):
     ring_cut = _as1d_local(features.get("formulae_ring_cut_flag", None), 0.0)
 
     bw = float(os.environ.get("OFFICIAL_BIN_WIDTH", "0.01"))
-    low_bin_max = int(float(low_mz_max) / max(1e-6, bw))
 
-    # 每个 candidate 的 support bins
     cand_bins = []
-    cand_low_bins = []
     min_bin = np.full((n,), 10**9, dtype=np.int64)
 
     for i in range(n):
         if not mask[i] or not np.any(valid_peak[i]):
             cand_bins.append(())
-            cand_low_bins.append(())
             continue
         bins = np.unique(off_idx[i][valid_peak[i]].astype(np.int64))
         bins = bins[bins >= 0]
         cand_bins.append(tuple(int(x) for x in bins.tolist()))
-        low_bins = bins[bins <= low_bin_max]
-        cand_low_bins.append(tuple(int(x) for x in low_bins.tolist()))
         if bins.size > 0:
             min_bin[i] = int(np.min(bins))
 
@@ -122,131 +116,69 @@ def _select_indices(features, max_keep=4096, low_mz_max=220.0):
                 if limit <= 0:
                     return
 
-    def candidate_base_score(ids):
-        ids = np.asarray(ids, dtype=np.int64)
+    def base_score(ci):
         return (
-            5.0 * (source[ids] > 0).astype(np.float32)
-            + 2.0 * (active[ids] > 0).astype(np.float32)
-            + prior[ids]
-            + 0.03 * peak_n[ids]
-            - 0.08 * np.clip(break_depth[ids], 0, 10)
-            - 0.20 * (ring_cut[ids] > 0).astype(np.float32)
+            5.0 * float(source[ci] > 0)
+            + 2.0 * float(active[ci] > 0)
+            + float(prior[ci])
+            + 0.03 * float(peak_n[ci])
+            - 0.08 * float(min(max(break_depth[ci], 0), 10))
+            - 0.20 * float(ring_cut[ci] > 0)
         )
 
-    # -----------------------------
-    # 1. 小预算保留 source/active
-    # -----------------------------
-    source_budget = int(os.environ.get("POSTSELECT_SOURCE_BUDGET", "512"))
-    source_score = candidate_base_score(valid_ids)
-    source_order = valid_ids[np.argsort(-source_score, kind="stable")]
-    add_many(source_order, source_budget)
+    def region_bins(ci, lo_bin, hi_bin):
+        out = []
+        for b in cand_bins[int(ci)]:
+            if b >= lo_bin and b < hi_bin:
+                out.append(int(b))
+        return tuple(out)
 
-    # -----------------------------
-    # 2. low-mz exact-bin set cover
-    # -----------------------------
-    low_budget = int(os.environ.get("POSTSELECT_LOW_MZ_BUDGET", "2048"))
+    def greedy_region_setcover(lo_mz, hi_mz, budget, name="region"):
+        if budget <= 0 or len(selected) >= max_keep:
+            return
 
-    low_candidates = np.asarray(
-        [i for i in valid_ids if len(cand_low_bins[int(i)]) > 0],
-        dtype=np.int64,
-    )
+        lo_bin = int(float(lo_mz) / max(1e-6, bw))
+        hi_bin = int(float(hi_mz) / max(1e-6, bw))
 
-    covered_low = set()
-    # 先把已选候选的 low bins 计入
-    for ci in selected:
-        covered_low.update(cand_low_bins[int(ci)])
-
-    remaining = set(int(x) for x in low_candidates.tolist()) - selected_set
-
-    # 为了速度，不每次全量排序太复杂；每轮选 new_bin_count 最大的 candidate
-    while len(selected) < max_keep and low_budget > 0 and remaining:
-        best_ci = None
-        best_tuple = None
-
-        # 对 100k/25k 规模足够快，候选每个只有少量 peaks
-        for ci in list(remaining):
-            new_bins = 0
-            for b in cand_low_bins[ci]:
-                if b not in covered_low:
-                    new_bins += 1
-            if new_bins <= 0:
+        region_cache = {}
+        candidates = []
+        for ci in valid_ids:
+            ci = int(ci)
+            if ci in selected_set:
                 continue
+            rb = region_bins(ci, lo_bin, hi_bin)
+            if len(rb) <= 0:
+                continue
+            region_cache[ci] = rb
+            candidates.append(ci)
 
-            # 先最大化新增 bins，再用 source/prior 打破平局
-            tie_score = (
-                5.0 * float(source[ci] > 0)
-                + 2.0 * float(active[ci] > 0)
-                + float(prior[ci])
-                + 0.03 * float(peak_n[ci])
-                - 0.05 * float(min(max(break_depth[ci], 0), 10))
-            )
-            tup = (int(new_bins), float(tie_score), -int(min_bin[ci]))
-            if best_tuple is None or tup > best_tuple:
-                best_tuple = tup
-                best_ci = ci
+        remaining = set(candidates)
+        covered = set()
 
-        if best_ci is None:
-            break
+        # 已选候选也算覆盖，避免重复浪费
+        for ci in selected:
+            for b in region_bins(ci, lo_bin, hi_bin):
+                covered.add(int(b))
 
-        add_one(best_ci)
-        remaining.remove(best_ci)
-        covered_low.update(cand_low_bins[int(best_ci)])
-        low_budget -= 1
-
-    # 如果 low budget 还没用完，用低 m/z candidate 的 base score 补一些
-    if low_budget > 0 and len(selected) < max_keep:
-        rest = np.asarray([x for x in low_candidates if int(x) not in selected_set], dtype=np.int64)
-        if rest.size > 0:
-            rest_score = candidate_base_score(rest)
-            rest = rest[np.argsort(-rest_score, kind="stable")]
-            add_many(rest, low_budget)
-
-    # -----------------------------
-    # 3. 全局 bucket set cover
-    # -----------------------------
-    diverse_budget = int(os.environ.get("POSTSELECT_DIVERSE_BUDGET", "1024"))
-    bucket_da = float(os.environ.get("POSTSELECT_BUCKET_DA", "25.0"))
-    bucket_size = max(1, int(bucket_da / max(1e-6, bw)))
-    per_bucket = int(os.environ.get("POSTSELECT_PER_BUCKET", "48"))
-
-    bucket_to_ids = {}
-    for ci in valid_ids:
-        ci = int(ci)
-        if ci in selected_set or len(cand_bins[ci]) == 0:
-            continue
-        b = int(min_bin[ci] // bucket_size)
-        bucket_to_ids.setdefault(b, []).append(ci)
-
-    global_covered = set()
-    for ci in selected:
-        global_covered.update(cand_bins[int(ci)])
-
-    # 每个 bucket 内做 small greedy
-    for b in sorted(bucket_to_ids.keys()):
-        if len(selected) >= max_keep or diverse_budget <= 0:
-            break
-
-        ids_b = set(bucket_to_ids[b])
-        take_b = min(per_bucket, diverse_budget)
-        local_taken = 0
-
-        while ids_b and local_taken < take_b and diverse_budget > 0:
+        while remaining and budget > 0 and len(selected) < max_keep:
             best_ci = None
             best_tuple = None
-            for ci in list(ids_b):
-                new_bins = 0
-                for bb in cand_bins[ci]:
-                    if bb not in global_covered:
-                        new_bins += 1
-                if new_bins <= 0:
+
+            # 贪心：先最大化新增 bins，再看先验/source
+            for ci in list(remaining):
+                rb = region_cache[ci]
+                new_n = 0
+                for b in rb:
+                    if b not in covered:
+                        new_n += 1
+
+                if new_n <= 0:
                     continue
-                tie_score = (
-                    4.0 * float(source[ci] > 0)
-                    + 2.0 * float(active[ci] > 0)
-                    + float(prior[ci])
-                    + 0.02 * float(peak_n[ci])
-                )
-                tup = (int(new_bins), float(tie_score))
+
+                # 中 m/z 区域的 candidate 往往 peak 更复杂，不能只看 source
+                tie = base_score(ci)
+                tup = (int(new_n), float(tie), -int(min_bin[ci]))
+
                 if best_tuple is None or tup > best_tuple:
                     best_tuple = tup
                     best_ci = ci
@@ -255,21 +187,47 @@ def _select_indices(features, max_keep=4096, low_mz_max=220.0):
                 break
 
             add_one(best_ci)
-            ids_b.remove(best_ci)
-            global_covered.update(cand_bins[int(best_ci)])
-            diverse_budget -= 1
-            local_taken += 1
+            remaining.remove(best_ci)
+            for b in region_cache[best_ci]:
+                covered.add(int(b))
+            budget -= 1
 
-    # -----------------------------
-    # 4. fill：prior/source/active 补满
-    # -----------------------------
-    fill_ids = np.asarray([i for i in valid_ids if int(i) not in selected_set], dtype=np.int64)
-    if fill_ids.size > 0 and len(selected) < max_keep:
-        fill_score = candidate_base_score(fill_ids)
-        fill_ids = fill_ids[np.argsort(-fill_score, kind="stable")]
-        add_many(fill_ids, max_keep - len(selected))
+        # 如果 setcover 没用完预算，用 region 内 base score 补
+        if budget > 0 and len(selected) < max_keep:
+            rest = np.asarray([ci for ci in candidates if ci not in selected_set], dtype=np.int64)
+            if rest.size > 0:
+                scores = np.asarray([base_score(int(ci)) for ci in rest], dtype=np.float32)
+                rest = rest[np.argsort(-scores, kind="stable")]
+                add_many(rest, budget)
 
-    # 兜底
+    # 1. source/active 只保少量，避免挤掉 coverage
+    source_budget = int(os.environ.get("POSTSELECT_SOURCE_BUDGET", "256"))
+    source_scores = np.asarray([base_score(int(ci)) for ci in valid_ids], dtype=np.float32)
+    source_order = valid_ids[np.argsort(-source_scores, kind="stable")]
+    add_many(source_order, source_budget)
+
+    # 2. 分区 support set cover
+    low_budget = int(os.environ.get("POSTSELECT_LOW_MZ_BUDGET", "1024"))
+    mid_budget = int(os.environ.get("POSTSELECT_MID_MZ_BUDGET", "1536"))
+    high_budget = int(os.environ.get("POSTSELECT_HIGH_MZ_BUDGET", "768"))
+
+    low_hi = float(os.environ.get("POSTSELECT_LOW_MZ_MAX", str(low_mz_max)))
+    mid_hi = float(os.environ.get("POSTSELECT_MID_MZ_MAX", "500.0"))
+    high_hi = float(os.environ.get("POSTSELECT_HIGH_MZ_MAX", "1500.0"))
+
+    greedy_region_setcover(0.0, low_hi, low_budget, name="low")
+    greedy_region_setcover(low_hi, mid_hi, mid_budget, name="mid")
+    greedy_region_setcover(mid_hi, high_hi, high_budget, name="high")
+
+    # 3. fill：补满 4096
+    if len(selected) < max_keep:
+        rest = np.asarray([ci for ci in valid_ids if int(ci) not in selected_set], dtype=np.int64)
+        if rest.size > 0:
+            scores = np.asarray([base_score(int(ci)) for ci in rest], dtype=np.float32)
+            rest = rest[np.argsort(-scores, kind="stable")]
+            add_many(rest, max_keep - len(selected))
+
+    # 4. 兜底
     if len(selected) < max_keep:
         add_many(valid_ids, max_keep - len(selected))
 
