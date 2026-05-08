@@ -225,6 +225,117 @@ def _build_true_official_intensity_map_from_sparse(
 
     return out, top20_bins
 
+
+def _safe_candidate_keep_mask(
+    formulae_feats,
+    formulae_mask,
+    formula_atomicnos,
+    precursor_formula=None,
+    precursor_mz=None,
+    max_mass_slack=4.1,
+):
+    """
+    安全硬过滤：
+    只删除明显物理不可能的 formula。
+    不在这里删除 no-source / DBE parity / ring-cut 候选。
+    """
+    feats = np.asarray(formulae_feats, dtype=np.float32)
+    if feats.ndim == 1:
+        feats = feats.reshape(-1, 1)
+
+    M = int(feats.shape[0])
+    mask = np.asarray(formulae_mask, dtype=np.float32).reshape(-1)
+    if mask.shape[0] < M:
+        mask = np.concatenate([mask, np.zeros((M - mask.shape[0],), dtype=np.float32)], axis=0)
+    mask = mask[:M] > 0.5
+
+    formula_atomicnos = [int(x) for x in list(formula_atomicnos)]
+    A = len(formula_atomicnos)
+
+    counts = feats[:, :A] if feats.shape[1] >= A else feats
+    if counts.shape[1] < A:
+        pad = np.zeros((M, A - counts.shape[1]), dtype=np.float32)
+        counts = np.concatenate([counts, pad], axis=1)
+
+    keep = mask.copy()
+
+    # 空 formula 删除
+    keep &= np.sum(counts, axis=1) > 0
+
+    # 没有 heavy atom 删除
+    heavy_cols = [i for i, z in enumerate(formula_atomicnos) if int(z) != 1]
+    if heavy_cols:
+        keep &= np.sum(counts[:, heavy_cols], axis=1) > 0
+
+    # parent formula 子集约束：heavy atoms 不能超过母体
+    parent_counts = None
+    if precursor_formula is not None:
+        try:
+            from rdkit import Chem
+            import re
+
+            pt = Chem.GetPeriodicTable()
+            symbol_to_idx = {}
+            for i, z in enumerate(formula_atomicnos):
+                symbol_to_idx[pt.GetElementSymbol(int(z))] = i
+
+            parent_counts = np.zeros((A,), dtype=np.float32)
+            for sym, raw_n in re.findall(r"([A-Z][a-z]?)(\d*)", str(precursor_formula)):
+                if sym not in symbol_to_idx:
+                    continue
+                n = int(raw_n) if raw_n else 1
+                parent_counts[symbol_to_idx[sym]] += float(n)
+        except Exception:
+            parent_counts = None
+
+    if parent_counts is not None:
+        for j, z in enumerate(formula_atomicnos):
+            if int(z) == 1:
+                # H 允许氢迁移，不硬卡
+                continue
+            keep &= counts[:, j] <= (parent_counts[j] + 1e-6)
+
+    # formula mass 不允许明显超过 parent neutral mass
+    try:
+        from rdkit import Chem
+
+        pt = Chem.GetPeriodicTable()
+        masses = np.asarray(
+            [pt.GetMostCommonIsotopeMass(int(z)) for z in formula_atomicnos],
+            dtype=np.float32,
+        )
+        formula_mass = counts @ masses
+
+        parent_mass = None
+        if parent_counts is not None:
+            parent_mass = float(parent_counts @ masses)
+        elif precursor_mz is not None:
+            proton_mass = float(os.environ.get("FORMULA_PROTON_MASS", "1.007276466812"))
+            parent_mass = float(precursor_mz) - proton_mass
+
+        if parent_mass is not None and np.isfinite(parent_mass) and parent_mass > 0:
+            keep &= formula_mass <= (parent_mass + float(max_mass_slack))
+    except Exception:
+        pass
+
+    return keep.astype(bool)
+
+
+def _compact_candidate_rows(arr, keep, pad_value=0):
+    arr = np.asarray(arr)
+    M = int(arr.shape[0])
+    keep = np.asarray(keep, dtype=bool).reshape(-1)
+    if keep.shape[0] < M:
+        keep = np.concatenate([keep, np.zeros((M - keep.shape[0],), dtype=bool)], axis=0)
+    keep = keep[:M]
+
+    kept = arr[keep]
+    out = np.full_like(arr, pad_value)
+    n = min(int(kept.shape[0]), M)
+    if n > 0:
+        out[:n] = kept[:n]
+    return out, n
+
 # Class overview: MolFeaturizer encapsulates a reusable component in this module.
 class MolFeaturizer(torch.utils.data.Dataset):
     # Function overview: __init__ handles a specific workflow step in this module.
@@ -388,6 +499,47 @@ class MolFeaturizer(torch.utils.data.Dataset):
 
             formulae_mask = np.asarray(getattr(self.pff, 'last_formulae_mask', np.ones((formulae_feats.shape[0],), dtype=np.float32)), dtype=np.float32)
             formulae_n_kept = int(np.sum(formulae_mask > 0.5))
+
+            if os.environ.get("USE_SAFE_FORMULA_HARD_FILTER", "0") == "1":
+                try:
+                    hard_keep = _safe_candidate_keep_mask(
+                        formulae_feats=formulae_feats,
+                        formulae_mask=formulae_mask,
+                        formula_atomicnos=getattr(self.pff, "formula_possible_atomicno", None),
+                        precursor_formula=precursor_formula,
+                        precursor_mz=precursor_mz,
+                        max_mass_slack=float(os.environ.get("SAFE_FORMULA_MAX_MASS_SLACK", "4.1")),
+                    )
+
+                    old_valid_n = int(np.sum(formulae_mask > 0.5))
+
+                    formulae_feats, new_valid_n = _compact_candidate_rows(
+                        formulae_feats,
+                        hard_keep,
+                        pad_value=0,
+                    )
+                    formulae_peaks, _ = _compact_candidate_rows(
+                        formulae_peaks,
+                        hard_keep,
+                        pad_value=0,
+                    )
+
+                    formulae_mask = np.zeros((formulae_feats.shape[0],), dtype=np.float32)
+                    formulae_mask[:new_valid_n] = 1.0
+
+                    if os.environ.get("DEBUG_SAFE_FORMULA_FILTER", "0") == "1":
+                        print(
+                            "[SAFE_FORMULA_FILTER]",
+                            "old_valid_n=", old_valid_n,
+                            "new_valid_n=", int(new_valid_n),
+                            "kept_ratio=", float(new_valid_n / max(1, old_valid_n)),
+                            flush=True,
+                        )
+                except Exception as e:
+                    if os.environ.get("DEBUG_SAFE_FORMULA_FILTER", "0") == "1":
+                        print("[SAFE_FORMULA_FILTER_ERROR]", repr(e), flush=True)
+            formulae_n_kept = int(np.sum(formulae_mask > 0.5))
+            
 
             # Explicitly invalidate padded candidates in projection tensors.
             formulae_peaks_mass_idx = formulae_peaks_mass_idx.astype(np.int64, copy=False)

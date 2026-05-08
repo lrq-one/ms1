@@ -88,25 +88,70 @@ def _normalize_instrument(v):
         return "ITFT"
     return s
 
+def _parse_nce_value(raw):
+    s = _to_optional_str(raw)
+    if s is None:
+        return None
+
+    low = s.lower()
+    m = re.search(r"nce\s*=\s*([-+]?\d*\.?\d+)", low)
+    if m is not None:
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+
+    # 对 HCD / Orbitrap 的纯数字，先按 NCE 处理
+    m = _FLOAT_RE.search(s)
+    if m is not None:
+        try:
+            return float(m.group(0))
+        except Exception:
+            return None
+
+    return None
+
 def _normalize_fragmentation_method(v):
     s = _to_optional_str(v)
     if s is None:
         return None
 
+    low = s.lower()
     key = s.lower().replace(" ", "").replace("-", "").replace("_", "")
 
-    if "hcd" in key:
+    # 真正的碎裂方式
+    if (
+        "hcd" in low
+        or "higher-energy" in low
+        or "higher energy" in low
+        or "higherenergy" in key
+        or "higherenergycollisionaldissociation" in key
+        or "higherenergycollisiondissociation" in key
+    ):
         return "HCD"
-    if "cid" in key:
-        return "CID"
-    if "etd" in key:
-        return "ETD"
-    if "itft" in key:
-        return "ITFT"
-    if "iontrap" in key:
-        return "IT"
 
-    return s
+    if (
+        "cid" in low
+        or "collision-induced" in low
+        or "collision induced" in low
+        or "collisioninduceddissociation" in key
+    ):
+        return "CID"
+
+    if "etd" in low:
+        return "ETD"
+
+    # 平台 / analyzer，不是碎裂方式
+    if (
+        "qtof" in key
+        or "quadtof" in key
+        or "quadrupoletof" in key
+        or key in {"tof", "orbitrap", "qexactive", "exactive", "itft", "fticr"}
+        or "iontrap" in key
+    ):
+        return None
+
+    return None
 
 def _parse_peak_line(line):
     """
@@ -394,7 +439,9 @@ def load_nist20_records(
         precursor_mz = _to_optional_float(msp.get("precursor_mz", None))
         ce_raw = msp.get("collision_energy_raw", None)
 
-        ce_ev, ce_raw_str, ce_type, ce_ok = parse_collision_energy_to_ev(
+        ce_nce = _parse_nce_value(ce_raw)
+
+        ce_ev, ce_raw_str, ce_type_ev, ce_ok_ev = parse_collision_energy_to_ev(
             ce_raw,
             precursor_mz=precursor_mz,
             instrument=instrument_platform,
@@ -402,7 +449,14 @@ def load_nist20_records(
             numeric_as_nce_for_orbitrap=(os.environ.get("NIST20_NUMERIC_CE_AS_NCE", "1") == "1"),
         )
 
-        collision_energy = ce_ev
+        if os.environ.get("NIST20_USE_NCE_AS_MODEL_CE", "1") == "1":
+            collision_energy = ce_nce
+            ce_type = "NCE_raw" if ce_nce is not None else "missing"
+            ce_ok = int(ce_nce is not None)
+        else:
+            collision_energy = ce_ev
+            ce_type = ce_type_ev
+            ce_ok = ce_ok_ev
 
         if int(require_ce) == 1 and collision_energy is None:
             stats["ce_missing"] += 1
@@ -483,6 +537,8 @@ def load_nist20_records(
             "collision_energy_raw": ce_raw_str,
             "collision_energy_type": ce_type,
             "collision_energy_parse_ok": int(ce_ok),
+            "collision_energy_nce": ce_nce,
+            "collision_energy_ev": ce_ev,
         }
         records.append(record)
         stats["joined_ok"] += 1
@@ -626,6 +682,8 @@ def records_to_dataframes(records, split):
                 "fragmentation_method": r.get("fragmentation_method", None),
                 "collision_energy_raw": r.get("collision_energy_raw", None),
                 "collision_energy_type": r.get("collision_energy_type", None),
+                "collision_energy_nce": r.get("collision_energy_nce", None),
+                "collision_energy_ev": r.get("collision_energy_ev", None),
                 "collision_energy_parse_ok": r.get("collision_energy_parse_ok", None),
             }
         )

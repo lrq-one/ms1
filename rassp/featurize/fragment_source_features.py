@@ -605,10 +605,42 @@ def enumerate_fragment_sources(
         )
         sources.extend(depth2_sources)
 
-    if len(sources) > int(max_sources):
-        sources = sources[:int(max_sources)]
+    if os.environ.get("FRAG_AUX_USE_RECURSIVE_SUBGRAPHS", "0").strip() == "1":
+        rec_sources = enumerate_recursive_subgraph_sources(
+            mol,
+            formula_atomicnos=formula_atomicnos,
+            h_shift_min=int(h_shift_min),
+            h_shift_max=int(h_shift_max),
+            max_depth=int(os.environ.get("FRAGMENT_NODE_RECURSIVE_MAX_DEPTH", str(max_depth))),
+            max_branch_per_node=int(os.environ.get("FRAGMENT_NODE_RECURSIVE_BRANCH", "8")),
+            max_nodes=int(os.environ.get("FRAGMENT_NODE_RECURSIVE_MAX_SOURCES", "100000")),
+            min_heavy_atoms=int(os.environ.get("FRAGMENT_NODE_RECURSIVE_MIN_HEAVY", "1")),
+        )
+        sources.extend(rec_sources)
+    dedup = {}
+    for s in sources:
+        try:
+            formula_key = tuple(int(x) for x in s.get("formula_key", ()))
+            atom_ids = tuple(int(x) for x in sorted(s.get("atom_ids", [])))
+            cut_bond_idx = s.get("cut_bond_idx", ())
+            if isinstance(cut_bond_idx, (list, tuple)):
+                cut_key = tuple(int(x) for x in cut_bond_idx)
+            else:
+                cut_key = (int(cut_bond_idx),)
+            h_shift = int(s.get("h_shift", 0))
+            depth = int(s.get("depth", 0))
+            key = (formula_key, atom_ids, cut_key, h_shift, depth)
+        except Exception:
+            continue
 
-    return sources
+        if key not in dedup:
+            dedup[key] = s
+
+        if len(dedup) >= int(max_sources):
+            break
+
+    return list(dedup.values())
+
 
 def local_bond_feature(mol, bond, brics_info=None):
     a = bond.GetBeginAtom()
