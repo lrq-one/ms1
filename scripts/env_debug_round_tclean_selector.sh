@@ -36,7 +36,7 @@ export FRAG_AUX_MAX_DEPTH=2
 # ===== 防 target leakage =====
 export MODEL_ALLOW_TARGET_ALIGNMENT_FEAT=0
 export STRICT_MODEL_KWARG_WHITELIST=1
-export DEBUG_TARGET_LEAKAGE_CHECK=0
+export DEBUG_TARGET_LEAKAGE_CHECK=1
 
 # ===== selector 必须在完整 4096 上选，不能只用 active mask =====
 export USE_FN_FORMULA_LOGITS_AS_SELECTOR=0
