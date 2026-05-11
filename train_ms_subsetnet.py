@@ -509,7 +509,102 @@ def get_formulae_official_intensity_from_batch(batch):
         return off_int
     return batch.get('formulae_peaks_intensity', None)
 
+def compute_selector_false_support_loss(
+    selector_logits,
+    batch,
+    topk=64,
+    eps=1e-8,
+):
+    """
+    Training-only loss for selector.
 
+    Penalize selected candidates whose predicted official-bin support mostly falls
+    outside the true official target bins.
+
+    Important:
+    - This uses true_official_idx only in the loss.
+    - It does NOT feed target information into the model input.
+    - It is safe from leakage as long as selector_logits were produced without target fields.
+    """
+    if selector_logits is None or not torch.is_tensor(selector_logits):
+        return torch.tensor(0.0, device=next(iter(batch.values())).device if batch else "cpu")
+
+    formulae_mask = batch.get("formulae_mask", None)
+    cand_idx = batch.get("formulae_peaks_official_idx", None)
+    cand_int = batch.get("formulae_peaks_official_intensity", None)
+    true_idx_obj = batch.get("true_all_official_idx", None)
+    if true_idx_obj is None:
+        true_idx_obj = batch.get("true_official_idx", None)
+
+    if cand_idx is None or cand_int is None or true_idx_obj is None:
+        return selector_logits.new_tensor(0.0)
+
+    if not torch.is_tensor(cand_idx) or not torch.is_tensor(cand_int):
+        return selector_logits.new_tensor(0.0)
+
+    if cand_idx.dim() != 3 or cand_int.dim() != 3:
+        return selector_logits.new_tensor(0.0)
+
+    B, M = selector_logits.shape[:2]
+    K = min(int(topk), int(M))
+    if K <= 0:
+        return selector_logits.new_tensor(0.0)
+
+    if formulae_mask is None or not torch.is_tensor(formulae_mask):
+        formulae_mask = torch.ones_like(selector_logits, dtype=torch.float32)
+    else:
+        formulae_mask = formulae_mask.float().to(selector_logits.device)
+
+    logits = selector_logits
+    logits = logits.masked_fill(formulae_mask <= 0, _neg_mask_fill_value(logits))
+
+    top_idx = torch.topk(logits, k=K, dim=1).indices
+
+    losses = []
+
+    for b in range(B):
+        # true_official_idx may be a list of variable-length tensors/arrays,
+        # or a padded tensor [B, T].
+        if torch.is_tensor(true_idx_obj):
+            t = true_idx_obj[b].detach().to(selector_logits.device).long().reshape(-1)
+        else:
+            try:
+                t = torch.as_tensor(true_idx_obj[b], dtype=torch.long, device=selector_logits.device).reshape(-1)
+            except Exception:
+                continue
+
+        t = t[t >= 0]
+        if t.numel() == 0:
+            continue
+
+        selected = top_idx[b]  # [K]
+
+        idx_b = cand_idx[b, selected].to(selector_logits.device).long()      # [K, P]
+        int_b = cand_int[b, selected].to(selector_logits.device).float()     # [K, P]
+
+        valid = (idx_b >= 0) & torch.isfinite(int_b) & (int_b > 0)
+        total_mass = torch.where(valid, int_b, torch.zeros_like(int_b)).sum(dim=1)
+
+        # torch.isin is supported in modern PyTorch.
+        # If your PyTorch is very old and errors here, tell me and I will give a fallback.
+        hit = valid & torch.isin(idx_b, t)
+
+        true_mass = torch.where(hit, int_b, torch.zeros_like(int_b)).sum(dim=1)
+
+        false_ratio = 1.0 - true_mass / total_mass.clamp_min(eps)
+        false_ratio = torch.clamp(false_ratio, 0.0, 1.0)
+
+        selected_logits = logits[b, selected]
+        selected_prob = torch.softmax(selected_logits, dim=0)
+
+        # Gradient flows through selected_prob / selected_logits.
+        # false_ratio is a target-derived supervision signal, detached.
+        losses.append((selected_prob * false_ratio.detach()).sum())
+
+    if len(losses) == 0:
+        return selector_logits.new_tensor(0.0)
+
+    return torch.stack(losses).mean()
 # Function overview: prepare_batch_cpu handles a specific workflow step in this module.
 
 def prepare_batch_cpu(raw_batch, spect_bin):
@@ -5930,10 +6025,25 @@ def train_mssubsetnet():
                             hinge = torch.clamp(diff, min=0.0)
                             pair_loss_total = pair_loss_total + hinge.mean()
                             pair_count += 1
-                    if pair_count > 0:
-                        pair_loss_avg = pair_loss_total / float(max(1, pair_count))
-                        selector_loss = selector_loss + float(pair_weight) * pair_loss_avg
+                if pair_count > 0:
+                    pair_loss_avg = pair_loss_total / float(max(1, pair_count))
+                    selector_loss = selector_loss + float(pair_weight) * pair_loss_avg
+                # ============================================================
+                # Selector false-support loss.
+                # This must be computed before selector-only/full-stage branching,
+                # so that TRAIN_SELECTOR_ONLY_STAGE=1 can still use it.
+                # ============================================================
+                selector_false_support_loss = selector_loss.new_zeros(())
 
+                if float(false_support_loss_weight) > 0.0 and os.environ.get("USE_SELECTOR_FALSE_SUPPORT_LOSS", "1") == "1":
+                    selector_false_support_loss = compute_selector_false_support_loss(
+                        selector_logits=selector_logits_for_topk,
+                        batch=batch,
+                        topk=int(os.environ.get("MODEL_TOPK_EVAL", os.environ.get("SELECTOR_TOPK", "64"))),
+                    )
+
+                    if (not torch.is_tensor(selector_false_support_loss)) or (not torch.isfinite(selector_false_support_loss)):
+                        selector_false_support_loss = selector_loss.new_zeros(())
                 # ============================================================
                 # Optional Stage 1: selector-only training.
                 # In this stage, do NOT run rerank / official projection / peak / OOS.
@@ -5948,8 +6058,18 @@ def train_mssubsetnet():
                     peak_aux_loss = selector_loss.new_zeros(())
                     oos_loss = selector_loss.new_zeros(())
                     formula_entropy_loss = selector_loss.new_zeros(())
-                    false_support_loss = selector_loss.new_zeros(())
+
+                    # Important:
+                    # In selector-only stage, false_support_loss should mean selector-level
+                    # false-support loss, not dense spectral false-support loss.
+                    false_support_loss = selector_false_support_loss
+
                     loss = float(selector_loss_weight) * selector_loss
+
+                    # This is the key fix.
+                    # Previously false_support_loss was forced to zero here.
+                    if float(false_support_loss_weight) > 0.0:
+                        loss = loss + float(false_support_loss_weight) * false_support_loss
 
                     if epoch >= precursor_loss_start_epoch and precursor_loss_weight > 0:
                         loss = loss + float(precursor_loss_weight) * precursor_loss
@@ -6905,6 +7025,24 @@ def train_mssubsetnet():
                         val_model_topk_oracle_cos_256_vals.append(model_topk_stats_256.get('official_cos', float('nan')))
                         val_model_topk_oracle_false_support_256_vals.append(model_topk_stats_256.get('false_support', float('nan')))
 
+                    model_topk_stats_eval = compute_candidate_support_stats(
+                        batch,
+                        model_topk_mask,
+                        official_bin_width=official_metric_cfg['bin_width'],
+                        official_max_mz=official_metric_cfg['max_mz'],
+                    )
+
+                    if model_topk_stats_eval:
+                        # Reuse the existing 256 lists only if model_topk_eval == 256.
+                        # Otherwise this is printed directly for debugging.
+                        if not hasattr(train_mssubsetnet, "_model_topk_eval_debug_vals"):
+                            train_mssubsetnet._model_topk_eval_debug_vals = []
+                        train_mssubsetnet._model_topk_eval_debug_vals.append((
+                            float(model_topk_eval),
+                            float(model_topk_stats_eval.get('official_cos', float('nan'))),
+                            float(model_topk_stats_eval.get('false_support', float('nan'))),
+                        ))
+
                     if epoch == 0 and step == 1:
                         teacher_pos_n = float("nan")
                         teacher_prob_n = float("nan")
@@ -7327,6 +7465,17 @@ def train_mssubsetnet():
         avg_val_teacher_oracle_pred_n = _finite_mean(val_teacher_oracle_pred_n_vals)
         avg_val_model_topk_oracle_cos_256 = _finite_mean(val_model_topk_oracle_cos_256_vals)
         avg_val_model_topk_oracle_false_support_256 = _finite_mean(val_model_topk_oracle_false_support_256_vals)
+        eval_debug_vals = getattr(train_mssubsetnet, "_model_topk_eval_debug_vals", [])
+        if len(eval_debug_vals) > 0:
+            arr = np.asarray(eval_debug_vals, dtype=np.float64)
+            eval_k_used = int(arr[-1, 0])
+            avg_val_model_topk_oracle_cos_eval = float(np.nanmean(arr[:, 1]))
+            avg_val_model_topk_oracle_false_support_eval = float(np.nanmean(arr[:, 2]))
+            train_mssubsetnet._model_topk_eval_debug_vals = []
+        else:
+            eval_k_used = int(model_topk_eval)
+            avg_val_model_topk_oracle_cos_eval = float("nan")
+            avg_val_model_topk_oracle_false_support_eval = float("nan")
         avg_val_overlap_ratio = (
             float(avg_val_overlap_n / max(avg_val_pred_n, 1e-8))
             if np.isfinite(avg_val_pred_n) and avg_val_pred_n > 0
@@ -7556,7 +7705,9 @@ def train_mssubsetnet():
             f'val_teacher_oracle_pred_int_on_true={avg_val_teacher_oracle_pred_int_on_true:.4f} | '
             f'val_teacher_oracle_pred_n={avg_val_teacher_oracle_pred_n:.2f} | '
             f'val_model_topk_oracle_cos@256={avg_val_model_topk_oracle_cos_256:.4f} | '
-            f'val_model_topk_oracle_false_support@256={avg_val_model_topk_oracle_false_support_256:.4f}'
+            f'val_model_topk_oracle_false_support@256={avg_val_model_topk_oracle_false_support_256:.4f} | '
+            f'val_model_topk_oracle_cos@{eval_k_used}={avg_val_model_topk_oracle_cos_eval:.4f} | '
+            f'val_model_topk_oracle_false_support@{eval_k_used}={avg_val_model_topk_oracle_false_support_eval:.4f}'
             + (' | BEST' if is_best else '')
         )
 
