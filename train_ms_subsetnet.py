@@ -28,6 +28,19 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 from rassp.featurize import msutil
 from rassp.msutil import masscompute
 from rassp import dataset, netutil
+from rassp.model.selector_topk import coverage_aware_topk
+from rassp.training.batch_utils import (
+    ADDUCT_VOCAB,
+    INSTRUMENT_VOCAB,
+    MS_LEVEL_VOCAB,
+    my_collate_fn,
+    prepare_batch_cpu,
+    move_batch_to_device,
+)
+from rassp.training.selector_losses import (
+    compute_selector_false_support_loss,
+    compute_selector_utility_target_loss,
+)
 
 def _neg_mask_fill_value(x):
     if torch.is_tensor(x) and torch.is_floating_point(x):
@@ -152,315 +165,6 @@ def build_true_official_dense_from_raw(
     return out
 
 
-# Function overview: cosine_loss_dense handles a specific workflow step in this module.
-
-def my_collate_fn(batch):
-    batch_dict = {}
-    for key in batch[0].keys():
-        batch_dict[key] = [d[key] for d in batch]
-    return batch_dict
-
-
-# =========================================================================
-# 🎯 [数据处理] 稀疏谱转密集谱
-# 原始的质谱数据是稀疏的 [(m/z=100, intensity=0.5), (m/z=200, intensity=0.8)]
-# 这个函数的作用是把它们“装进” 1024 个箱子(Bin)里，变成一个长度为 1024 的数组。
-# 模型最终预测的也就是这 1024 个箱子的高度。
-# =========================================================================
-# Function overview: to_dense_binned_spectrum handles a specific workflow step in this module.
-
-def to_dense_binned_spectrum(s, spect_bin_obj):
-    """
-    Convert a sparse spectrum to a dense binned 1024 vector.
-
-    Accepts either:
-    - already dense vector (len == 1024)
-    - sparse peaks as iterable of (mz, intensity)
-    """
-    if isinstance(s, torch.Tensor):
-        s = s.detach().cpu().numpy()
-
-    if isinstance(s, np.ndarray) and s.ndim == 1 and s.shape[0] == 1024:
-        return torch.as_tensor(s, dtype=torch.float32)
-
-    if isinstance(s, (list, tuple)) and len(s) == 1024 and not isinstance(s[0], (list, tuple, np.ndarray, torch.Tensor)):
-        return torch.as_tensor(s, dtype=torch.float32)
-
-    # Common dataset format: object array with each element like [mz, intensity]
-    if isinstance(s, np.ndarray) and s.dtype == object and s.ndim == 1:
-        try:
-            peaks = np.stack([np.asarray(x, dtype=np.float32) for x in s], axis=0)
-        except Exception:
-            peaks = np.asarray(s, dtype=np.float32)
-    else:
-        peaks = np.asarray(s, dtype=np.float32)
-    if peaks.size == 0:
-        return torch.zeros(1024, dtype=torch.float32)
-    if peaks.ndim != 2 or peaks.shape[1] != 2:
-        # Fallback: try flattening odd inputs; if still invalid, return zeros.
-        try:
-            peaks = peaks.reshape(-1, 2)
-        except Exception:
-            return torch.zeros(1024, dtype=torch.float32)
-
-    _, _, spect_out = spect_bin_obj.histogram(peaks[:, 0], peaks[:, 1])
-    return torch.as_tensor(spect_out, dtype=torch.float32)
-
-
-
-# =========================================================================
-# 🎯 [特征定义] MS/MS 加合物词表
-# 为了让串联质谱模型知道前体离子(Precursor)是怎么带电的（挂了氢H+还是钠Na+）。
-# 我们给常见的加合物进行编号，相当于 NLP 里的单词分词，送进网络做 Embedding。
-# =========================================================================
-ADDUCT_VOCAB = {
-    '[M+H]+': 1,
-    '[M+Na]+': 2,
-    '[M+K]+': 3,
-    '[M-H]-': 4,
-    '[M+NH4]+': 5,
-}
-
-MISSING_TOKEN = '__MISSING__'
-UNKNOWN_TOKEN = '__UNK__'
-
-INSTRUMENT_VOCAB = {
-    'orbitrap': 1,
-    'qtof': 2,
-    'tof': 3,
-    'iontrap': 4,
-    'fticr': 5,
-    'triplequad': 6,
-}
-
-
-# Function overview: _load_vocab_from_json handles a specific workflow step in this module.
-
-def _load_vocab_from_json(env_var_name, fallback_vocab, field_name):
-    path = os.environ.get(env_var_name, '').strip()
-    if not path:
-        return dict(fallback_vocab)
-    if not os.path.exists(path):
-        return dict(fallback_vocab)
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            obj = json.load(f)
-        if isinstance(obj, dict) and field_name in obj and isinstance(obj[field_name], dict):
-            raw = obj[field_name]
-        elif isinstance(obj, dict):
-            raw = obj
-        else:
-            return dict(fallback_vocab)
-
-        out = {}
-        for k, v in raw.items():
-            try:
-                idx = int(v)
-            except Exception:
-                continue
-            if idx >= 0:
-                out[str(k)] = idx
-        return out if len(out) > 0 else dict(fallback_vocab)
-    except Exception:
-        return dict(fallback_vocab)
-
-
-# Function overview: _vocab_uses_separate_unknown handles a specific workflow step in this module.
-
-def _vocab_uses_separate_unknown(vocab):
-    return isinstance(vocab, dict) and MISSING_TOKEN in vocab and UNKNOWN_TOKEN in vocab
-
-
-# Function overview: _vocab_missing_index handles a specific workflow step in this module.
-
-def _vocab_missing_index(vocab):
-    if _vocab_uses_separate_unknown(vocab):
-        try:
-            return int(vocab.get(MISSING_TOKEN, 0))
-        except Exception:
-            return 0
-    return 0
-
-
-# Function overview: _vocab_unknown_index handles a specific workflow step in this module.
-
-def _vocab_unknown_index(vocab):
-    if _vocab_uses_separate_unknown(vocab):
-        try:
-            return int(vocab.get(UNKNOWN_TOKEN, 1))
-        except Exception:
-            return 1
-    return 0
-
-
-# Function overview: _instrument_norm_key handles a specific workflow step in this module.
-
-def _instrument_norm_key(val):
-    return str(val).strip().lower().replace(' ', '').replace('-', '').replace('_', '')
-
-
-# Function overview: _build_normalized_instrument_vocab handles a specific workflow step in this module.
-
-def _build_normalized_instrument_vocab(vocab):
-    out = {}
-    if not isinstance(vocab, dict):
-        return out
-    for k, v in vocab.items():
-        if str(k) in (MISSING_TOKEN, UNKNOWN_TOKEN):
-            continue
-        try:
-            idx = int(v)
-        except Exception:
-            continue
-        if idx <= 0:
-            continue
-        nk = _instrument_norm_key(k)
-        if nk and nk not in out:
-            out[nk] = idx
-    return out
-
-
-
-
-# Function overview: encode_adduct_batch handles a specific workflow step in this module.
-
-ADDUCT_VOCAB = _load_vocab_from_json('ADDUCT_VOCAB_PATH', ADDUCT_VOCAB, 'adduct_vocab')
-INSTRUMENT_VOCAB = _load_vocab_from_json('INSTRUMENT_VOCAB_PATH', INSTRUMENT_VOCAB, 'instrument_vocab')
-MS_LEVEL_VOCAB = _load_vocab_from_json('MS_LEVEL_VOCAB_PATH', {}, 'ms_level_vocab')
-INSTRUMENT_VOCAB_NORM = _build_normalized_instrument_vocab(INSTRUMENT_VOCAB)
-
-def encode_adduct_batch(values):
-    missing_idx = _vocab_missing_index(ADDUCT_VOCAB)
-    unknown_idx = _vocab_unknown_index(ADDUCT_VOCAB)
-    out = []
-    for val in values:
-        if val is None or (isinstance(val, str) and not val.strip()):
-            out.append(missing_idx)
-            continue
-        if isinstance(val, (int, np.integer)):
-            out.append(int(val))
-            continue
-        if isinstance(val, (float, np.floating)):
-            if np.isnan(val):
-                out.append(missing_idx)
-            else:
-                out.append(int(val))
-            continue
-        sval = str(val).strip()
-        out.append(ADDUCT_VOCAB.get(sval, unknown_idx))
-    return torch.as_tensor(out, dtype=torch.long)
-
-
-# Function overview: _normalize_instrument_key handles a specific workflow step in this module.
-
-def _normalize_instrument_key(val):
-    return _instrument_norm_key(val)
-
-
-# Function overview: encode_instrument_batch handles a specific workflow step in this module.
-
-def encode_instrument_batch(values):
-    missing_idx = _vocab_missing_index(INSTRUMENT_VOCAB)
-    unknown_idx = _vocab_unknown_index(INSTRUMENT_VOCAB)
-    out = []
-    for val in values:
-        if val is None or (isinstance(val, str) and not val.strip()):
-            out.append(missing_idx)
-            continue
-        if isinstance(val, (int, np.integer)):
-            out.append(int(val))
-            continue
-        if isinstance(val, (float, np.floating)):
-            if np.isnan(val):
-                out.append(missing_idx)
-            else:
-                out.append(int(val))
-            continue
-        key = _normalize_instrument_key(val)
-        idx = INSTRUMENT_VOCAB_NORM.get(key, unknown_idx)
-        if idx == unknown_idx:
-            if 'orbitrap' in key:
-                idx = INSTRUMENT_VOCAB_NORM.get('orbitrap', unknown_idx)
-            elif 'qtof' in key:
-                idx = INSTRUMENT_VOCAB_NORM.get('qtof', unknown_idx)
-            elif 'tof' == key:
-                idx = INSTRUMENT_VOCAB_NORM.get('tof', unknown_idx)
-            elif 'iontrap' in key:
-                idx = INSTRUMENT_VOCAB_NORM.get('iontrap', unknown_idx)
-            elif 'fticr' in key:
-                idx = INSTRUMENT_VOCAB_NORM.get('fticr', unknown_idx)
-            elif 'triplequad' in key or 'triplequadrupole' in key:
-                idx = INSTRUMENT_VOCAB_NORM.get('triplequad', unknown_idx)
-        out.append(idx)
-    return torch.as_tensor(out, dtype=torch.long)
-
-
-# Function overview: encode_ms_level_batch handles a specific workflow step in this module.
-
-def encode_ms_level_batch(values):
-    out = []
-    has_vocab = len(MS_LEVEL_VOCAB) > 0
-    missing_idx = _vocab_missing_index(MS_LEVEL_VOCAB)
-    unknown_idx = _vocab_unknown_index(MS_LEVEL_VOCAB)
-    for val in values:
-        if val is None or (isinstance(val, str) and not str(val).strip()):
-            out.append(missing_idx)
-            continue
-        if isinstance(val, (int, np.integer)):
-            raw = int(val)
-        elif isinstance(val, (float, np.floating)):
-            if np.isnan(val):
-                out.append(missing_idx)
-                continue
-            raw = int(val)
-        else:
-            sval = str(val).strip().lower()
-            if not sval:
-                out.append(missing_idx)
-                continue
-            else:
-                try:
-                    raw = int(float(sval))
-                except Exception:
-                    m = re.search(r"\d+", sval)
-                    if m is None:
-                        out.append(unknown_idx if has_vocab else 0)
-                        continue
-                    raw = int(m.group(0))
-        if has_vocab:
-            out.append(int(MS_LEVEL_VOCAB.get(str(raw), unknown_idx)))
-        else:
-            out.append(raw)
-    return torch.as_tensor(out, dtype=torch.long)
-
-
-# Function overview: _stack_list_to_tensor handles a specific workflow step in this module.
-
-def _stack_list_to_tensor(values, target_dtype=None):
-    if values is None or len(values) == 0:
-        return values
-
-    first = values[0]
-    try:
-        if torch.is_tensor(first):
-            t = torch.stack([v if torch.is_tensor(v) else torch.as_tensor(v) for v in values])
-            return t.to(dtype=target_dtype) if target_dtype is not None else t
-
-        arr = np.asarray(values)
-        if arr.dtype != object:
-            t = torch.as_tensor(arr)
-            return t.to(dtype=target_dtype) if target_dtype is not None else t
-    except Exception:
-        pass
-
-    try:
-        elems = [torch.as_tensor(v) for v in values]
-        t = torch.stack(elems)
-        return t.to(dtype=target_dtype) if target_dtype is not None else t
-    except Exception:
-        return values
-
-
 # Function overview: _parse_csv_env handles a specific workflow step in this module.
 
 def _parse_csv_env(raw):
@@ -500,6 +204,7 @@ def _resolve_formula_atomicnos():
                 vals.append(an)
     return vals
 
+
 def get_formulae_official_intensity_from_batch(batch):
     """Prefer official-bin intensity tensor when present; fallback to legacy intensity."""
     if not isinstance(batch, dict):
@@ -508,416 +213,6 @@ def get_formulae_official_intensity_from_batch(batch):
     if torch.is_tensor(off_int) and off_int.dim() == 3:
         return off_int
     return batch.get('formulae_peaks_intensity', None)
-
-def compute_selector_false_support_loss(
-    selector_logits,
-    batch,
-    topk=64,
-    eps=1e-8,
-):
-    """
-    Training-only loss for selector.
-
-    Penalize selected candidates whose predicted official-bin support mostly falls
-    outside the true official target bins.
-
-    Important:
-    - This uses true_official_idx only in the loss.
-    - It does NOT feed target information into the model input.
-    - It is safe from leakage as long as selector_logits were produced without target fields.
-    """
-    if selector_logits is None or not torch.is_tensor(selector_logits):
-        return torch.tensor(0.0, device=next(iter(batch.values())).device if batch else "cpu")
-
-    formulae_mask = batch.get("formulae_mask", None)
-    cand_idx = batch.get("formulae_peaks_official_idx", None)
-    cand_int = batch.get("formulae_peaks_official_intensity", None)
-    true_idx_obj = batch.get("true_all_official_idx", None)
-    if true_idx_obj is None:
-        true_idx_obj = batch.get("true_official_idx", None)
-
-    if cand_idx is None or cand_int is None or true_idx_obj is None:
-        return selector_logits.new_tensor(0.0)
-
-    if not torch.is_tensor(cand_idx) or not torch.is_tensor(cand_int):
-        return selector_logits.new_tensor(0.0)
-
-    if cand_idx.dim() != 3 or cand_int.dim() != 3:
-        return selector_logits.new_tensor(0.0)
-
-    B, M = selector_logits.shape[:2]
-    K = min(int(topk), int(M))
-    if K <= 0:
-        return selector_logits.new_tensor(0.0)
-
-    if formulae_mask is None or not torch.is_tensor(formulae_mask):
-        formulae_mask = torch.ones_like(selector_logits, dtype=torch.float32)
-    else:
-        formulae_mask = formulae_mask.float().to(selector_logits.device)
-
-    logits = selector_logits
-    logits = logits.masked_fill(formulae_mask <= 0, _neg_mask_fill_value(logits))
-
-    top_idx = torch.topk(logits, k=K, dim=1).indices
-
-    losses = []
-
-    for b in range(B):
-        # true_official_idx may be a list of variable-length tensors/arrays,
-        # or a padded tensor [B, T].
-        if torch.is_tensor(true_idx_obj):
-            t = true_idx_obj[b].detach().to(selector_logits.device).long().reshape(-1)
-        else:
-            try:
-                t = torch.as_tensor(true_idx_obj[b], dtype=torch.long, device=selector_logits.device).reshape(-1)
-            except Exception:
-                continue
-
-        t = t[t >= 0]
-        if t.numel() == 0:
-            continue
-
-        selected = top_idx[b]  # [K]
-
-        idx_b = cand_idx[b, selected].to(selector_logits.device).long()      # [K, P]
-        int_b = cand_int[b, selected].to(selector_logits.device).float()     # [K, P]
-
-        valid = (idx_b >= 0) & torch.isfinite(int_b) & (int_b > 0)
-        total_mass = torch.where(valid, int_b, torch.zeros_like(int_b)).sum(dim=1)
-
-        # torch.isin is supported in modern PyTorch.
-        # If your PyTorch is very old and errors here, tell me and I will give a fallback.
-        hit = valid & torch.isin(idx_b, t)
-
-        true_mass = torch.where(hit, int_b, torch.zeros_like(int_b)).sum(dim=1)
-
-        false_ratio = 1.0 - true_mass / total_mass.clamp_min(eps)
-        false_ratio = torch.clamp(false_ratio, 0.0, 1.0)
-
-        selected_logits = logits[b, selected]
-        selected_prob = torch.softmax(selected_logits, dim=0)
-
-        # Gradient flows through selected_prob / selected_logits.
-        # false_ratio is a target-derived supervision signal, detached.
-        losses.append((selected_prob * false_ratio.detach()).sum())
-
-    if len(losses) == 0:
-        return selector_logits.new_tensor(0.0)
-
-    return torch.stack(losses).mean()
-# Function overview: prepare_batch_cpu handles a specific workflow step in this module.
-
-def compute_selector_utility_target_loss(
-    selector_logits,
-    batch,
-    eps=1e-8,
-):
-    """
-    Candidate-level utility target for selector.
-
-    Goal:
-    Train selector over all candidates, not only current topK.
-
-    Utility is high when a candidate's official-bin support overlaps true bins
-    and low when it mostly creates false support.
-
-    This uses true bins only as training supervision, not as model input.
-    """
-    if selector_logits is None or not torch.is_tensor(selector_logits):
-        return torch.tensor(0.0)
-
-    formulae_mask = batch.get("formulae_mask", None)
-    cand_idx = batch.get("formulae_peaks_official_idx", None)
-    cand_int = batch.get("formulae_peaks_official_intensity", None)
-
-    true_idx_obj = batch.get("true_all_official_idx", None)
-    if true_idx_obj is None:
-        true_idx_obj = batch.get("true_official_idx", None)
-
-    if cand_idx is None or cand_int is None or true_idx_obj is None:
-        return selector_logits.new_tensor(0.0)
-
-    if not torch.is_tensor(cand_idx) or not torch.is_tensor(cand_int):
-        return selector_logits.new_tensor(0.0)
-
-    if cand_idx.dim() != 3 or cand_int.dim() != 3:
-        return selector_logits.new_tensor(0.0)
-
-    device = selector_logits.device
-    B, M = selector_logits.shape[:2]
-
-    if formulae_mask is None or not torch.is_tensor(formulae_mask):
-        formulae_mask = torch.ones_like(selector_logits, dtype=torch.float32, device=device)
-    else:
-        formulae_mask = formulae_mask.float().to(device)
-
-    logits = selector_logits.masked_fill(formulae_mask <= 0, _neg_mask_fill_value(selector_logits))
-
-    try:
-        lambda_false = float(os.environ.get("SELECTOR_UTILITY_FALSE_LAMBDA", "0.25"))
-    except Exception:
-        lambda_false = 0.25
-
-    try:
-        gamma = float(os.environ.get("SELECTOR_UTILITY_GAMMA", "1.0"))
-    except Exception:
-        gamma = 1.0
-
-    losses = []
-
-    for b in range(B):
-        if torch.is_tensor(true_idx_obj):
-            t = true_idx_obj[b].detach().to(device).long().reshape(-1)
-        else:
-            try:
-                t = torch.as_tensor(true_idx_obj[b], dtype=torch.long, device=device).reshape(-1)
-            except Exception:
-                continue
-
-        t = t[t >= 0]
-        if t.numel() == 0:
-            continue
-
-        idx_b = cand_idx[b].to(device).long()       # [M, P]
-        int_b = cand_int[b].to(device).float()      # [M, P]
-
-        valid = (idx_b >= 0) & torch.isfinite(int_b) & (int_b > 0)
-
-        total_mass = torch.where(valid, int_b, torch.zeros_like(int_b)).sum(dim=1)  # [M]
-
-        hit = valid & torch.isin(idx_b, t)
-        hit_mass = torch.where(hit, int_b, torch.zeros_like(int_b)).sum(dim=1)      # [M]
-
-        hit_share = hit_mass / total_mass.clamp_min(eps)
-        false_share = 1.0 - hit_share
-
-        # Candidate utility:
-        # high if candidate mostly hits true bins;
-        # low/zero if mostly false support.
-        utility = hit_share - float(lambda_false) * false_share
-        utility = torch.clamp(utility, min=0.0)
-
-        if gamma != 1.0:
-            utility = torch.pow(utility.clamp_min(0.0), gamma)
-
-        # Prefer candidates that contribute non-trivial hit mass.
-        utility = utility * torch.log1p(hit_mass)
-
-        utility = utility * formulae_mask[b].float()
-
-        s = utility.sum()
-        if not torch.isfinite(s) or float(s.detach().cpu().item()) <= eps:
-            continue
-
-        target = utility / s.clamp_min(eps)
-        log_prob = F.log_softmax(logits[b], dim=0)
-
-        losses.append(-(target.detach() * log_prob).sum())
-
-    if len(losses) == 0:
-        return selector_logits.new_tensor(0.0)
-
-    return torch.stack(losses).mean()
-
-def prepare_batch_cpu(raw_batch, spect_bin):
-    try:
-        prefix_topk = int(os.environ.get('CANDIDATE_PREFIX_TOPK', '0'))
-    except Exception:
-        prefix_topk = 0
-
-    processed_batch = {}
-    for k, v in raw_batch.items():
-        if k == 'spect':
-            dense = _stack_list_to_tensor(v, target_dtype=torch.float32)
-            if torch.is_tensor(dense) and dense.dim() == 2 and dense.shape[1] == 1024:
-                processed_batch[k] = dense
-            else:
-                spect_list = [to_dense_binned_spectrum(s, spect_bin) for s in v]
-                processed_batch[k] = torch.stack(spect_list)
-
-        elif k == 'spect_raw':
-            # Keep sparse/raw spectra on CPU for official validation metrics.
-            processed_batch[k] = v
-
-        elif k in ['formulae_feats', 'formula_feats']:
-            processed_batch[k] = _stack_list_to_tensor(v, target_dtype=torch.long)
-
-        elif k in [
-            'true_official_idx',
-            'true_official_intensity',
-            'true_top20_official_idx',
-            'true_top20_official_intensity',
-            'true_all_official_idx',
-            'true_all_official_intensity',
-        ]:
-            # 这些是变长 sparse target，先保留 list。
-            processed_batch[k] = v
-
-        elif k in ['vect_feat', 'adj', 'input_mask', 'mol_feat', 'ce', 'precursor_mz',
-            'ce_missing', 'adduct_missing', 'instrument_missing', 'ms_level_missing',
-            'precursor_mz_missing', 'formulae_mask', 'teacher_formula_probs']:
-            stacked = _stack_list_to_tensor(v, target_dtype=torch.float32)
-            processed_batch[k] = stacked if torch.is_tensor(stacked) else v
-
-        elif k in [
-            'true_precursor_intensity',
-            'true_precursor_prob_in_all',
-            'true_precursor_present',
-        ]:
-            stacked = _stack_list_to_tensor(v, target_dtype=torch.float32)
-            processed_batch[k] = stacked if torch.is_tensor(stacked) else v
-
-        elif k in [
-            'true_precursor_bin',
-        ]:
-            stacked = _stack_list_to_tensor(v, target_dtype=torch.long)
-            processed_batch[k] = stacked if torch.is_tensor(stacked) else v
-
-        elif k in ['formulae_n_raw', 'formulae_n_kept', 'formulae_truncated']:
-            stacked = _stack_list_to_tensor(v, target_dtype=torch.long)
-            processed_batch[k] = stacked if torch.is_tensor(stacked) else v
-        elif k in ['formulae_active_mask', 'formulae_prior_score']:
-            stacked = _stack_list_to_tensor(v, target_dtype=torch.float32)
-            processed_batch[k] = stacked if torch.is_tensor(stacked) else v
-
-        elif k in ['formulae_source_flag', 'formulae_break_depth', 'formulae_ring_cut_flag']:
-            stacked = _stack_list_to_tensor(v, target_dtype=torch.long)
-            processed_batch[k] = stacked if torch.is_tensor(stacked) else v
-
-        elif k == 'adduct':
-            processed_batch[k] = encode_adduct_batch(v)
-
-        elif k == 'instrument_type':
-            processed_batch[k] = encode_instrument_batch(v)
-
-        elif k == 'ms_level':
-            processed_batch[k] = encode_ms_level_batch(v)
-
-        elif k in [
-            'formulae_features', 'formulae_peaks', 'formulae_peaks_mass_idx', 'formulae_peaks_intensity',
-            'formulae_peaks_official_idx', 'formulae_peaks_official_intensity',
-            'formulae_peaks_official_idx_agg', 'formulae_peaks_official_intensity_agg',
-            'formulae_aux_feat', 'formulae_frag_aux_feat', 'formulae_instance_is_source',
-            'formulae_instance_group_id', 'formulae_instance_depth', 'formulae_instance_h_shift',
-            'vert_element_oh',
-            'fragment_node_mz', 'fragment_node_intensity', 'fragment_node_local_feat',
-            'fragment_node_depth', 'fragment_node_h_shift', 'fragment_node_is_brics',
-            'fragment_node_ring_cut', 'fragment_node_atom_count', 'fragment_node_cut_count',
-            'fragment_node_source_type', 'fragment_node_mask', 'fragment_node_label',
-            'fragment_node_true_intensity', 'fragment_node_true_intensity_share',
-            'fragment_node_bin_dup_count', 'fragment_node_label_top20'
-        ]:
-            if k in ['formulae_features']:
-                stacked = _stack_list_to_tensor(v, target_dtype=torch.long)
-            elif ('idx' in k) or ('mass_idx' in k):
-                stacked = _stack_list_to_tensor(v, target_dtype=torch.long)
-            else:
-                stacked = _stack_list_to_tensor(v, target_dtype=torch.float32)
-            processed_batch[k] = stacked if torch.is_tensor(stacked) else v
-
-        elif k in [
-            'fragment_node_formula', 'fragment_node_official_idx', 'fragment_node_group_formula_id', 'fragment_node_n_valid'
-        ]:
-            stacked = _stack_list_to_tensor(v, target_dtype=torch.long)
-            processed_batch[k] = stacked if torch.is_tensor(stacked) else v
-
-        else:
-            processed_batch[k] = v
-
-    # Optional controlled ablation: keep only the first-K candidates from a shared cache.
-    # This enables a clean max_formulae prefix sweep on identical samples/candidate ordering.
-    if prefix_topk > 0 and torch.is_tensor(processed_batch.get('formulae_features', None)):
-        cand_n = int(processed_batch['formulae_features'].shape[1])
-        keep_n = max(1, min(int(prefix_topk), cand_n))
-
-        for kk in [
-            'formulae_features',
-            'formulae_peaks',
-            'formulae_peaks_mass_idx',
-            'formulae_peaks_intensity',
-            'formulae_peaks_official_idx',
-            'formulae_peaks_official_intensity',
-            'formulae_peaks_official_idx_agg',
-            'formulae_peaks_official_intensity_agg',
-            'formulae_aux_feat',
-            'formulae_frag_aux_feat',
-            'formulae_active_mask',
-            'formulae_prior_score',
-            'formulae_source_flag',
-            'formulae_break_depth',
-            'formulae_ring_cut_flag',
-            'formulae_mask',
-            'teacher_formula_probs',
-            'formulae_instance_is_source',
-            'formulae_instance_group_id',
-            'formulae_instance_depth',
-            'formulae_instance_h_shift',
-        ]:
-            vv = processed_batch.get(kk, None)
-            if torch.is_tensor(vv) and vv.dim() >= 2 and int(vv.shape[1]) >= keep_n:
-                processed_batch[kk] = vv[:, :keep_n, ...]
-
-        n_kept = processed_batch.get('formulae_n_kept', None)
-        if torch.is_tensor(n_kept):
-            processed_batch['formulae_n_kept'] = torch.clamp(n_kept.long(), max=int(keep_n))
-
-        n_raw = processed_batch.get('formulae_n_raw', None)
-        if torch.is_tensor(n_raw):
-            trunc = (n_raw.long() > int(keep_n)).long()
-            if torch.is_tensor(processed_batch.get('formulae_truncated', None)):
-                processed_batch['formulae_truncated'] = torch.maximum(
-                    processed_batch['formulae_truncated'].long(),
-                    trunc,
-                )
-            else:
-                processed_batch['formulae_truncated'] = trunc
-        # Robust fallback: some batches may still leave peak tensors as python lists.
-    # Force-convert them here if shapes are regular.
-    for kk in [
-        'formulae_peaks_mass_idx',
-        'formulae_peaks_intensity',
-        'formulae_peaks_official_idx',
-        'formulae_peaks_official_intensity',
-        'formulae_peaks_official_idx_agg',
-        'formulae_peaks_official_intensity_agg',
-
-        
-        'true_precursor_bin',
-        'true_precursor_intensity',
-        'true_precursor_prob_in_all',
-        'true_precursor_present',
-    ]:
-        vv = processed_batch.get(kk, None)
-        if isinstance(vv, list):
-            try:
-                arr = np.asarray(vv)
-                if (
-                    ('idx' in kk)
-                    or ('mass_idx' in kk)
-                    or kk in [
-                        'true_precursor_bin',
-                    ]
-                ):
-                    processed_batch[kk] = torch.as_tensor(arr, dtype=torch.long)
-                else:
-                    processed_batch[kk] = torch.as_tensor(arr, dtype=torch.float32)
-            except Exception:
-                pass
-    return processed_batch
-
-
-# Function overview: move_batch_to_device handles a specific workflow step in this module.
-
-def move_batch_to_device(processed_batch, device):
-    batch = {}
-    for k, v in processed_batch.items():
-        if torch.is_tensor(v):
-            batch[k] = v.to(device, non_blocking=True)
-        elif isinstance(v, list) and len(v) > 0 and torch.is_tensor(v[0]):
-            batch[k] = [i.to(device, non_blocking=True) for i in v]
-        else:
-            batch[k] = v
-    return batch
 
 
 # Function overview: compute_formula_distribution_metrics summarizes score/probability behavior over candidates.
@@ -4397,6 +3692,57 @@ def _build_topk_mask_from_scores(scores_tensor, formulae_mask=None, topk=64, can
     return keep
 
 
+def _build_mask_from_topk_indices(topk_idx, scores_tensor, formulae_mask=None, candidate_mask=None):
+    if not torch.is_tensor(topk_idx) or not torch.is_tensor(scores_tensor):
+        return None
+
+    sc = scores_tensor.float()
+    if sc.dim() == 1:
+        sc = sc.unsqueeze(0)
+    elif sc.dim() > 2:
+        sc = sc.reshape(sc.shape[0], -1)
+
+    B = int(sc.shape[0])
+    M = int(sc.shape[1])
+
+    idx = topk_idx
+    if idx.dim() == 1:
+        idx = idx.unsqueeze(0)
+    elif idx.dim() > 2:
+        idx = idx.reshape(idx.shape[0], -1)
+
+    idx = idx.to(device=sc.device, dtype=torch.long)
+    use_b = min(B, int(idx.shape[0]))
+
+    keep = torch.zeros((B, M), dtype=torch.float32, device=sc.device)
+    if use_b > 0 and M > 0:
+        idx_clamped = idx[:use_b].clamp(0, max(0, M - 1))
+        keep[:use_b].scatter_(1, idx_clamped, 1.0)
+
+    if torch.is_tensor(formulae_mask):
+        fm = formulae_mask.float()
+        if fm.dim() > 2:
+            fm = fm.reshape(fm.shape[0], -1)
+        fm = fm[:use_b, :M]
+    else:
+        fm = torch.ones((use_b, M), dtype=torch.float32, device=sc.device)
+
+    if torch.is_tensor(candidate_mask):
+        cm = candidate_mask.float()
+        if cm.dim() > 2:
+            cm = cm.reshape(cm.shape[0], -1)
+        cm = cm[:use_b, :M]
+
+        fm_full = fm
+        fm_active = fm * (cm > 0.5).float()
+
+        row_has_active = fm_active.sum(dim=-1, keepdim=True) > 0
+        fm = torch.where(row_has_active, fm_active, fm_full)
+
+    keep[:use_b] = keep[:use_b] * fm
+    return keep
+
+
 def _build_group_unique_topk_mask_from_scores(
     scores,
     formulae_mask=None,
@@ -7040,7 +6386,58 @@ def train_mssubsetnet():
                             ks=k_list,
                         )
                     for k in k_list:
-                        if os.environ.get("USE_GROUP_UNIQUE_MODEL_TOPK", "0") == "1":
+                        if use_coverage_topk:
+                            peak_idx = batch.get("formulae_peaks_official_idx", None)
+                            peak_int = batch.get("formulae_peaks_official_intensity", None)
+                            if peak_idx is None or peak_int is None:
+                                peak_idx = batch.get("formulae_peaks_mass_idx", None)
+                                peak_int = batch.get("formulae_peaks_intensity", None)
+
+                            coverage_mask_k = batch.get('formulae_mask', None)
+                            if torch.is_tensor(coverage_mask_k):
+                                coverage_mask_k = coverage_mask_k.float()
+                                if coverage_mask_k.dim() > 2:
+                                    coverage_mask_k = coverage_mask_k.reshape(coverage_mask_k.shape[0], -1)
+
+                            if torch.is_tensor(topk_candidate_mask_val):
+                                cm = topk_candidate_mask_val.float()
+                                if cm.dim() > 2:
+                                    cm = cm.reshape(cm.shape[0], -1)
+
+                                if not torch.is_tensor(coverage_mask_k):
+                                    coverage_mask_k = torch.ones_like(cm)
+
+                                use_b = min(int(coverage_mask_k.shape[0]), int(cm.shape[0]))
+                                use_m = min(int(coverage_mask_k.shape[1]), int(cm.shape[1]))
+                                coverage_mask_k = coverage_mask_k[:use_b, :use_m]
+                                cm = cm[:use_b, :use_m]
+
+                                fm_full = coverage_mask_k
+                                fm_active = coverage_mask_k * (cm > 0.5).float()
+
+                                row_has_active = fm_active.sum(dim=-1, keepdim=True) > 0
+                                coverage_mask_k = torch.where(row_has_active, fm_active, fm_full)
+
+                            group_id = None
+                            if os.environ.get("USE_GROUP_UNIQUE_MODEL_TOPK", "0") == "1":
+                                group_id = batch.get("formulae_instance_group_id", None)
+
+                            topk_idx = coverage_aware_topk(
+                                selector_logits_for_topk,
+                                peak_idx,
+                                peak_int,
+                                formulae_mask=coverage_mask_k,
+                                group_id=group_id,
+                                k=k,
+                                duplicate_penalty=float(os.environ.get("COVERAGE_TOPK_DUP_PENALTY", "0.35")),
+                                novelty_bonus=float(os.environ.get("COVERAGE_TOPK_NOVELTY_BONUS", "0.10")),
+                            )
+                            selector_masks[k] = _build_mask_from_topk_indices(
+                                topk_idx,
+                                selector_logits_for_topk,
+                                formulae_mask=coverage_mask_k,
+                            )
+                        elif os.environ.get("USE_GROUP_UNIQUE_MODEL_TOPK", "0") == "1":
                             selector_masks[k] = _build_group_unique_topk_mask_from_scores(
                                 selector_logits_for_topk,
                                 formulae_mask=batch.get('formulae_mask', None),
