@@ -352,13 +352,41 @@ class MolAttentionGRUNewSparse(nn.Module):
 
         self.align_to_base_proj = nn.Linear(4, int(internal_d))
 
-        self.selector_head = nn.Sequential(
-            nn.LayerNorm(int(internal_d)),
-            nn.Linear(int(internal_d), int(internal_d)),
-            nn.ReLU(),
-            nn.Linear(int(internal_d), 1),
+        self.selector_self_attn = nn.MultiheadAttention(
+            embed_dim=int(internal_d),
+            num_heads=4,
+            dropout=0.10,
+            batch_first=True,
         )
-        
+
+        self.selector_attn_norm = nn.LayerNorm(int(internal_d))
+
+        self.selector_ffn = nn.Sequential(
+            nn.Linear(int(internal_d), int(internal_d) * 2),
+            nn.ReLU(),
+            nn.Dropout(0.10),
+            nn.Linear(int(internal_d) * 2, int(internal_d)),
+        )
+
+        self.selector_ffn_norm = nn.LayerNorm(int(internal_d))
+
+        self.selector_global_proj = nn.Sequential(
+            nn.LayerNorm(int(internal_d) * 2),
+            nn.Linear(int(internal_d) * 2, int(internal_d)),
+            nn.ReLU(),
+            nn.Linear(int(internal_d), int(internal_d)),
+        )
+
+        self.selector_head = nn.Sequential(
+            nn.LayerNorm(int(internal_d) * 4),
+            nn.Linear(int(internal_d) * 4, int(internal_d)),
+            nn.ReLU(),
+            nn.Dropout(0.10),
+            nn.Linear(int(internal_d), int(internal_d) // 2),
+            nn.ReLU(),
+            nn.Linear(int(internal_d) // 2, 1),
+        )
+
         # 新增：set-wise scorer
         self.set_score_norm = nn.LayerNorm(int(internal_d) * 4 + 2)
         self.set_score_l1 = nn.Linear(int(internal_d) * 4 + 2, int(internal_d))
@@ -1253,6 +1281,70 @@ class MolAttentionGRUNewSparse(nn.Module):
         out = out / out.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         return out
 
+    def _selector_context_encode(self, h, formulae_mask):
+        """
+        Build context-aware selector features.
+
+        h: [B, M, D]
+        formulae_mask: [B, M]
+        return: [B, M, 4D]
+        """
+        if formulae_mask is None:
+            formulae_mask = torch.ones(
+                h.shape[:2],
+                dtype=torch.float32,
+                device=h.device,
+            )
+        else:
+            formulae_mask = formulae_mask.to(device=h.device, dtype=torch.float32)
+
+        valid = formulae_mask > 0.5
+        key_padding_mask = ~valid
+
+        all_bad = key_padding_mask.all(dim=1)
+        if bool(all_bad.any().item()):
+            key_padding_mask = key_padding_mask.clone()
+            key_padding_mask[all_bad, 0] = False
+            formulae_mask = formulae_mask.clone()
+            formulae_mask[all_bad, 0] = 1.0
+            valid = formulae_mask > 0.5
+
+        attn_out, _ = self.selector_self_attn(
+            h,
+            h,
+            h,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+
+        h = self.selector_attn_norm(h + attn_out)
+
+        ffn_out = self.selector_ffn(h)
+        h = self.selector_ffn_norm(h + ffn_out)
+
+        mask_f = formulae_mask.unsqueeze(-1)
+
+        mean_ctx = (h * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)
+
+        h_for_max = h.masked_fill(mask_f <= 0, -1e4)
+        max_ctx = h_for_max.max(dim=1).values
+
+        global_ctx = torch.cat([mean_ctx, max_ctx], dim=-1)
+        global_ctx = self.selector_global_proj(global_ctx)
+        global_ctx = global_ctx.unsqueeze(1).expand_as(h)
+
+        selector_h = torch.cat(
+            [
+                h,
+                global_ctx,
+                h * global_ctx,
+                h - global_ctx,
+            ],
+            dim=-1,
+        )
+
+        return selector_h
+
     def forward(
         self,
         vert_feat_in,
@@ -1492,7 +1584,8 @@ class MolAttentionGRUNewSparse(nn.Module):
         matched_subset_per_sample = torch.zeros((batch_n,), dtype=torch.float32, device=device)
         matched_formula_per_sample = torch.zeros((batch_n,), dtype=torch.float32, device=device)
         invalid_formula = formulae_mask <= 0
-        selector_logits = self.selector_head(base_h).squeeze(-1)
+        selector_h = self._selector_context_encode(base_h, formulae_mask)
+        selector_logits = self.selector_head(selector_h).squeeze(-1)
         selector_logits = selector_logits.masked_fill(
             invalid_formula,
             torch.finfo(selector_logits.dtype).min,
