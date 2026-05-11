@@ -5967,6 +5967,9 @@ def train_mssubsetnet():
                             dtype=pos.dtype,
                         ).float().mean()
 
+                pair_loss_total = selector_logits_for_loss.new_tensor(0.0)
+                pair_count = 0
+
                 # Optional: selector pairwise ranking loss (hard-negative sampling)
                 if os.environ.get('ENABLE_SELECTOR_PAIRWISE', '0') == '1':
                     try:
