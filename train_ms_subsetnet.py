@@ -4087,7 +4087,6 @@ def compute_candidate_support_stats(
         'overlap_n': float(overlap.float().sum(dim=-1).mean().detach().cpu().item()),
         'pred_int_on_true': float(pred_int_on_true.mean().detach().cpu().item()),
         'false_support': float(false_support.mean().detach().cpu().item()),
-        "selector_utility": float(selector_utility_loss.detach().cpu().item()),
         'official_cos': float(cos.mean().detach().cpu().item()),
     }
 
@@ -5212,6 +5211,10 @@ def train_mssubsetnet():
         0.0,
         float(os.environ.get('FALSE_SUPPORT_LOSS_WEIGHT', '0.0')),
     )
+    selector_utility_loss_weight = max(
+        0.0,
+        float(os.environ.get('SELECTOR_UTILITY_LOSS_WEIGHT', '0.0')),
+    )
     # coarse_spectral_aux_weight = max(0.0, float(os.environ.get('COARSE_SPECTRAL_AUX_WEIGHT', '0.1')))
     coarse_spectral_aux_weight = 0.0
     official_spectral_kl_weight = max(0.0, float(os.environ.get('OFFICIAL_SPECTRAL_KL_WEIGHT', '0.2')))
@@ -6151,11 +6154,6 @@ def train_mssubsetnet():
                 # ============================================================
                 selector_false_support_loss = selector_loss.new_zeros(())
                 selector_utility_loss = selector_loss.new_zeros(())
-
-                try:
-                    selector_utility_loss_weight = float(os.environ.get("SELECTOR_UTILITY_LOSS_WEIGHT", "0.0"))
-                except Exception:
-                    selector_utility_loss_weight = 0.0
 
                 if selector_utility_loss_weight > 0.0:
                     selector_utility_loss = compute_selector_utility_target_loss(
