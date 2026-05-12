@@ -50,6 +50,7 @@ class LossConfig:
     selector_kl_weight: float
     selector_pos_weight: float
     selector_utility_weight: float
+    selector_pairwise_weight: float
     selector_false_lambda: float
     false_support_weight: float
     rerank_weight: float
@@ -90,6 +91,7 @@ def get_loss_config():
         selector_kl_weight=env_float("SELECTOR_KL_WEIGHT", 0.45),
         selector_pos_weight=env_float("SELECTOR_POS_WEIGHT", 3.0),
         selector_utility_weight=env_float("SELECTOR_UTILITY_LOSS_WEIGHT", 0.25),
+        selector_pairwise_weight=env_float("SELECTOR_PAIRWISE_WEIGHT", 0.40),
         selector_false_lambda=env_float("SELECTOR_UTILITY_FALSE_LAMBDA", 0.60),
         false_support_weight=env_float("FALSE_SUPPORT_LOSS_WEIGHT", 0.20),
         rerank_weight=env_float("RERANK_LOSS_WEIGHT", 0.0),
