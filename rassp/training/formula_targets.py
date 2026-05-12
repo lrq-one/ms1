@@ -6,310 +6,159 @@ import torch
 import torch.nn.functional as F
 
 from rassp.model.model_utils import neg_mask_fill_value as _neg_mask_fill_value
+from rassp.model.selector_topk import coverage_aware_topk, group_unique_topk, plain_topk
+from rassp.training.formula_targets import (
+    _build_true_official_dense_from_cached_sparse_batch,
+    get_formulae_official_intensity_from_batch,
+)
 from rassp.training.spectrum_targets import build_true_official_dense_from_raw
 
 
-def get_formulae_official_intensity_from_batch(batch):
-    """Prefer official-bin intensity tensor when present; fallback to legacy intensity."""
+def compute_selector_quality_metrics(selector_logits, selector_quality, formulae_mask, ks=(32, 64, 128, 256)):
+    out = {}
+    valid_quality = selector_quality * formulae_mask.float()
+
+    for k in ks:
+        kk = min(k, selector_logits.shape[1])
+        idx = torch.topk(
+            selector_logits.masked_fill(formulae_mask <= 0.5, -1e9),
+            k=kk,
+            dim=1,
+        ).indices
+
+        q_top = torch.gather(valid_quality, 1, idx)
+        pos_top = (q_top > 0.3).float()
+
+        out[f"selector_quality_mean_at_{k}"] = q_top.mean().detach()
+        out[f"selector_precision_at_{k}"] = pos_top.mean().detach()
+
+    return out
+
+
+def _zero_precursor_bin_dense_batch(dense_spect, precursor_mz, bin_width):
+    if (not torch.is_tensor(dense_spect)) or precursor_mz is None:
+        return dense_spect
+
+    out = dense_spect.clone()
+    if not torch.is_tensor(precursor_mz):
+        precursor_mz = torch.as_tensor(precursor_mz)
+
+    pmz = precursor_mz.to(device=out.device, dtype=torch.float32).reshape(-1)
+    if pmz.shape[0] < int(out.shape[0]):
+        pad = torch.zeros((int(out.shape[0]) - int(pmz.shape[0]),), dtype=torch.float32, device=out.device)
+        pmz = torch.cat([pmz, pad], dim=0)
+    pmz = pmz[: int(out.shape[0])]
+
+    bin_idx = torch.floor(pmz / float(bin_width) + 1e-8).long()
+    valid = torch.isfinite(pmz) & (bin_idx >= 0) & (bin_idx < int(out.shape[1]))
+    if bool(valid.any().item()):
+        row_idx = torch.arange(int(out.shape[0]), device=out.device)
+        out[row_idx[valid], bin_idx[valid]] = 0.0
+    return out
+
+
+def build_true_official_dense_from_batch(
+    batch,
+    official_bin_width=0.01,
+    official_max_mz=1005.0,
+    exclude_precursor=True,
+    device=None,
+):
+    """Build dense official-bin targets from either cached sparse targets or raw spectra."""
     if not isinstance(batch, dict):
         return None
-    off_int = batch.get("formulae_peaks_official_intensity", None)
-    if torch.is_tensor(off_int) and off_int.dim() == 3:
-        return off_int
-    return batch.get("formulae_peaks_intensity", None)
+    if device is None:
+        device = torch.device("cpu")
 
-
-def _build_true_official_dense_from_cached_sparse_batch(batch, batch_n, device, official_bin_n):
-    out = torch.zeros((int(batch_n), int(official_bin_n)), dtype=torch.float32, device=device)
-    idx_src = batch.get("true_official_idx", None)
-    val_src = batch.get("true_official_intensity", None)
-    used_cache = False
-
-    if torch.is_tensor(idx_src) and torch.is_tensor(val_src):
-        idx_t = idx_src.long()
-        val_t = val_src.float()
-        if idx_t.dim() == 1:
-            idx_t = idx_t.unsqueeze(0)
-        if val_t.dim() == 1:
-            val_t = val_t.unsqueeze(0)
-        if idx_t.dim() == 2 and val_t.dim() == 2:
-            use_b = min(int(batch_n), int(idx_t.shape[0]), int(val_t.shape[0]))
-            use_k = min(int(idx_t.shape[1]), int(val_t.shape[1]))
-            if use_b > 0 and use_k > 0:
-                idx_t = idx_t[:use_b, :use_k].to(device=device)
-                val_t = val_t[:use_b, :use_k].to(device=device)
-                valid = (
-                    (idx_t >= 0)
-                    & (idx_t < int(official_bin_n))
-                    & torch.isfinite(val_t)
-                    & (val_t > 0)
-                )
-                if bool(valid.any().item()):
-                    idx_safe = idx_t.clamp(0, max(0, int(official_bin_n) - 1))
-                    out[:use_b].scatter_add_(1, idx_safe, val_t * valid.float())
-                    used_cache = True
-        return out, used_cache
-
-    if isinstance(idx_src, (list, tuple)) and isinstance(val_src, (list, tuple)):
-        use_b = min(int(batch_n), len(idx_src), len(val_src))
-        for bi in range(use_b):
-            try:
-                idx_i = np.asarray(idx_src[bi], dtype=np.int64).reshape(-1)
-                val_i = np.asarray(val_src[bi], dtype=np.float32).reshape(-1)
-            except Exception:
-                continue
-            if idx_i.size <= 0 or val_i.size <= 0:
-                continue
-            use_k = min(int(idx_i.shape[0]), int(val_i.shape[0]))
-            idx_i = idx_i[:use_k]
-            val_i = val_i[:use_k]
-            valid_i = (
-                (idx_i >= 0)
-                & (idx_i < int(official_bin_n))
-                & np.isfinite(val_i)
-                & (val_i > 0)
-            )
-            if not np.any(valid_i):
-                continue
-            idx_t = torch.as_tensor(idx_i[valid_i], dtype=torch.long, device=device)
-            val_t = torch.as_tensor(val_i[valid_i], dtype=torch.float32, device=device)
-            out[bi].scatter_add_(0, idx_t, val_t)
-            used_cache = True
-    return out, used_cache
-
-
-build_true_official_dense_from_cached_sparse_batch = _build_true_official_dense_from_cached_sparse_batch
-
-
-def _build_cached_true_top20_tensors(batch, batch_n, official_bin_n, device, default_k=20):
-    k = max(1, int(default_k))
-    out_idx = torch.full((int(batch_n), k), -1, dtype=torch.long, device=device)
-    out_val = torch.zeros((int(batch_n), k), dtype=torch.float32, device=device)
-    out_valid = torch.zeros((int(batch_n), k), dtype=torch.bool, device=device)
-    used_cache = False
-
-    idx_src = batch.get("true_top20_official_idx", None)
-    val_src = batch.get("true_top20_official_intensity", None)
-    if idx_src is None or val_src is None:
-        return out_idx, out_val, out_valid, used_cache
-
-    if torch.is_tensor(idx_src) and torch.is_tensor(val_src):
-        idx_t = idx_src.long()
-        val_t = val_src.float()
-        if idx_t.dim() == 1:
-            idx_t = idx_t.unsqueeze(0)
-        if val_t.dim() == 1:
-            val_t = val_t.unsqueeze(0)
-        if idx_t.dim() != 2 or val_t.dim() != 2:
-            return out_idx, out_val, out_valid, used_cache
-
-        use_b = min(int(batch_n), int(idx_t.shape[0]), int(val_t.shape[0]))
-        use_k = min(int(idx_t.shape[1]), int(val_t.shape[1]))
-        if use_b <= 0 or use_k <= 0:
-            return out_idx, out_val, out_valid, used_cache
-
-        idx_t = idx_t[:use_b, :use_k].to(device=device)
-        val_t = val_t[:use_b, :use_k].to(device=device)
-
-        valid = (
-            (idx_t >= 0)
-            & (idx_t < int(official_bin_n))
-            & torch.isfinite(val_t)
-            & (val_t > 0)
-        )
-        if bool(valid.any().item()):
-            order = torch.argsort(val_t, dim=-1, descending=True)
-            idx_sorted = torch.gather(idx_t, 1, order)
-            val_sorted = torch.gather(val_t, 1, order)
-            valid_sorted = torch.gather(valid, 1, order)
-            keep = min(k, int(idx_sorted.shape[1]))
-            out_idx[:use_b, :keep] = idx_sorted[:, :keep]
-            out_val[:use_b, :keep] = val_sorted[:, :keep]
-            out_valid[:use_b, :keep] = valid_sorted[:, :keep]
-            used_cache = True
-        return out_idx, out_val, out_valid, used_cache
-
-    if isinstance(idx_src, (list, tuple)) and isinstance(val_src, (list, tuple)):
-        use_b = min(int(batch_n), len(idx_src), len(val_src))
-        for bi in range(use_b):
-            try:
-                idx_i = np.asarray(idx_src[bi], dtype=np.int64).reshape(-1)
-                val_i = np.asarray(val_src[bi], dtype=np.float32).reshape(-1)
-            except Exception:
-                continue
-            if idx_i.size <= 0 or val_i.size <= 0:
-                continue
-            use_n = min(int(idx_i.shape[0]), int(val_i.shape[0]))
-            idx_i = idx_i[:use_n]
-            val_i = val_i[:use_n]
-            valid_i = (
-                (idx_i >= 0)
-                & (idx_i < int(official_bin_n))
-                & np.isfinite(val_i)
-                & (val_i > 0)
-            )
-            if not np.any(valid_i):
-                continue
-            idx_v = idx_i[valid_i]
-            val_v = val_i[valid_i]
-            order = np.argsort(-val_v, kind="stable")
-            take = min(k, int(order.shape[0]))
-            if take <= 0:
-                continue
-            sel = order[:take]
-            out_idx[bi, :take] = torch.as_tensor(idx_v[sel], dtype=torch.long, device=device)
-            out_val[bi, :take] = torch.as_tensor(val_v[sel], dtype=torch.float32, device=device)
-            out_valid[bi, :take] = True
-            used_cache = True
-    return out_idx, out_val, out_valid, used_cache
-
-
-def _get_teacher_formula_target_from_batch(batch):
-    tq = batch.get("teacher_formula_probs", None)
-    if not torch.is_tensor(tq):
-        return None
-
-    tq = tq.float()
-
-    if tq.dim() == 1:
-        tq = tq.unsqueeze(0)
-    elif tq.dim() > 2:
-        tq = tq.reshape(tq.shape[0], -1)
-
-    fm = batch.get("formulae_mask", None)
-    if torch.is_tensor(fm):
-        fm = fm.float()
-        if fm.dim() > 2:
-            fm = fm.reshape(fm.shape[0], -1)
-
-        use_b = min(int(tq.shape[0]), int(fm.shape[0]))
-        use_m = min(int(tq.shape[1]), int(fm.shape[1]))
-        if use_b <= 0 or use_m <= 0:
+    if torch.is_tensor(batch.get("vect_feat", None)):
+        batch_n = int(batch["vect_feat"].shape[0])
+    else:
+        idx_src = batch.get("true_official_idx", None)
+        if torch.is_tensor(idx_src):
+            batch_n = int(idx_src.shape[0]) if idx_src.dim() > 0 else 1
+        elif isinstance(idx_src, (list, tuple)):
+            batch_n = len(idx_src)
+        else:
             return None
 
-        tq = tq[:use_b, :use_m]
-        fm = fm[:use_b, :use_m]
+    official_bin_width = float(max(1e-6, float(official_bin_width)))
+    official_max_mz = float(max(official_bin_width, float(official_max_mz)))
+    official_bin_n = int(math.floor(float(official_max_mz) / official_bin_width)) + 1
 
-        tq = torch.where(torch.isfinite(tq), tq, torch.zeros_like(tq))
-        tq = tq.clamp_min(0.0)
-        tq = tq * (fm > 0.5).float()
-
-        row_sum = tq.sum(dim=-1, keepdim=True)
-        bad = row_sum <= 1e-12
-
-        if bool(bad.any().item()):
-            fallback = (fm > 0.5).float()
-            fallback = fallback / fallback.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-            tq = torch.where(
-                bad.expand_as(tq),
-                fallback,
-                tq / row_sum.clamp_min(1e-12),
-            )
-        else:
-            tq = tq / row_sum.clamp_min(1e-12)
-
-        return tq
-
-    tq = torch.where(torch.isfinite(tq), tq, torch.zeros_like(tq))
-    tq = tq.clamp_min(0.0)
-    row_sum = tq.sum(dim=-1, keepdim=True)
-    valid = row_sum > 1e-12
-
-    if bool(valid.any().item()):
-        tq = torch.where(
-            valid.expand_as(tq),
-            tq / row_sum.clamp_min(1e-12),
-            torch.full_like(tq, 1.0 / max(1, int(tq.shape[1]))),
+    dense, used_cache = _build_true_official_dense_from_cached_sparse_batch(
+        batch=batch,
+        batch_n=batch_n,
+        device=device,
+        official_bin_n=official_bin_n,
+    )
+    if not used_cache:
+        dense = build_true_official_dense_from_raw(
+            spect_raw_list=batch.get("spect_raw", None),
+            precursor_mz=batch.get("precursor_mz", None),
+            official_bin_width=official_bin_width,
+            official_max_mz=official_max_mz,
+            exclude_precursor=exclude_precursor,
+            batch_n=batch_n,
+            device=device,
         )
-        return tq
 
-    return None
+    if exclude_precursor:
+        dense = _zero_precursor_bin_dense_batch(
+            dense,
+            batch.get("precursor_mz", None),
+            official_bin_width,
+        )
+
+    return dense
 
 
-def apply_teacher_topk_to_target(target_probs, formulae_mask=None, topk=0):
-    if (not torch.is_tensor(target_probs)) or int(topk) <= 0:
-        return target_probs, formulae_mask
+def _build_true_official_dense_for_batch(batch, official_metric_cfg, device):
+    if not isinstance(batch, dict):
+        return None
+    if not torch.is_tensor(batch.get("vect_feat", None)):
+        return None
 
-    tp = target_probs.float()
-    if tp.dim() == 1:
-        tp = tp.unsqueeze(0)
-    elif tp.dim() > 2:
-        tp = tp.reshape(tp.shape[0], -1)
+    batch_n = int(batch["vect_feat"].shape[0])
+    official_bin_width = float(official_metric_cfg.get("bin_width", 0.01))
+    official_max_mz = float(official_metric_cfg.get("max_mz", 1005.0))
+    official_bin_n = int(math.floor(float(official_max_mz) / float(official_bin_width))) + 1
 
-    if torch.is_tensor(formulae_mask):
-        fm = formulae_mask.float()
-        if fm.dim() > 2:
-            fm = fm.reshape(fm.shape[0], -1)
-
-        use_b = min(int(tp.shape[0]), int(fm.shape[0]))
-        use_m = min(int(tp.shape[1]), int(fm.shape[1]))
-        tp = tp[:use_b, :use_m]
-        fm = fm[:use_b, :use_m]
-        fm = (fm > 0.5).float()
-    else:
-        fm = torch.ones_like(tp)
-
-    kk = max(1, min(int(topk), int(tp.shape[1])))
-
-    score = tp.masked_fill(fm <= 0.5, -1e9)
-    top_idx = torch.topk(score, k=kk, dim=-1).indices
-
-    keep = torch.zeros_like(tp)
-    keep.scatter_(1, top_idx, 1.0)
-    keep = keep * fm
-
-    try:
-        pos_eps = float(os.environ.get("TEACHER_TOPK_POS_EPS", "1e-12"))
-    except Exception:
-        pos_eps = 1e-12
-
-    positive = (tp > float(pos_eps)).float() * fm
-
-    if os.environ.get("TEACHER_TOPK_MASK_POSITIVE_ONLY", "1") == "1":
-        eff_mask = keep * positive
-
-        row_has_pos = eff_mask.sum(dim=-1, keepdim=True) > 0
-        eff_mask = torch.where(row_has_pos, eff_mask, keep)
-    else:
-        eff_mask = keep
-
-    tp_masked = tp * eff_mask
-
-    row_sum = tp_masked.sum(dim=-1, keepdim=True)
-
-    fallback = eff_mask / eff_mask.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-
-    tp_out = torch.where(
-        row_sum > 1e-12,
-        tp_masked / row_sum.clamp_min(1e-12),
-        fallback,
+    true_official_dense, used_cache = _build_true_official_dense_from_cached_sparse_batch(
+        batch=batch,
+        batch_n=batch_n,
+        device=device,
+        official_bin_n=official_bin_n,
     )
 
-    return tp_out, eff_mask
+    if not used_cache:
+        true_official_dense = build_true_official_dense_from_raw(
+            spect_raw_list=batch.get("spect_raw", None),
+            precursor_mz=batch.get("precursor_mz", None),
+            official_bin_width=official_bin_width,
+            official_max_mz=official_max_mz,
+            exclude_precursor=official_metric_cfg.get("exclude_precursor", True),
+            batch_n=batch_n,
+            device=device,
+        )
+
+    if official_metric_cfg.get("exclude_precursor", True):
+        true_official_dense = _zero_precursor_bin_dense_batch(
+            true_official_dense,
+            batch.get("precursor_mz", None),
+            official_bin_width,
+        )
+
+    return true_official_dense
 
 
-def compute_formula_target_probs_from_batch(
+def compute_candidate_support_stats(
     batch,
-    bin_width=0.1,
-    max_mz=1005.0,
-    target_mode="exact_overlap",
-    support_temperature=1.0,
-    support_topk=0,
+    cand_probs_or_mask,
+    official_bin_width=0.01,
+    official_max_mz=1005.0,
+    eps=1e-8,
 ):
-    use_teacher = str(os.environ.get("USE_TEACHER_FORMULA_TARGET", "1")).strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
-
-    if use_teacher:
-        teacher_target = _get_teacher_formula_target_from_batch(batch)
-        if torch.is_tensor(teacher_target):
-            return teacher_target
-
-    del target_mode
-
+    """Project candidate probabilities or masks to official bins and summarize support quality."""
     off_idx = batch.get("formulae_peaks_official_idx_agg", None)
     off_int = batch.get("formulae_peaks_official_intensity_agg", None)
     if off_idx is None:
@@ -317,420 +166,555 @@ def compute_formula_target_probs_from_batch(
     if off_int is None:
         off_int = get_formulae_official_intensity_from_batch(batch)
 
-    if not (torch.is_tensor(off_idx) and torch.is_tensor(off_int)):
-        return None
+    if not (torch.is_tensor(off_idx) and torch.is_tensor(off_int) and torch.is_tensor(cand_probs_or_mask)):
+        return {}
 
     if off_idx.dim() == 2:
         off_idx = off_idx.unsqueeze(0)
     if off_int.dim() == 2:
         off_int = off_int.unsqueeze(0)
-    if off_idx.dim() != 3 or off_int.dim() != 3:
+
+    device = cand_probs_or_mask.device
+    off_idx = off_idx.to(device=device).long()
+    off_int = off_int.to(device=device).float()
+    probs = cand_probs_or_mask.to(device=device).float()
+    if probs.dim() == 1:
+        probs = probs.unsqueeze(0)
+    elif probs.dim() > 2:
+        probs = probs.reshape(probs.shape[0], -1)
+
+    B = min(int(probs.shape[0]), int(off_idx.shape[0]), int(off_int.shape[0]))
+    M = min(int(probs.shape[1]), int(off_idx.shape[1]), int(off_int.shape[1]))
+    K = min(int(off_idx.shape[2]), int(off_int.shape[2]))
+    if B <= 0 or M <= 0 or K <= 0:
+        return {}
+
+    probs = probs[:B, :M]
+    off_idx = off_idx[:B, :M, :K]
+    off_int = off_int[:B, :M, :K]
+
+    try:
+        official_bin_n = int(np.floor(float(official_max_mz) / float(official_bin_width))) + 1
+    except Exception:
+        official_bin_n = 1
+    official_bin_n = max(1, int(official_bin_n))
+
+    valid = (off_idx >= 0) & (off_idx < official_bin_n) & torch.isfinite(off_int) & (off_int > 0)
+    probs_eff = probs
+    if probs_eff.dtype != off_int.dtype:
+        probs_eff = probs_eff.to(dtype=off_int.dtype)
+    contrib = probs_eff.unsqueeze(-1) * off_int * valid.float()
+
+    pred_dense = torch.zeros((B, official_bin_n), dtype=torch.float32, device=device)
+    flat_idx = off_idx.clamp(0, max(0, official_bin_n - 1)).reshape(B, -1)
+    flat_val = contrib.reshape(B, -1)
+    flat_val = flat_val * valid.reshape(B, -1).float()
+    pred_dense.scatter_add_(1, flat_idx, flat_val)
+
+    true_dense = build_true_official_dense_from_batch(
+        batch,
+        official_bin_width=official_bin_width,
+        official_max_mz=official_max_mz,
+        exclude_precursor=True,
+        device=device,
+    )
+    if true_dense is None:
+        return {}
+    true_dense = true_dense[:B].to(device=device)
+
+    pred_support = pred_dense > float(eps)
+    true_support = true_dense > float(eps)
+    overlap = pred_support & true_support
+    false = pred_support & (~true_support)
+
+    pred_int_sum = pred_dense.sum(dim=-1).clamp_min(float(eps))
+    pred_int_on_true = (pred_dense * true_support.float()).sum(dim=-1) / pred_int_sum
+    false_support = (pred_dense * (~true_support).float()).sum(dim=-1) / pred_int_sum
+    cos = F.cosine_similarity(pred_dense, true_dense, dim=-1, eps=float(eps))
+
+    return {
+        "pred_n": float(pred_support.float().sum(dim=-1).mean().detach().cpu().item()),
+        "false_pred_n": float(false.float().sum(dim=-1).mean().detach().cpu().item()),
+        "overlap_n": float(overlap.float().sum(dim=-1).mean().detach().cpu().item()),
+        "pred_int_on_true": float(pred_int_on_true.mean().detach().cpu().item()),
+        "false_support": float(false_support.mean().detach().cpu().item()),
+        "official_cos": float(cos.mean().detach().cpu().item()),
+    }
+
+
+def _build_topk_mask_from_scores(scores_tensor, formulae_mask=None, topk=64, candidate_mask=None):
+    if not torch.is_tensor(scores_tensor):
         return None
 
-    batch_n = min(int(off_idx.shape[0]), int(off_int.shape[0]))
-    formula_n = min(int(off_idx.shape[1]), int(off_int.shape[1]))
-    peak_n = min(int(off_idx.shape[2]), int(off_int.shape[2]))
-    if batch_n <= 0 or formula_n <= 0 or peak_n <= 0:
-        return None
+    sc = scores_tensor.float()
+    if sc.dim() == 1:
+        sc = sc.unsqueeze(0)
+    elif sc.dim() > 2:
+        sc = sc.reshape(sc.shape[0], -1)
 
-    device = off_idx.device
-    off_idx = off_idx[:batch_n, :formula_n, :peak_n].long()
-    off_int = off_int[:batch_n, :formula_n, :peak_n].float()
-
-    formulae_mask = batch.get("formulae_mask", None)
     if torch.is_tensor(formulae_mask):
-        mask = formulae_mask.float()
-        if mask.dim() > 2:
-            mask = mask.reshape(mask.shape[0], -1)
-        use_b = min(batch_n, int(mask.shape[0]))
-        use_m = min(formula_n, int(mask.shape[1]))
-        off_idx = off_idx[:use_b, :use_m, :]
-        off_int = off_int[:use_b, :use_m, :]
-        mask = mask[:use_b, :use_m]
-        batch_n = use_b
-        formula_n = use_m
-        peak_n = min(peak_n, int(off_idx.shape[2]), int(off_int.shape[2]))
-    else:
-        mask = torch.ones((batch_n, formula_n), dtype=torch.float32, device=device)
+        fm = formulae_mask.float()
+        if fm.dim() > 2:
+            fm = fm.reshape(fm.shape[0], -1)
 
-    if batch_n <= 0 or formula_n <= 0 or peak_n <= 0:
+        use_b = min(int(sc.shape[0]), int(fm.shape[0]))
+        use_m = min(int(sc.shape[1]), int(fm.shape[1]))
+        sc = sc[:use_b, :use_m]
+        fm = fm[:use_b, :use_m]
+        fm = (fm > 0.5).float()
+    else:
+        fm = torch.ones_like(sc)
+
+    if torch.is_tensor(candidate_mask):
+        cm = candidate_mask.float()
+        if cm.dim() > 2:
+            cm = cm.reshape(cm.shape[0], -1)
+
+        use_b2 = min(int(sc.shape[0]), int(cm.shape[0]))
+        use_m2 = min(int(sc.shape[1]), int(cm.shape[1]))
+        sc = sc[:use_b2, :use_m2]
+        fm = fm[:use_b2, :use_m2]
+        cm = cm[:use_b2, :use_m2]
+
+        fm_full = fm
+        fm_active = fm * (cm > 0.5).float()
+
+        row_has_active = fm_active.sum(dim=-1, keepdim=True) > 0
+        fm = torch.where(row_has_active, fm_active, fm_full)
+
+    if int(sc.shape[1]) <= 0:
         return None
 
-    try:
-        temp = float(support_temperature)
-    except Exception:
-        temp = 1.0
-    if (not np.isfinite(temp)) or temp <= 0:
-        temp = 1.0
+    kk = max(1, min(int(topk), int(sc.shape[1])))
 
-    try:
-        topk = int(support_topk)
-    except Exception:
-        topk = 0
-    topk = max(0, topk)
+    masked_scores = sc.masked_fill(fm <= 0, _neg_mask_fill_value(sc))
+    top_idx = torch.topk(masked_scores, k=kk, dim=-1).indices
 
-    bwidth = float(max(1e-6, bin_width))
-    max_mz = float(max(bwidth, max_mz))
-    official_bin_n = int(math.floor(max_mz / bwidth)) + 1
+    keep = torch.zeros_like(sc, dtype=torch.float32)
+    keep.scatter_(1, top_idx, 1.0)
+    keep = keep * fm
+    return keep
 
-    true_dense, used_cached_true = _build_true_official_dense_from_cached_sparse_batch(
-        batch=batch,
-        batch_n=batch_n,
-        device=device,
-        official_bin_n=official_bin_n,
-    )
 
-    if not used_cached_true:
-        raw_batch = batch.get("spect_raw", None)
-        if not getattr(compute_formula_target_probs_from_batch, "_warned_raw_fallback", False):
-            print(
-                "[target] missing cached true_official_idx/intensity, fallback to spect_raw target build; "
-                "rebuild cache via cache_featurizer_condv2 for official cache mode.",
-                flush=True,
-            )
-            compute_formula_target_probs_from_batch._warned_raw_fallback = True
-        true_dense = build_true_official_dense_from_raw(
-            spect_raw_list=raw_batch,
-            precursor_mz=batch.get("precursor_mz", None),
-            official_bin_width=bwidth,
-            official_max_mz=max_mz,
-            exclude_precursor=True,
-            batch_n=batch_n,
-            device=device,
+def _build_mask_from_topk_indices(topk_idx, scores_tensor, formulae_mask=None, candidate_mask=None):
+    if not torch.is_tensor(topk_idx) or not torch.is_tensor(scores_tensor):
+        return None
+
+    sc = scores_tensor.float()
+    if sc.dim() == 1:
+        sc = sc.unsqueeze(0)
+    elif sc.dim() > 2:
+        sc = sc.reshape(sc.shape[0], -1)
+
+    B = int(sc.shape[0])
+    M = int(sc.shape[1])
+
+    idx = topk_idx
+    if idx.dim() == 1:
+        idx = idx.unsqueeze(0)
+    elif idx.dim() > 2:
+        idx = idx.reshape(idx.shape[0], -1)
+
+    idx = idx.to(device=sc.device, dtype=torch.long)
+    use_b = min(B, int(idx.shape[0]))
+
+    keep = torch.zeros((B, M), dtype=torch.float32, device=sc.device)
+    if use_b > 0 and M > 0:
+        idx_clamped = idx[:use_b].clamp(0, max(0, M - 1))
+        keep[:use_b].scatter_(1, idx_clamped, 1.0)
+
+    if torch.is_tensor(formulae_mask):
+        fm = formulae_mask.float()
+        if fm.dim() > 2:
+            fm = fm.reshape(fm.shape[0], -1)
+        fm = fm[:use_b, :M]
+    else:
+        fm = torch.ones((use_b, M), dtype=torch.float32, device=sc.device)
+
+    if torch.is_tensor(candidate_mask):
+        cm = candidate_mask.float()
+        if cm.dim() > 2:
+            cm = cm.reshape(cm.shape[0], -1)
+        cm = cm[:use_b, :M]
+
+        fm_full = fm
+        fm_active = fm * (cm > 0.5).float()
+
+        row_has_active = fm_active.sum(dim=-1, keepdim=True) > 0
+        fm = torch.where(row_has_active, fm_active, fm_full)
+
+    keep[:use_b] = keep[:use_b] * fm
+    return keep
+
+
+def _build_group_unique_topk_mask_from_scores(
+    scores,
+    formulae_mask=None,
+    group_id=None,
+    topk=256,
+    candidate_mask=None,
+):
+    """
+    Build topK mask with at most one candidate per formula group.
+    """
+    if not torch.is_tensor(scores):
+        return None
+
+    s = scores.detach()
+    if s.dim() == 1:
+        s = s.unsqueeze(0)
+    elif s.dim() > 2:
+        s = s.reshape(s.shape[0], -1)
+
+    B, M = int(s.shape[0]), int(s.shape[1])
+    device = s.device
+
+    if torch.is_tensor(formulae_mask):
+        fm = formulae_mask.to(device=device)
+        if fm.dim() == 1:
+            fm = fm.unsqueeze(0)
+        elif fm.dim() > 2:
+            fm = fm.reshape(fm.shape[0], -1)
+        valid = torch.zeros((B, M), dtype=torch.bool, device=device)
+        use_b = min(B, int(fm.shape[0]))
+        use_m = min(M, int(fm.shape[1]))
+        valid[:use_b, :use_m] = fm[:use_b, :use_m] > 0.5
+    else:
+        valid = torch.ones((B, M), dtype=torch.bool, device=device)
+
+    if torch.is_tensor(candidate_mask):
+        cm = candidate_mask.to(device=device)
+        if cm.dim() == 1:
+            cm = cm.unsqueeze(0)
+        elif cm.dim() > 2:
+            cm = cm.reshape(cm.shape[0], -1)
+        use_b = min(B, int(cm.shape[0]))
+        use_m = min(M, int(cm.shape[1]))
+        cm_full = torch.zeros((B, M), dtype=torch.bool, device=device)
+        cm_full[:use_b, :use_m] = cm[:use_b, :use_m] > 0.5
+        valid = valid & cm_full
+
+    if torch.is_tensor(group_id):
+        gid = group_id.to(device=device, dtype=torch.long)
+        if gid.dim() == 1:
+            gid = gid.unsqueeze(0)
+        elif gid.dim() > 2:
+            gid = gid.reshape(gid.shape[0], -1)
+        use_b = min(B, int(gid.shape[0]))
+        use_m = min(M, int(gid.shape[1]))
+        gid_full = torch.arange(M, device=device, dtype=torch.long).view(1, -1).expand(B, -1).clone()
+        gid_full[:use_b, :use_m] = gid[:use_b, :use_m].clamp_min(0)
+        gid = gid_full
+    else:
+        gid = torch.arange(M, device=device, dtype=torch.long).view(1, -1).expand(B, -1)
+
+    out = torch.zeros((B, M), dtype=torch.float32, device=device)
+    kk = max(1, min(int(topk), M))
+
+    for b in range(B):
+        valid_idx = torch.nonzero(valid[b], as_tuple=False).reshape(-1)
+        if valid_idx.numel() <= 0:
+            continue
+
+        valid_scores = s[b, valid_idx]
+        order = torch.argsort(valid_scores, descending=True)
+
+        seen = set()
+        chosen = []
+
+        for oi in order.detach().cpu().tolist():
+            idx = int(valid_idx[oi].detach().cpu().item())
+            g = int(gid[b, idx].detach().cpu().item())
+
+            if g in seen:
+                continue
+
+            seen.add(g)
+            chosen.append(idx)
+
+            if len(chosen) >= kk:
+                break
+
+        if len(chosen) > 0:
+            chosen_t = torch.as_tensor(chosen, dtype=torch.long, device=device)
+            out[b, chosen_t] = 1.0
+
+    return out
+
+
+def _mask_recall(pred_mask, true_mask):
+    if (not torch.is_tensor(pred_mask)) or (not torch.is_tensor(true_mask)):
+        return float("nan")
+
+    pm = pred_mask.float()
+    tm = true_mask.float()
+
+    if pm.dim() == 1:
+        pm = pm.unsqueeze(0)
+    elif pm.dim() > 2:
+        pm = pm.reshape(pm.shape[0], -1)
+
+    if tm.dim() == 1:
+        tm = tm.unsqueeze(0)
+    elif tm.dim() > 2:
+        tm = tm.reshape(tm.shape[0], -1)
+
+    use_b = min(int(pm.shape[0]), int(tm.shape[0]))
+    use_m = min(int(pm.shape[1]), int(tm.shape[1]))
+    if use_b <= 0 or use_m <= 0:
+        return float("nan")
+
+    pm = pm[:use_b, :use_m] > 0.5
+    tm = tm[:use_b, :use_m] > 0.5
+
+    denom = tm.sum(dim=-1).float().clamp_min(1.0)
+    hit = (pm & tm).sum(dim=-1).float()
+    recall = hit / denom
+    return float(recall.mean().detach().cpu().item())
+
+
+def _mask_precision(pred_mask, true_mask):
+    if (not torch.is_tensor(pred_mask)) or (not torch.is_tensor(true_mask)):
+        return float("nan")
+
+    pm = pred_mask.float()
+    tm = true_mask.float()
+
+    if pm.dim() == 1:
+        pm = pm.unsqueeze(0)
+    elif pm.dim() > 2:
+        pm = pm.reshape(pm.shape[0], -1)
+
+    if tm.dim() == 1:
+        tm = tm.unsqueeze(0)
+    elif tm.dim() > 2:
+        tm = tm.reshape(tm.shape[0], -1)
+
+    use_b = min(int(pm.shape[0]), int(tm.shape[0]))
+    use_m = min(int(pm.shape[1]), int(tm.shape[1]))
+    if use_b <= 0 or use_m <= 0:
+        return float("nan")
+
+    pm = pm[:use_b, :use_m] > 0.5
+    tm = tm[:use_b, :use_m] > 0.5
+
+    denom = pm.sum(dim=-1).float().clamp_min(1.0)
+    hit = (pm & tm).sum(dim=-1).float()
+    precision = hit / denom
+    return float(precision.mean().detach().cpu().item())
+
+
+def _mask_ratio_in_topk(source_mask, topk_mask):
+    """Ratio of source_mask within selected topK candidates."""
+    if (not torch.is_tensor(source_mask)) or (not torch.is_tensor(topk_mask)):
+        return float("nan")
+
+    sm = source_mask.float()
+    tm = topk_mask.float()
+
+    if sm.dim() == 1:
+        sm = sm.unsqueeze(0)
+    elif sm.dim() > 2:
+        sm = sm.reshape(sm.shape[0], -1)
+
+    if tm.dim() == 1:
+        tm = tm.unsqueeze(0)
+    elif tm.dim() > 2:
+        tm = tm.reshape(tm.shape[0], -1)
+
+    use_b = min(int(sm.shape[0]), int(tm.shape[0]))
+    use_m = min(int(sm.shape[1]), int(tm.shape[1]))
+    if use_b <= 0 or use_m <= 0:
+        return float("nan")
+
+    sm = sm[:use_b, :use_m]
+    tm = tm[:use_b, :use_m]
+
+    denom = tm.sum(dim=-1).clamp_min(1.0)
+    ratio = ((sm > 0.5).float() * (tm > 0.5).float()).sum(dim=-1) / denom
+
+    return float(ratio.mean().detach().cpu().item())
+
+
+build_group_unique_topk_mask_from_scores = _build_group_unique_topk_mask_from_scores
+build_mask_from_topk_indices = _build_mask_from_topk_indices
+build_topk_mask_from_scores = _build_topk_mask_from_scores
+build_true_official_dense_for_batch = _build_true_official_dense_for_batch
+mask_precision = _mask_precision
+mask_ratio_in_topk = _mask_ratio_in_topk
+mask_recall = _mask_recall
+
+
+def select_model_topk_indices(
+    selector_logits,
+    batch,
+    k,
+    use_coverage=False,
+    use_group_unique=False,
+):
+    formulae_mask = batch.get("formulae_mask", None)
+    group_id = batch.get("formulae_instance_group_id", None)
+
+    if use_coverage:
+        return coverage_aware_topk(
+            selector_logits,
+            batch.get("formulae_peaks_official_idx", None),
+            batch.get("formulae_peaks_official_intensity", None),
+            formulae_mask=formulae_mask,
+            group_id=group_id,
+            k=k,
+            duplicate_penalty=float(os.environ.get("COVERAGE_TOPK_DUP_PENALTY", "0.35")),
+            novelty_bonus=float(os.environ.get("COVERAGE_TOPK_NOVELTY_BONUS", "0.10")),
         )
 
-    true_norm = torch.sqrt((true_dense ** 2).sum(dim=-1).clamp_min(1e-12))
-    true_support = true_dense > 0
+    if use_group_unique:
+        return group_unique_topk(
+            selector_logits,
+            group_id,
+            k=k,
+            mask=formulae_mask,
+        )
 
-    valid_peak = (
-        (off_idx >= 0)
-        & (off_idx < int(official_bin_n))
-        & torch.isfinite(off_int)
-        & (off_int > 0)
+    return plain_topk(
+        selector_logits,
+        k=k,
+        mask=formulae_mask,
     )
-    safe_idx = off_idx.clamp(0, max(0, int(official_bin_n) - 1))
 
-    true_at_peak = torch.gather(
-        true_dense,
-        1,
-        safe_idx.reshape(batch_n, -1),
-    ).reshape(batch_n, formula_n, peak_n)
 
-    candidate_dot = (true_at_peak * off_int * valid_peak.float()).sum(dim=-1)
-    cand_norm = torch.sqrt(((off_int * valid_peak.float()) ** 2).sum(dim=-1).clamp_min(1e-12))
-    candidate_overlap = candidate_dot / (cand_norm * true_norm.unsqueeze(-1) + 1e-12)
+def compute_selected_support_metrics(topk_idx, batch, eps=1e-8):
+    cand_idx = batch.get("formulae_peaks_official_idx", None)
+    cand_int = batch.get("formulae_peaks_official_intensity", None)
+    if cand_idx is None or cand_int is None:
+        cand_idx = batch.get("formulae_peaks_mass_idx", None)
+        cand_int = batch.get("formulae_peaks_intensity", None)
 
-    support_at_peak = torch.gather(
-        true_support.float(),
-        1,
-        safe_idx.reshape(batch_n, -1),
-    ).reshape(batch_n, formula_n, peak_n)
-    overlap_support_score = (support_at_peak * valid_peak.float()).sum(dim=-1) / valid_peak.float().sum(
-        dim=-1
-    ).clamp_min(1.0)
+    true_idx_obj = batch.get("true_all_official_idx", None)
+    if true_idx_obj is None:
+        true_idx_obj = batch.get("true_official_idx", None)
 
-    candidate_int_precision_score = (
-        support_at_peak * off_int * valid_peak.float()
-    ).sum(dim=-1) / (
-        off_int * valid_peak.float()
-    ).sum(dim=-1).clamp_min(1e-8)
-    top20_idx, top20_val, top20_valid, used_cached_top20 = _build_cached_true_top20_tensors(
-        batch=batch,
-        batch_n=batch_n,
-        official_bin_n=official_bin_n,
-        device=device,
-        default_k=20,
-    )
-    if not used_cached_top20:
-        if not getattr(compute_formula_target_probs_from_batch, "_warned_top20_fallback", False):
-            print(
-                "[target] missing cached true_top20_official_idx/intensity, fallback to dense topk(true_official).",
-                flush=True,
+    if not (torch.is_tensor(topk_idx) and torch.is_tensor(cand_idx) and torch.is_tensor(cand_int)):
+        return {}
+
+    true_mass_list = []
+    false_mass_list = []
+    batch_n = int(min(topk_idx.shape[0], cand_idx.shape[0], cand_int.shape[0]))
+
+    for b in range(batch_n):
+        if torch.is_tensor(true_idx_obj):
+            true_idx = true_idx_obj[b].detach().to(cand_idx.device).long().reshape(-1)
+        else:
+            try:
+                true_idx = torch.as_tensor(true_idx_obj[b], dtype=torch.long, device=cand_idx.device).reshape(-1)
+            except Exception:
+                continue
+
+        true_idx = true_idx[true_idx >= 0]
+        if true_idx.numel() == 0:
+            continue
+
+        sel = topk_idx[b].long().clamp(0, max(0, int(cand_idx.shape[1]) - 1))
+        idx_b = cand_idx[b, sel].long()
+        int_b = cand_int[b, sel].float()
+
+        valid = (idx_b >= 0) & torch.isfinite(int_b) & (int_b > 0)
+        total = torch.where(valid, int_b, torch.zeros_like(int_b)).sum()
+        if float(total.detach().item()) <= eps:
+            continue
+
+        hit = valid & torch.isin(idx_b, true_idx)
+        true_mass = torch.where(hit, int_b, torch.zeros_like(int_b)).sum()
+        ratio_true = true_mass / total.clamp_min(eps)
+
+        true_mass_list.append(ratio_true)
+        false_mass_list.append(1.0 - ratio_true)
+
+    if len(true_mass_list) == 0:
+        return {}
+
+    return {
+        "selected_true_hit_mass": float(torch.stack(true_mass_list).mean().detach().cpu().item()),
+        "selected_false_mass": float(torch.stack(false_mass_list).mean().detach().cpu().item()),
+    }
+
+
+def compute_selector_eval_pack(
+    selector_logits,
+    batch,
+    formulae_mask=None,
+    teacher_mask=None,
+    active_mask=None,
+    topk_list=(32, 64, 128, 256),
+    use_group_unique=False,
+    use_coverage=False,
+):
+    """
+    High-level selector eval wrapper.
+
+    This keeps train_ms_subsetnet.py from depending on private mask helpers.
+    """
+    out = {}
+
+    if selector_logits is None or not torch.is_tensor(selector_logits):
+        return out
+
+    if formulae_mask is None:
+        formulae_mask = batch.get("formulae_mask", None)
+
+    group_id = batch.get("formulae_instance_group_id", None)
+
+    for k in topk_list:
+        topk_idx = None
+        if use_coverage:
+            topk_idx = select_model_topk_indices(
+                selector_logits=selector_logits,
+                batch=batch,
+                k=int(k),
+                use_coverage=True,
+                use_group_unique=False,
             )
-            compute_formula_target_probs_from_batch._warned_top20_fallback = True
-        k20_dense = min(20, int(true_dense.shape[-1]))
-        if k20_dense > 0:
-            dense_top_val, dense_top_idx = torch.topk(true_dense, k=k20_dense, dim=-1)
-            top20_idx[:, :k20_dense] = dense_top_idx
-            top20_val[:, :k20_dense] = dense_top_val
-            top20_valid[:, :k20_dense] = dense_top_val > 0
+            pred_mask = _build_mask_from_topk_indices(
+                topk_idx,
+                selector_logits,
+                formulae_mask=formulae_mask,
+                candidate_mask=active_mask,
+            )
+        elif use_group_unique:
+            pred_mask = _build_group_unique_topk_mask_from_scores(
+                selector_logits,
+                formulae_mask=formulae_mask,
+                group_id=group_id,
+                topk=int(k),
+                candidate_mask=active_mask,
+            )
+        else:
+            pred_mask = _build_topk_mask_from_scores(
+                selector_logits,
+                formulae_mask=formulae_mask,
+                topk=int(k),
+                candidate_mask=active_mask,
+            )
 
-    try:
-        weak_thr = float(os.environ.get("QUALITY_HYBRID_WEAK_INTENSITY_MAX", "0.05"))
-    except Exception:
-        weak_thr = 0.05
-    if (not np.isfinite(weak_thr)) or weak_thr <= 0:
-        weak_thr = 0.05
+        if pred_mask is None:
+            continue
 
-    k20 = int(top20_idx.shape[1])
-    hit_top20_score = torch.zeros((batch_n, formula_n), dtype=torch.float32, device=device)
-    weak_hit_top20_score = torch.zeros((batch_n, formula_n), dtype=torch.float32, device=device)
-    hit_top20_intensity_score = torch.zeros((batch_n, formula_n), dtype=torch.float32, device=device)
-    weak_top20_valid = top20_valid & (top20_val <= float(weak_thr))
+        if torch.is_tensor(teacher_mask):
+            out[f"selector_recall@{k}"] = _mask_recall(pred_mask, teacher_mask)
+            out[f"selector_precision@{k}"] = _mask_precision(pred_mask, teacher_mask)
 
-    if k20 > 0:
-        for kk in range(k20):
-            tk = top20_idx[:, kk].view(batch_n, 1, 1)
-            tk_valid = top20_valid[:, kk].view(batch_n, 1)
-            hit_k = ((safe_idx == tk) & valid_peak).any(dim=-1).float()
-            hit_top20_score += hit_k * tk_valid.float()
-            hit_top20_intensity_score += hit_k * tk_valid.float() * top20_val[:, kk].view(batch_n, 1)
-            tk_weak = weak_top20_valid[:, kk].view(batch_n, 1)
-            weak_hit_top20_score += hit_k * tk_weak.float()
-        hit_top20_score = hit_top20_score / float(max(1, k20))
-        top20_int_den = (top20_val * top20_valid.float()).sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        hit_top20_intensity_score = hit_top20_intensity_score / top20_int_den
-        weak_den = weak_top20_valid.float().sum(dim=-1, keepdim=True).clamp_min(1.0)
-        weak_hit_top20_score = weak_hit_top20_score / weak_den
-        no_weak = weak_top20_valid.float().sum(dim=-1, keepdim=True) <= 0
-        weak_hit_top20_score = torch.where(no_weak, hit_top20_score, weak_hit_top20_score)
-
-    q1 = candidate_overlap * mask
-    q2 = hit_top20_score * mask
-    q3 = overlap_support_score * mask
-    q4 = weak_hit_top20_score * mask
-    q5 = hit_top20_intensity_score * mask
-    q6 = candidate_int_precision_score * mask
-
-    if os.environ.get("QUALITY_HYBRID_NORMALIZE", "1") == "1":
-
-        def _row_minmax(x):
-            x_safe = torch.where(mask > 0, x, torch.full_like(x, float("inf")))
-            row_min = torch.amin(x_safe, dim=-1, keepdim=True)
-            row_min = torch.where(torch.isfinite(row_min), row_min, torch.zeros_like(row_min))
-
-            x_safe_max = torch.where(mask > 0, x, torch.full_like(x, float("-inf")))
-            row_max = torch.amax(x_safe_max, dim=-1, keepdim=True)
-            row_max = torch.where(torch.isfinite(row_max), row_max, torch.zeros_like(row_max))
-
-            denom = (row_max - row_min).clamp_min(1e-8)
-            out = (x - row_min) / denom
-            return torch.where(mask > 0, out, torch.zeros_like(out))
-
-        q1 = _row_minmax(q1)
-        q2 = _row_minmax(q2)
-        q3 = _row_minmax(q3)
-        q4 = _row_minmax(q4)
-        q5 = _row_minmax(q5)
-        q6 = _row_minmax(q6)
-
-    w1 = float(os.environ.get("QUALITY_HYBRID_W_COS", "0.7"))
-    w2 = float(os.environ.get("QUALITY_HYBRID_W_HIT20", "0.2"))
-    w3 = float(os.environ.get("QUALITY_HYBRID_W_OVERLAP", "0.1"))
-    w4 = float(os.environ.get("QUALITY_HYBRID_W_WEAK20", "0.0"))
-    w5 = float(os.environ.get("QUALITY_HYBRID_W_HIT20_INT", "0.0"))
-    w6 = float(os.environ.get("QUALITY_HYBRID_W_PREC_INT", "0.0"))
-
-    candidate_overlap = (
-        w1 * q1 + w2 * q2 + w3 * q3 + w4 * q4 + w5 * q5 + w6 * q6
-    ) * mask
-
-    try:
-        source_instance_teacher_bonus = float(os.environ.get("SOURCE_INSTANCE_TEACHER_BONUS", "0.0"))
-    except Exception:
-        source_instance_teacher_bonus = 0.0
-
-    if source_instance_teacher_bonus > 0.0:
-        inst_src = batch.get("formulae_instance_is_source", None)
-        if torch.is_tensor(inst_src):
-            inst_src = inst_src.to(device=candidate_overlap.device, dtype=candidate_overlap.dtype)
-            if inst_src.dim() == 1:
-                inst_src = inst_src.unsqueeze(0)
-            if inst_src.dim() > 2:
-                inst_src = inst_src.reshape(inst_src.shape[0], -1)
-
-            use_b = min(int(candidate_overlap.shape[0]), int(inst_src.shape[0]))
-            use_m = min(int(candidate_overlap.shape[1]), int(inst_src.shape[1]))
-
-            bonus = torch.zeros_like(candidate_overlap)
-            bonus[:use_b, :use_m] = inst_src[:use_b, :use_m] * float(source_instance_teacher_bonus)
-            candidate_overlap = candidate_overlap + bonus * mask.float()
-
-    independent_teacher_scores = candidate_overlap.float().clamp_min(0.0) * mask.float()
-    independent_sum = independent_teacher_scores.sum(dim=-1, keepdim=True)
-
-    independent_fallback = mask.float() / mask.float().sum(dim=-1, keepdim=True).clamp_min(1e-8)
-
-    independent_teacher_probs = torch.where(
-        independent_sum > 1e-12,
-        independent_teacher_scores / independent_sum.clamp_min(1e-8),
-        independent_fallback,
-    )
-
-    if str(os.environ.get("QUALITY_USE_SETCOVER_TEACHER", "0")).strip() == "1":
-        with torch.no_grad():
-            try:
-                sc_topk = int(os.environ.get("QUALITY_SETCOVER_TOPK", "16"))
-            except Exception:
-                sc_topk = 16
-
-            try:
-                pool_k = int(os.environ.get("QUALITY_SETCOVER_POOL_TOPK", "1024"))
-            except Exception:
-                pool_k = 1024
-
-            try:
-                lambda_false = float(os.environ.get("QUALITY_SETCOVER_LAMBDA_FALSE", "0.5"))
-            except Exception:
-                lambda_false = 0.5
-
-            try:
-                lambda_redun = float(os.environ.get("QUALITY_SETCOVER_LAMBDA_REDUN", "0.2"))
-            except Exception:
-                lambda_redun = 0.2
-
-            try:
-                min_gain = float(os.environ.get("QUALITY_SETCOVER_MIN_GAIN", "1e-8"))
-            except Exception:
-                min_gain = 1e-8
-
-            pool_k = max(1, min(int(pool_k), int(formula_n)))
-            sc_topk = max(1, min(int(sc_topk), int(pool_k)))
-
-            neg_val = _neg_mask_fill_value(candidate_overlap)
-            rank_score = candidate_overlap.masked_fill(mask <= 0, neg_val)
-
-            pool_idx_all = torch.topk(rank_score, k=pool_k, dim=-1).indices
-            sel_probs = torch.zeros_like(candidate_overlap)
-
-            for bi in range(int(batch_n)):
-                pool_idx = pool_idx_all[bi]
-                pool_valid = mask[bi, pool_idx] > 0
-
-                idx_pool = off_idx[bi, pool_idx].long()
-                int_pool = off_int[bi, pool_idx].float()
-                valid_pool = valid_peak[bi, pool_idx].bool()
-
-                valid_pool = (
-                    valid_pool
-                    & (idx_pool >= 0)
-                    & (idx_pool < int(official_bin_n))
-                    & torch.isfinite(int_pool)
-                    & (int_pool > 0)
-                    & pool_valid.unsqueeze(-1)
-                )
-
-                idx_safe = idx_pool.clamp(0, max(0, int(official_bin_n) - 1))
-                int_pool = int_pool * valid_pool.float()
-
-                cand_tot = int_pool.sum(dim=-1)
-                true_hit = (true_at_peak[bi, pool_idx].float() * int_pool).sum(dim=-1)
-                cand_false_mass = (cand_tot - true_hit).clamp_min(0.0)
-
-                residual = true_dense[bi].float().clone()
-                selected_bins_dense = torch.zeros_like(residual)
-
-                selected_local = []
-                selected_gain_vals = []
-                selected_mask = torch.zeros((pool_k,), dtype=torch.bool, device=device)
-
-                for step in range(sc_topk):
-                    res_vals = residual[idx_safe]
-                    gain = torch.minimum(res_vals, int_pool).sum(dim=-1)
-
-                    sel_vals = selected_bins_dense[idx_safe]
-                    redun = (sel_vals * int_pool).sum(dim=-1)
-
-                    score = (
-                        gain
-                        - float(lambda_false) * cand_false_mass
-                        - float(lambda_redun) * redun
-                        + 1e-4 * rank_score[bi, pool_idx].clamp_min(0.0)
-                    )
-
-                    score = score.masked_fill(~pool_valid, neg_val)
-                    score = score.masked_fill(selected_mask, neg_val)
-                    score = score.masked_fill(cand_tot <= 0, neg_val)
-
-                    best_score, best_local_t = torch.max(score, dim=0)
-
-                    if not bool(torch.isfinite(best_score).item()):
-                        break
-
-                    best_local = int(best_local_t.detach().item())
-                    best_gain = float(gain[best_local].detach().item())
-                    if step > 0 and best_gain <= float(min_gain):
-                        break
-
-                    selected_mask[best_local] = True
-                    selected_local.append(best_local)
-                    selected_gain_vals.append(gain[best_local].clamp_min(0.0))
-
-                    sel_valid = valid_pool[best_local]
-                    if bool(sel_valid.any().item()):
-                        sel_idxs = idx_safe[best_local, sel_valid]
-                        sel_ints = int_pool[best_local, sel_valid]
-
-                        delta = torch.zeros_like(residual)
-                        delta.scatter_add_(0, sel_idxs, sel_ints)
-                        residual = torch.clamp(residual - delta, min=0.0)
-
-                        selected_bins_dense.scatter_add_(0, sel_idxs, sel_ints)
-
-                if len(selected_local) > 0:
-                    selected_orig_idx = pool_idx[
-                        torch.as_tensor(selected_local, dtype=torch.long, device=device)
-                    ]
-
-                    gains = torch.stack(selected_gain_vals).float()
-                    if float(gains.sum().detach().item()) <= 1e-12:
-                        gains = candidate_overlap[bi, selected_orig_idx].float().clamp_min(1e-8)
-
-                    weights = gains / gains.sum().clamp_min(1e-8)
-                    sel_probs[bi, selected_orig_idx] = weights
-
-            sel_sum = sel_probs.sum(dim=-1, keepdim=True)
-
-            if os.environ.get("QUALITY_SETCOVER_HYBRID", "0").strip() == "1":
-                try:
-                    independent_w = float(os.environ.get("QUALITY_SETCOVER_HYBRID_Q6_WEIGHT", "0.7"))
-                except Exception:
-                    independent_w = 0.7
-                independent_w = float(np.clip(independent_w, 0.0, 1.0))
-
-                setcover_probs = torch.where(
-                    sel_sum > 0,
-                    sel_probs / sel_sum.clamp_min(1e-8),
-                    independent_teacher_probs,
-                )
-
-                hybrid_probs = independent_w * independent_teacher_probs + (1.0 - independent_w) * setcover_probs
-                hybrid_probs = hybrid_probs * mask.float()
-                hybrid_probs = hybrid_probs / hybrid_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-
-                candidate_overlap = hybrid_probs
+        if topk_idx is None:
+            if torch.is_tensor(formulae_mask):
+                masked_logits = selector_logits.masked_fill(formulae_mask <= 0.5, -1e9)
             else:
-                candidate_overlap = torch.where(sel_sum > 0, sel_probs, candidate_overlap)
+                masked_logits = selector_logits
+            topk_idx = torch.topk(
+                masked_logits,
+                k=min(int(k), int(selector_logits.shape[1])),
+                dim=1,
+            ).indices
 
-    try:
-        target_gamma = float(os.environ.get("QUALITY_TARGET_GAMMA", "2.0"))
-    except Exception:
-        target_gamma = 2.0
-    if (not np.isfinite(target_gamma)) or target_gamma <= 0:
-        target_gamma = 1.5
+        support_metrics = compute_selected_support_metrics(topk_idx, batch)
+        for kk, vv in support_metrics.items():
+            out[f"{kk}@{k}"] = vv
 
-    eff_gamma = float(target_gamma) * float(1.0 / temp)
-
-    if abs(eff_gamma - 1.0) > 1e-8:
-        positive = candidate_overlap > 0
-        candidate_overlap = torch.where(
-            positive,
-            torch.pow(candidate_overlap.clamp_min(1e-12), eff_gamma),
-            candidate_overlap * 0.0,
-        )
-    if topk > 0 and int(candidate_overlap.shape[1]) > topk:
-        k = int(min(topk, int(candidate_overlap.shape[1])))
-        rank_score = candidate_overlap.masked_fill(mask <= 0, _neg_mask_fill_value(candidate_overlap))
-        top_idx = torch.topk(rank_score, k=k, dim=-1).indices
-        keep = torch.zeros_like(candidate_overlap)
-        keep.scatter_(1, top_idx, 1.0)
-        candidate_overlap = candidate_overlap * keep
-
-    overlap_sum = candidate_overlap.sum(dim=-1, keepdim=True)
-    valid_sum = mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
-    target_probs = torch.where(
-        overlap_sum > 0,
-        candidate_overlap / overlap_sum.clamp_min(1e-8),
-        mask / valid_sum,
-    )
-    return target_probs
+    return out

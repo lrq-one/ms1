@@ -12,7 +12,7 @@ from rassp.training.formula_targets import (
     get_formulae_official_intensity_from_batch,
 )
 
-#DIII
+
 def build_selector_teacher_dist_from_official_overlap(
     batch,
     formulae_mask,
