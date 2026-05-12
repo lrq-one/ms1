@@ -20,10 +20,30 @@ def safe_mean(values, default=0.0):
 
 
 def format_metric_line(prefix, metrics):
+    keep_keys = [
+        "train_loss",
+        "train_selector_loss",
+        "train_false_support",
+        "val_loss",
+        "val_official_cos_no_precursor",
+        "val_official_js_no_precursor",
+        "val_false_support",
+        "val_model_topk_oracle_cos@64",
+        "val_model_topk_oracle_false_support@64",
+        "val_selected_true_hit_mass@64",
+        "val_selected_false_mass@64",
+        "val_teacher_oracle_cos",
+        "val_teacher_oracle_false_support",
+    ]
+
     parts = [prefix]
     if not isinstance(metrics, dict):
         return str(prefix)
-    for key, value in metrics.items():
+
+    for key in keep_keys:
+        if key not in metrics:
+            continue
+        value = metrics[key]
         try:
             parts.append(f"{key}={float(value):.4f}")
         except Exception:

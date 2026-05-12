@@ -907,8 +907,15 @@ def train_mssubsetnet():
     # 2) listwise ranking distribution over candidates
     selector_bce_weight = max(0.0, float(os.environ.get('SELECTOR_BCE_WEIGHT', '0.2')))
     selector_kl_weight = max(0.0, float(os.environ.get('SELECTOR_KL_WEIGHT', '0.2')))
-    selector_pairwise_weight = max(0.0, float(os.environ.get('SELECTOR_PAIRWISE_WEIGHT', '0.4')))
-    selector_utility_kl_weight = max(0.0, float(os.environ.get('SELECTOR_UTILITY_KL_WEIGHT', '0.2')))
+    use_selector_local_utility = os.environ.get("USE_SELECTOR_LOCAL_UTILITY", "0") == "1"
+    selector_pairwise_weight = max(
+        0.0,
+        float(os.environ.get('SELECTOR_PAIRWISE_WEIGHT', '0.4' if use_selector_local_utility else '0.0')),
+    )
+    selector_utility_kl_weight = max(
+        0.0,
+        float(os.environ.get('SELECTOR_UTILITY_KL_WEIGHT', '0.2' if use_selector_local_utility else '0.0')),
+    )
 
     train_selector_only_stage = os.environ.get("TRAIN_SELECTOR_ONLY_STAGE", "0") == "1"
 
@@ -1650,7 +1657,7 @@ def train_mssubsetnet():
 
                     utility_t = None
                     utility_dist_t = None
-                    if isinstance(selector_extra, dict):
+                    if use_selector_local_utility and isinstance(selector_extra, dict):
                         if torch.is_tensor(selector_extra.get("utility", None)):
                             utility_t = selector_extra["utility"].to(
                                 device=selector_logits_for_loss.device,
@@ -2653,7 +2660,7 @@ def train_mssubsetnet():
 
                         utility_t = None
                         utility_dist_t = None
-                        if isinstance(selector_extra, dict):
+                        if use_selector_local_utility and isinstance(selector_extra, dict):
                             if torch.is_tensor(selector_extra.get("utility", None)):
                                 utility_t = selector_extra["utility"].to(
                                     device=selector_logits_for_loss.device,
@@ -2848,7 +2855,7 @@ def train_mssubsetnet():
                             formulae_mask,
                             ks=k_list,
                         )
-                    if step == 1:
+                    if os.environ.get("DEBUG_ACTIVE_MASK", "0") == "1" and step == 1:
                         if torch.is_tensor(topk_candidate_mask_val):
                             print(
                                 "[ACTIVE_DEBUG]",
@@ -2987,7 +2994,11 @@ def train_mssubsetnet():
                         val_teacher_oracle_pred_n_vals.append(teacher_stats.get('pred_n', float('nan')))
 
                     utility_top64_stats = {}
-                    if isinstance(selector_extra, dict) and torch.is_tensor(selector_extra.get("utility", None)):
+                    if (
+                        use_selector_local_utility
+                        and isinstance(selector_extra, dict)
+                        and torch.is_tensor(selector_extra.get("utility", None))
+                    ):
                         utility_scores = selector_extra["utility"].to(
                             device=selector_logits_for_topk.device,
                             dtype=selector_logits_for_topk.dtype,
@@ -3605,122 +3616,27 @@ def train_mssubsetnet():
             if np.isfinite(model_select_metric):
                 early_stop_wait += 1
 
-        log(
-            f'Epoch {epoch+1}/{epochs} | '
-            f'train_loss={avg_train_loss:.4f} | '
-            f'train_rerank_teacher_ratio={avg_train_rerank_teacher_ratio:.4f} | '
-            f'train_selector_loss={avg_train_selector_loss:.4f} | '
-            f'train_selector_bce={avg_train_selector_bce:.4f} | '
-            f'train_selector_kl={avg_train_selector_kl:.4f} | '
-            f'train_selector_quality_mean={avg_train_selector_quality_mean:.4f} | '
-            f'train_selector_pos_rate={avg_train_selector_pos_rate:.4f} | '
-            f'train_target_pos_false_mass={avg_train_target_pos_false_mass:.4f} | '
-            f'train_target_pos_overlap_exact={avg_train_target_pos_overlap_exact:.4f} | '
-            f'train_target_pos_exact_support_mass={avg_train_target_pos_exact_support_mass:.4f} | '
-            f'train_target_strict_keep_rate={avg_train_target_strict_keep_rate:.4f} | '
-            f'train_target_fallback_rate={avg_train_target_fallback_rate:.4f} | '
-            f'train_target_clean_pos_rate={avg_train_target_clean_pos_rate:.4f} | '
-            f'train_target_pool_pos_rate={avg_train_target_pool_pos_rate:.4f} | '
-            f'train_target_pool_pos_false_mass={avg_train_target_pool_pos_false_mass:.4f} | '
-            f'train_target_pool_pos_overlap_tol={avg_train_target_pool_pos_overlap_tol:.4f} | '
-            f'train_target_teacher_pos_rate={avg_train_target_teacher_pos_rate:.4f} | '
-            f'train_target_teacher_dist_n={avg_train_target_teacher_dist_n:.4f} | '
-            f'train_target_teacher_added_rate={avg_train_target_teacher_added_rate:.4f} | '
-            f'train_selector_dyn_pos_weight={avg_train_selector_dyn_pos_weight:.4f} | '
-            f'train_use_rerank_delta={avg_train_use_rerank_delta:.1f} | '
-            f'train_main_candidate_kl={avg_train_main_kl:.4f} | '
-            f'train_rerank_kl={avg_train_rerank_kl:.4f} | '
-            f'train_rerank_bce={avg_train_rerank_bce:.4f} | '
-            f'train_rerank_loss={avg_train_rerank_loss:.4f} | '
-            f'train_official_spectral={avg_train_official_spectral:.4f} | '
-            f'train_peak_aux={avg_train_peak_aux:.4f} | '
-            f'train_oos={avg_train_oos:.4f} | '
-            f'train_formula_entropy={avg_train_formula_entropy:.4f} | '
-            f'train_false_support={avg_train_false_support:.4f} | '
-            f'train_precursor={avg_train_precursor_loss:.4f} | '
-            f'train_fn_loss={avg_train_fn_loss:.4f} | '
-            f'val_loss={avg_val_loss:.4f} | '
-            f'val_selector_loss={avg_val_selector_loss:.4f} | '
-            f'val_selector_bce={avg_val_selector_bce:.4f} | '
-            f'val_selector_kl={avg_val_selector_kl:.4f} | '
-            f'val_selector_quality_mean={avg_val_selector_quality_mean:.4f} | '
-            f'val_selector_pos_rate={avg_val_selector_pos_rate:.4f} | '
-            f'val_target_pos_false_mass={avg_val_target_pos_false_mass:.4f} | '
-            f'val_target_pos_overlap_exact={avg_val_target_pos_overlap_exact:.4f} | '
-            f'val_target_pos_exact_support_mass={avg_val_target_pos_exact_support_mass:.4f} | '
-            f'val_target_strict_keep_rate={avg_val_target_strict_keep_rate:.4f} | '
-            f'val_target_fallback_rate={avg_val_target_fallback_rate:.4f} | '
-            f'val_target_clean_pos_rate={avg_val_target_clean_pos_rate:.4f} | '
-            f'val_target_pool_pos_rate={avg_val_target_pool_pos_rate:.4f} | '
-            f'val_target_pool_pos_false_mass={avg_val_target_pool_pos_false_mass:.4f} | '
-            f'val_target_pool_pos_overlap_tol={avg_val_target_pool_pos_overlap_tol:.4f} | '
-            f'val_target_teacher_pos_rate={avg_val_target_teacher_pos_rate:.4f} | '
-            f'val_target_teacher_dist_n={avg_val_target_teacher_dist_n:.4f} | '
-            f'val_target_teacher_added_rate={avg_val_target_teacher_added_rate:.4f} | '
-            f'val_selector_dyn_pos_weight={avg_val_selector_dyn_pos_weight:.4f} | '
-            f'val_use_rerank_delta={avg_val_use_rerank_delta:.1f} | '
-            f'val_model_topk_teacher_recall@{model_topk_eval}={avg_val_model_topk_teacher_recall:.4f} | '
-            f'val_active_teacher_recall={avg_val_active_teacher_recall:.4f} | '
-            f'val_fragaux_teacher_recall={avg_val_fragaux_teacher_recall:.4f} | '
-            f'val_fragaux_model_topk_ratio@32={avg_val_fragaux_model_topk_ratio_32:.4f} | '
-            f'val_fragaux_model_topk_ratio@64={avg_val_fragaux_model_topk_ratio_64:.4f} | '
-            f'val_fragaux_model_topk_ratio@128={avg_val_fragaux_model_topk_ratio_128:.4f} | '
-            f'val_fragaux_model_topk_ratio@256={avg_val_fragaux_model_topk_ratio_256:.4f} | '
-            f'val_selector_recall@32={avg_val_selector_recall_32:.4f} | '
-            f'val_selector_recall@64={avg_val_selector_recall_64:.4f} | '
-            f'val_selector_recall@128={avg_val_selector_recall_128:.4f} | '
-            f'val_selector_recall@256={avg_val_selector_recall_256:.4f} | '
-            f'val_selector_precision@32={avg_val_selector_precision_32:.4f} | '
-            f'val_selector_precision@64={avg_val_selector_precision_64:.4f} | '
-            f'val_selector_precision@128={avg_val_selector_precision_128:.4f} | '
-            f'val_selector_precision@256={avg_val_selector_precision_256:.4f} | '
-            f'val_selector_quality_mean@32={avg_val_selector_quality_mean_32:.4f} | '
-            f'val_selector_quality_mean@64={avg_val_selector_quality_mean_64:.4f} | '
-            f'val_selector_quality_mean@128={avg_val_selector_quality_mean_128:.4f} | '
-            f'val_selector_quality_mean@256={avg_val_selector_quality_mean_256:.4f} | '
-            f'val_main_candidate_kl={avg_val_main_kl:.4f} | '
-            f'val_rerank_kl={avg_val_rerank_kl:.4f} | '
-            f'val_rerank_bce={avg_val_rerank_bce:.4f} | '
-            f'val_rerank_loss={avg_val_rerank_loss:.4f} | '
-            f'val_official_spectral={avg_val_official_spectral:.4f} | '
-            f'val_peak_aux={avg_val_peak_aux:.4f} | '
-            f'val_oos={avg_val_oos:.4f} | '
-            f'val_formula_entropy={avg_val_formula_entropy:.4f} | '
-            f'val_pred_n={avg_val_pred_n:.1f} | '
-            f'val_true_n={avg_val_true_n:.1f} | '
-            f'val_overlap_n={avg_val_overlap_n:.1f} | '
-            f'val_false_pred_n={avg_val_false_pred_n:.1f} | '
-            f'val_overlap_ratio={avg_val_overlap_ratio:.4f} | '
-            f'val_pred_int_on_true={avg_val_pred_int_on_true:.4f} | '
-            f'val_precursor={avg_val_precursor_loss:.4f} | '
-            f'val_fn_loss={avg_val_fn_loss:.4f} | '
-            f'val_official_cos_no_precursor={avg_val_cos:.4f} | '
-            f'val_official_js_no_precursor={avg_val_js:.4f} | '
-            f'val_topk_peak_recall@20={avg_val_recall:.4f} | '
-            f'val_false_support={avg_val_false_support:.4f} | '
-            f'val_matched_intensity_coverage={avg_val_cov:.4f} | '
-            f'val_selected_true_hit_mass@32={avg_val_selected_true_hit_mass_32:.4f} | '
-            f'val_selected_true_hit_mass@64={avg_val_selected_true_hit_mass_64:.4f} | '
-            f'val_selected_true_hit_mass@128={avg_val_selected_true_hit_mass_128:.4f} | '
-            f'val_selected_true_hit_mass@256={avg_val_selected_true_hit_mass_256:.4f} | '
-            f'val_selected_false_mass@32={avg_val_selected_false_mass_32:.4f} | '
-            f'val_selected_false_mass@64={avg_val_selected_false_mass_64:.4f} | '
-            f'val_selected_false_mass@128={avg_val_selected_false_mass_128:.4f} | '
-            f'val_selected_false_mass@256={avg_val_selected_false_mass_256:.4f} | '
-            f'val_teacher_oracle_cos={avg_val_teacher_oracle_cos:.4f} | '
-            f'val_teacher_oracle_false_support={avg_val_teacher_oracle_false_support:.4f} | '
-            f'val_teacher_oracle_pred_int_on_true={avg_val_teacher_oracle_pred_int_on_true:.4f} | '
-            f'val_teacher_oracle_pred_n={avg_val_teacher_oracle_pred_n:.2f} | '
-            f'val_model_topk_oracle_cos@256={avg_val_model_topk_oracle_cos_256:.4f} | '
-            f'val_model_topk_oracle_false_support@256={avg_val_model_topk_oracle_false_support_256:.4f} | '
-            f'val_utility_top64_oracle_cos={avg_val_utility_top64_oracle_cos:.4f} | '
-            f'val_utility_top64_false_support={avg_val_utility_top64_false_support:.4f} | '
-            f'val_utility_top64_true_hit_mass={avg_val_utility_top64_true_hit_mass:.4f} | '
-            f'val_utility_top64_false_mass={avg_val_utility_top64_false_mass:.4f} | '
-            f'val_model_topk_oracle_cos@{eval_k_used}={avg_val_model_topk_oracle_cos_eval:.4f} | '
-            f'val_model_topk_oracle_false_support@{eval_k_used}={avg_val_model_topk_oracle_false_support_eval:.4f}'
-            + (' | BEST' if is_best else '')
-        )
+        epoch_metrics = {
+            'train_loss': avg_train_loss,
+            'train_selector_loss': avg_train_selector_loss,
+            'train_false_support': avg_train_false_support,
+            'val_loss': avg_val_loss,
+            'val_official_cos_no_precursor': avg_val_cos,
+            'val_official_js_no_precursor': avg_val_js,
+            'val_false_support': avg_val_false_support,
+            'val_selected_true_hit_mass@64': avg_val_selected_true_hit_mass_64,
+            'val_selected_false_mass@64': avg_val_selected_false_mass_64,
+            'val_teacher_oracle_cos': avg_val_teacher_oracle_cos,
+            'val_teacher_oracle_false_support': avg_val_teacher_oracle_false_support,
+        }
+        if int(eval_k_used) == 64:
+            epoch_metrics['val_model_topk_oracle_cos@64'] = avg_val_model_topk_oracle_cos_eval
+            epoch_metrics['val_model_topk_oracle_false_support@64'] = avg_val_model_topk_oracle_false_support_eval
+
+        epoch_line = format_metric_line(f'Epoch {epoch+1}/{epochs}', epoch_metrics)
+        if is_best:
+            epoch_line += ' | BEST'
+        log(epoch_line)
 
         history['train_loss'].append(avg_train_loss)
         history['train_main_candidate_kl'].append(avg_train_main_kl)
