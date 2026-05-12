@@ -1027,6 +1027,9 @@ def train_mssubsetnet():
         int(os.environ.get('OOS_LOSS_START_EPOCH', str(peak_aux_start_epoch + 1))),
     )
 
+    if bool(use_selector_prob_spectrum):
+        spectral_loss_start_epoch = 0
+
     official_metric_cfg = {
         'bin_width': float(max(1e-6, float(os.environ.get('OFFICIAL_BIN_WIDTH', '0.01')))),
         'max_mz': float(max(1.0, float(os.environ.get('OFFICIAL_MAX_MZ', '1005.0')))),
@@ -2032,6 +2035,8 @@ def train_mssubsetnet():
                 # ============================================================
                 if bool(use_selector_prob_spectrum):
                     rerank_teacher_ratio = 0.0
+
+                    res = model(**batch)
 
                     pred_spect_coarse = res['spect'] if isinstance(res, dict) else res
                     pred_spect_official = res.get('spect_out_official', None) if isinstance(res, dict) else None
@@ -3272,6 +3277,7 @@ def train_mssubsetnet():
                     # PASS 2: model-top64 reranker
                     # ============================================================
                     if bool(use_selector_prob_spectrum):
+                        res = model(**batch)
                         pred_spect_coarse = res['spect'] if isinstance(res, dict) else res
                         pred_spect_official = res.get('spect_out_official', None) if isinstance(res, dict) else None
 
