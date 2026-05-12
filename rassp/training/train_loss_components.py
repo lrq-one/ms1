@@ -7,6 +7,65 @@ import torch.nn.functional as F
 from rassp.model.model_utils import neg_mask_fill_value as _neg_mask_fill_value
 
 
+def selector_pairwise_utility_loss(
+    selector_logits,
+    utility,
+    valid_mask=None,
+    high_q=0.80,
+    low_q=0.40,
+    margin=0.2,
+    max_pairs=2048,
+):
+    if (not torch.is_tensor(selector_logits)) or (not torch.is_tensor(utility)):
+        return None
+
+    if selector_logits.dim() != 2 or utility.dim() != 2:
+        return None
+
+    B, _ = selector_logits.shape
+    if valid_mask is None:
+        valid_mask = torch.ones_like(selector_logits, dtype=torch.bool)
+    else:
+        valid_mask = valid_mask > 0.5
+
+    losses = []
+    for b in range(B):
+        mask_b = valid_mask[b]
+        if int(mask_b.sum().item()) < 4:
+            continue
+
+        u = utility[b]
+        logit = selector_logits[b]
+        valid_u = u[mask_b]
+        if valid_u.numel() < 4:
+            continue
+
+        try:
+            high_thr = torch.quantile(valid_u, float(high_q))
+            low_thr = torch.quantile(valid_u, float(low_q))
+        except Exception:
+            continue
+
+        high_idx = torch.where(mask_b & (u >= high_thr))[0]
+        low_idx = torch.where(mask_b & (u <= low_thr))[0]
+        if high_idx.numel() == 0 or low_idx.numel() == 0:
+            continue
+
+        num_pairs = min(int(max_pairs // max(B, 1)), int(high_idx.numel() * low_idx.numel()))
+        num_pairs = max(1, num_pairs)
+        hi = high_idx[torch.randint(0, high_idx.numel(), (num_pairs,), device=selector_logits.device)]
+        lo = low_idx[torch.randint(0, low_idx.numel(), (num_pairs,), device=selector_logits.device)]
+
+        diff = logit[hi] - logit[lo]
+        loss_b = F.softplus(float(margin) - diff).mean()
+        losses.append(loss_b)
+
+    if len(losses) == 0:
+        return selector_logits.new_tensor(0.0)
+
+    return torch.stack(losses).mean()
+
+
 def _masked_candidate_kl(scores_tensor, target_probs, formulae_mask=None):
     if (not torch.is_tensor(scores_tensor)) or (not torch.is_tensor(target_probs)):
         return None

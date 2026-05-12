@@ -13,6 +13,50 @@ from rassp.training.formula_targets import (
 )
 
 
+def normalize_per_sample(x, mask=None, eps=1e-8):
+    if mask is None:
+        mask = torch.ones_like(x, dtype=torch.bool)
+    else:
+        mask = mask > 0.5
+
+    x_masked = x.masked_fill(~mask, 0.0)
+    x_min = x.masked_fill(~mask, float("inf")).amin(dim=1, keepdim=True)
+    x_max = x.masked_fill(~mask, float("-inf")).amax(dim=1, keepdim=True)
+
+    x_min = torch.where(torch.isfinite(x_min), x_min, torch.zeros_like(x_min))
+    x_max = torch.where(torch.isfinite(x_max), x_max, torch.ones_like(x_max))
+
+    out = (x_masked - x_min) / (x_max - x_min + eps)
+    out = out.masked_fill(~mask, 0.0)
+    return out
+
+
+def build_selector_utility_target(
+    true_hit_mass,
+    false_mass,
+    valid_mask=None,
+    false_lambda=1.2,
+    temp=0.7,
+):
+    if valid_mask is None:
+        valid_mask = torch.ones_like(true_hit_mass, dtype=torch.bool)
+    else:
+        valid_mask = valid_mask > 0.5
+
+    raw_utility = true_hit_mass.float() - float(false_lambda) * false_mass.float()
+    raw_utility = raw_utility.masked_fill(~valid_mask, -1e9)
+
+    utility = normalize_per_sample(raw_utility, valid_mask)
+
+    logits = raw_utility / max(float(temp), 1e-6)
+    logits = logits.masked_fill(~valid_mask, -1e9)
+    utility_dist = torch.softmax(logits, dim=1)
+    utility_dist = utility_dist * valid_mask.float()
+    utility_dist = utility_dist / utility_dist.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+    return utility.detach(), utility_dist.detach()
+
+
 def build_selector_teacher_dist_from_official_overlap(
     batch,
     formulae_mask,
@@ -1120,6 +1164,13 @@ def build_candidate_local_quality_target(
     has_signal = (pos_label.sum(dim=1, keepdim=True) > 0).float()
     valid_mask = formulae_mask.float() * has_signal
     teacher_added_label = teacher_pos_label * (1.0 - clean_pos_label)
+    utility, utility_dist = build_selector_utility_target(
+        true_hit_mass=overlap_intensity_exact,
+        false_mass=false_support_mass_exact,
+        valid_mask=formulae_mask > 0.5,
+        false_lambda=float(os.environ.get("SELECTOR_UTILITY_FALSE_LAMBDA", "1.2")),
+        temp=float(os.environ.get("SELECTOR_UTILITY_TEMP", "0.7")),
+    )
     return quality, pos_label, valid_mask, {
         'overlap_intensity_exact': overlap_intensity_exact.detach(),
         'overlap_intensity_tol': overlap_intensity_tol.detach(),
@@ -1138,6 +1189,10 @@ def build_candidate_local_quality_target(
         'teacher_pos_label': teacher_pos_label.detach(),
         'teacher_dist': teacher_dist.detach(),
         'teacher_added_label': teacher_added_label.detach(),
+        'true_hit_mass': overlap_intensity_exact.detach(),
+        'false_mass': false_support_mass_exact.detach(),
+        'utility': utility.detach(),
+        'utility_dist': utility_dist.detach(),
     }
 
 

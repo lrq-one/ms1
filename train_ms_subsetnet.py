@@ -71,6 +71,7 @@ from rassp.training.train_loss_components import (
     _renormalize_target_probs,
     _sqrt_cosine_loss_dense,
     compute_official_dense_spectral_loss,
+    selector_pairwise_utility_loss,
 )
 from rassp.training.selector_metrics import (
     build_group_unique_topk_mask_from_scores,
@@ -905,7 +906,9 @@ def train_mssubsetnet():
     # 1) binary inclusion into teacher topK
     # 2) listwise ranking distribution over candidates
     selector_bce_weight = max(0.0, float(os.environ.get('SELECTOR_BCE_WEIGHT', '0.2')))
-    selector_kl_weight = max(0.0, float(os.environ.get('SELECTOR_KL_WEIGHT', '1.0')))
+    selector_kl_weight = max(0.0, float(os.environ.get('SELECTOR_KL_WEIGHT', '0.2')))
+    selector_pairwise_weight = max(0.0, float(os.environ.get('SELECTOR_PAIRWISE_WEIGHT', '0.4')))
+    selector_utility_kl_weight = max(0.0, float(os.environ.get('SELECTOR_UTILITY_KL_WEIGHT', '0.2')))
 
     train_selector_only_stage = os.environ.get("TRAIN_SELECTOR_ONLY_STAGE", "0") == "1"
 
@@ -1024,7 +1027,9 @@ def train_mssubsetnet():
     log(f'馃З selector_pos_weight={selector_pos_weight:.3f}')
     log(
         f'馃З selector_components: bce_weight={selector_bce_weight:.3f} '
-        f'kl_weight={selector_kl_weight:.3f}'
+        f'kl_weight={selector_kl_weight:.3f} '
+        f'pairwise_weight={selector_pairwise_weight:.3f} '
+        f'utility_kl_weight={selector_utility_kl_weight:.3f}'
     )
     log(f'馃З train_selector_only_stage={int(train_selector_only_stage)}')
     log(f'馃З selector_only_warmup_epochs={selector_only_warmup_epochs}')
@@ -1299,6 +1304,10 @@ def train_mssubsetnet():
         'val_teacher_oracle_pred_n': [],
         'val_model_topk_oracle_cos@256': [],
         'val_model_topk_oracle_false_support@256': [],
+        'val_utility_top64_oracle_cos': [],
+        'val_utility_top64_false_support': [],
+        'val_utility_top64_true_hit_mass': [],
+        'val_utility_top64_false_mass': [],
     }
 
     for epoch in range(epochs):
@@ -1502,6 +1511,8 @@ def train_mssubsetnet():
 
                 selector_bce_loss = res_full['spect'].sum() * 0.0
                 selector_kl_loss = res_full['spect'].sum() * 0.0
+                selector_pairwise_loss = res_full['spect'].sum() * 0.0
+                selector_utility_kl_loss = res_full['spect'].sum() * 0.0
                 selector_pos_rate = res_full['spect'].sum() * 0.0
                 selector_quality_mean = res_full['spect'].sum() * 0.0
                 selector_dyn_pos_weight = res_full['spect'].sum() * 0.0
@@ -1637,6 +1648,53 @@ def train_mssubsetnet():
                     selector_quality_mean = selector_quality.mean()
                     selector_dyn_pos_weight = dyn_pos_weight.detach()
 
+                    utility_t = None
+                    utility_dist_t = None
+                    if isinstance(selector_extra, dict):
+                        if torch.is_tensor(selector_extra.get("utility", None)):
+                            utility_t = selector_extra["utility"].to(
+                                device=selector_logits_for_loss.device,
+                                dtype=selector_logits_for_loss.dtype,
+                            )
+                        if torch.is_tensor(selector_extra.get("utility_dist", None)):
+                            utility_dist_t = selector_extra["utility_dist"].to(
+                                device=selector_logits_for_loss.device,
+                                dtype=selector_logits_for_loss.dtype,
+                            )
+
+                    if torch.is_tensor(utility_t):
+                        selector_pairwise_loss = selector_pairwise_utility_loss(
+                            selector_logits=selector_logits_for_loss,
+                            utility=utility_t,
+                            valid_mask=selector_valid_mask,
+                            high_q=float(os.environ.get("SELECTOR_PAIRWISE_HIGH_Q", "0.80")),
+                            low_q=float(os.environ.get("SELECTOR_PAIRWISE_LOW_Q", "0.40")),
+                            margin=float(os.environ.get("SELECTOR_PAIRWISE_MARGIN", "0.2")),
+                            max_pairs=int(os.environ.get("SELECTOR_PAIRWISE_MAX_PAIRS", "2048")),
+                        )
+                        if (not torch.is_tensor(selector_pairwise_loss)) or (not torch.isfinite(selector_pairwise_loss)):
+                            selector_pairwise_loss = res_full['spect'].sum() * 0.0
+
+                    if torch.is_tensor(utility_dist_t):
+                        utility_log_probs = F.log_softmax(
+                            selector_logits_for_loss.masked_fill(
+                                selector_valid_mask <= 0.5,
+                                _neg_mask_fill_value(selector_logits_for_loss),
+                            ),
+                            dim=1,
+                        )
+                        selector_utility_kl_loss = F.kl_div(
+                            utility_log_probs,
+                            utility_dist_t,
+                            reduction='none',
+                        ).sum(dim=1)
+                        valid_rows = (selector_valid_mask.sum(dim=1) > 0).float()
+                        selector_utility_kl_loss = (
+                            selector_utility_kl_loss * valid_rows
+                        ).sum() / valid_rows.sum().clamp_min(1.0)
+                        if (not torch.is_tensor(selector_utility_kl_loss)) or (not torch.isfinite(selector_utility_kl_loss)):
+                            selector_utility_kl_loss = res_full['spect'].sum() * 0.0
+
                 target_pos_false_mass = res_full['spect'].sum() * 0.0
                 target_pos_overlap_exact = res_full['spect'].sum() * 0.0
                 target_clean_pos_rate = res_full['spect'].sum() * 0.0
@@ -1725,6 +1783,8 @@ def train_mssubsetnet():
                 selector_loss = (
                     float(selector_bce_weight) * selector_bce_loss
                     + float(selector_kl_weight) * selector_kl_loss
+                    + float(selector_pairwise_weight) * selector_pairwise_loss
+                    + float(selector_utility_kl_weight) * selector_utility_kl_loss
                 )
 
                 target_pos_exact_support_mass = res_full['spect'].sum() * 0.0
@@ -2229,6 +2289,10 @@ def train_mssubsetnet():
         val_teacher_oracle_pred_n_vals = []
         val_model_topk_oracle_cos_256_vals = []
         val_model_topk_oracle_false_support_256_vals = []
+        val_utility_top64_oracle_cos_vals = []
+        val_utility_top64_false_support_vals = []
+        val_utility_top64_true_hit_mass_vals = []
+        val_utility_top64_false_mass_vals = []
         epoch_best_sparse = None
         epoch_worst_sparse = None
         epoch_best_cos = -1.0
@@ -2440,6 +2504,8 @@ def train_mssubsetnet():
 
                     val_selector_bce = res_full['spect'].sum() * 0.0
                     val_selector_kl = res_full['spect'].sum() * 0.0
+                    val_selector_pairwise = res_full['spect'].sum() * 0.0
+                    val_selector_utility_kl = res_full['spect'].sum() * 0.0
                     val_selector_pos_rate = res_full['spect'].sum() * 0.0
                     val_selector_quality_mean = res_full['spect'].sum() * 0.0
                     val_selector_dyn_pos_weight = res_full['spect'].sum() * 0.0
@@ -2585,6 +2651,53 @@ def train_mssubsetnet():
                         val_selector_quality_mean = selector_quality.mean()
                         val_selector_dyn_pos_weight = dyn_pos_weight.detach()
 
+                        utility_t = None
+                        utility_dist_t = None
+                        if isinstance(selector_extra, dict):
+                            if torch.is_tensor(selector_extra.get("utility", None)):
+                                utility_t = selector_extra["utility"].to(
+                                    device=selector_logits_for_loss.device,
+                                    dtype=selector_logits_for_loss.dtype,
+                                )
+                            if torch.is_tensor(selector_extra.get("utility_dist", None)):
+                                utility_dist_t = selector_extra["utility_dist"].to(
+                                    device=selector_logits_for_loss.device,
+                                    dtype=selector_logits_for_loss.dtype,
+                                )
+
+                        if torch.is_tensor(utility_t):
+                            val_selector_pairwise = selector_pairwise_utility_loss(
+                                selector_logits=selector_logits_for_loss,
+                                utility=utility_t,
+                                valid_mask=selector_valid_mask,
+                                high_q=float(os.environ.get("SELECTOR_PAIRWISE_HIGH_Q", "0.80")),
+                                low_q=float(os.environ.get("SELECTOR_PAIRWISE_LOW_Q", "0.40")),
+                                margin=float(os.environ.get("SELECTOR_PAIRWISE_MARGIN", "0.2")),
+                                max_pairs=int(os.environ.get("SELECTOR_PAIRWISE_MAX_PAIRS", "2048")),
+                            )
+                            if (not torch.is_tensor(val_selector_pairwise)) or (not torch.isfinite(val_selector_pairwise)):
+                                val_selector_pairwise = res_full['spect'].sum() * 0.0
+
+                        if torch.is_tensor(utility_dist_t):
+                            utility_log_probs = F.log_softmax(
+                                selector_logits_for_loss.masked_fill(
+                                    selector_valid_mask <= 0.5,
+                                    _neg_mask_fill_value(selector_logits_for_loss),
+                                ),
+                                dim=1,
+                            )
+                            val_selector_utility_kl = F.kl_div(
+                                utility_log_probs,
+                                utility_dist_t,
+                                reduction='none',
+                            ).sum(dim=1)
+                            valid_rows = (selector_valid_mask.sum(dim=1) > 0).float()
+                            val_selector_utility_kl = (
+                                val_selector_utility_kl * valid_rows
+                            ).sum() / valid_rows.sum().clamp_min(1.0)
+                            if (not torch.is_tensor(val_selector_utility_kl)) or (not torch.isfinite(val_selector_utility_kl)):
+                                val_selector_utility_kl = res_full['spect'].sum() * 0.0
+
                     val_target_pos_false_mass = res_full['spect'].sum() * 0.0
                     val_target_pos_overlap_exact = res_full['spect'].sum() * 0.0
                     val_target_pos_exact_support_mass = res_full['spect'].sum() * 0.0
@@ -2697,6 +2810,8 @@ def train_mssubsetnet():
                     val_selector_loss = (
                         float(selector_bce_weight) * val_selector_bce
                         + float(selector_kl_weight) * val_selector_kl
+                        + float(selector_pairwise_weight) * val_selector_pairwise
+                        + float(selector_utility_kl_weight) * val_selector_utility_kl
                     )
                     topk_candidate_mask_val = None
                     if os.environ.get("MODEL_TOPK_USE_ACTIVE_MASK", "0") == "1":
@@ -2870,6 +2985,38 @@ def train_mssubsetnet():
                         val_teacher_oracle_false_support_vals.append(teacher_stats.get('false_support', float('nan')))
                         val_teacher_oracle_pred_int_on_true_vals.append(teacher_stats.get('pred_int_on_true', float('nan')))
                         val_teacher_oracle_pred_n_vals.append(teacher_stats.get('pred_n', float('nan')))
+
+                    utility_top64_stats = {}
+                    if isinstance(selector_extra, dict) and torch.is_tensor(selector_extra.get("utility", None)):
+                        utility_scores = selector_extra["utility"].to(
+                            device=selector_logits_for_topk.device,
+                            dtype=selector_logits_for_topk.dtype,
+                        )
+                        utility_topk_idx = select_model_topk_indices(
+                            selector_logits=utility_scores,
+                            batch=batch,
+                            k=64,
+                            use_coverage=False,
+                            use_group_unique=use_group_unique_model,
+                            candidate_mask=None,
+                        )
+                        utility_topk_mask = build_mask_from_topk_indices(
+                            utility_topk_idx,
+                            utility_scores,
+                            formulae_mask=batch.get('formulae_mask', None),
+                            candidate_mask=None,
+                        )
+                        utility_top64_stats = compute_candidate_support_stats(
+                            batch,
+                            utility_topk_mask,
+                            official_bin_width=official_metric_cfg['bin_width'],
+                            official_max_mz=official_metric_cfg['max_mz'],
+                        )
+                    if utility_top64_stats:
+                        val_utility_top64_oracle_cos_vals.append(utility_top64_stats.get('official_cos', float('nan')))
+                        val_utility_top64_false_support_vals.append(utility_top64_stats.get('false_support', float('nan')))
+                        val_utility_top64_true_hit_mass_vals.append(utility_top64_stats.get('pred_int_on_true', float('nan')))
+                        val_utility_top64_false_mass_vals.append(utility_top64_stats.get('false_support', float('nan')))
 
                     model_topk_stats_256 = compute_candidate_support_stats(
                         batch,
@@ -3321,6 +3468,10 @@ def train_mssubsetnet():
         avg_val_teacher_oracle_pred_n = _finite_mean(val_teacher_oracle_pred_n_vals)
         avg_val_model_topk_oracle_cos_256 = _finite_mean(val_model_topk_oracle_cos_256_vals)
         avg_val_model_topk_oracle_false_support_256 = _finite_mean(val_model_topk_oracle_false_support_256_vals)
+        avg_val_utility_top64_oracle_cos = _finite_mean(val_utility_top64_oracle_cos_vals)
+        avg_val_utility_top64_false_support = _finite_mean(val_utility_top64_false_support_vals)
+        avg_val_utility_top64_true_hit_mass = _finite_mean(val_utility_top64_true_hit_mass_vals)
+        avg_val_utility_top64_false_mass = _finite_mean(val_utility_top64_false_mass_vals)
         eval_debug_vals = getattr(train_mssubsetnet, "_model_topk_eval_debug_vals", [])
         if len(eval_debug_vals) > 0:
             arr = np.asarray(eval_debug_vals, dtype=np.float64)
@@ -3562,6 +3713,10 @@ def train_mssubsetnet():
             f'val_teacher_oracle_pred_n={avg_val_teacher_oracle_pred_n:.2f} | '
             f'val_model_topk_oracle_cos@256={avg_val_model_topk_oracle_cos_256:.4f} | '
             f'val_model_topk_oracle_false_support@256={avg_val_model_topk_oracle_false_support_256:.4f} | '
+            f'val_utility_top64_oracle_cos={avg_val_utility_top64_oracle_cos:.4f} | '
+            f'val_utility_top64_false_support={avg_val_utility_top64_false_support:.4f} | '
+            f'val_utility_top64_true_hit_mass={avg_val_utility_top64_true_hit_mass:.4f} | '
+            f'val_utility_top64_false_mass={avg_val_utility_top64_false_mass:.4f} | '
             f'val_model_topk_oracle_cos@{eval_k_used}={avg_val_model_topk_oracle_cos_eval:.4f} | '
             f'val_model_topk_oracle_false_support@{eval_k_used}={avg_val_model_topk_oracle_false_support_eval:.4f}'
             + (' | BEST' if is_best else '')
@@ -3665,6 +3820,10 @@ def train_mssubsetnet():
         history['val_teacher_oracle_pred_n'].append(avg_val_teacher_oracle_pred_n)
         history['val_model_topk_oracle_cos@256'].append(avg_val_model_topk_oracle_cos_256)
         history['val_model_topk_oracle_false_support@256'].append(avg_val_model_topk_oracle_false_support_256)
+        history['val_utility_top64_oracle_cos'].append(avg_val_utility_top64_oracle_cos)
+        history['val_utility_top64_false_support'].append(avg_val_utility_top64_false_support)
+        history['val_utility_top64_true_hit_mass'].append(avg_val_utility_top64_true_hit_mass)
+        history['val_utility_top64_false_mass'].append(avg_val_utility_top64_false_mass)
         history['train_false_support'].append(avg_train_false_support)
         history['val_false_support'].append(avg_val_false_support)
         if epoch_best_sparse is not None:
@@ -3946,7 +4105,6 @@ def _save_training_curves(history, out_dir='outputs'):
 
 if __name__ == '__main__':
     train_mssubsetnet()
-
 
 
 
