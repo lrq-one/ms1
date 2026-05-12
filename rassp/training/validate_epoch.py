@@ -1,6 +1,7 @@
 import torch
 from tqdm import tqdm
-
+import os
+from rassp.training.teacher_audit import compute_teacher_audit_pack
 from rassp.training.batch_utils import move_batch_to_device, prepare_batch_cpu
 from rassp.training.logging_utils import MetricAccumulator
 from rassp.training.official_metrics import compute_batch_official_metrics
@@ -9,7 +10,6 @@ from rassp.training.selector_metrics import (
     compute_selected_support_metrics,
     select_model_topk_indices,
 )
-from rassp.training.selector_losses import build_selector_utility_tensors
 
 def _cfg_value(cfg, name, default):
     return getattr(cfg, name, default) if cfg is not None else default
@@ -70,30 +70,12 @@ def validate_one_epoch(
             selector_metrics = compute_selected_support_metrics(topk_idx, batch)
             suffix = int(_cfg_value(selector_cfg, "model_topk_eval", 64))
             acc.add_dict({f"{key}@{suffix}": value for key, value in selector_metrics.items()})
-            utility, utility_dist, valid_mask, util_stats = build_selector_utility_tensors(
-                selector_logits,
-                batch,
+        if os.environ.get("ENABLE_TEACHER_AUDIT", "0") == "1":
+            audit_metrics = compute_teacher_audit_pack(
+                selector_logits=selector_logits,
+                batch=batch,
+                selector_cfg=selector_cfg,
+                metric_cfg=metric_cfg,
             )
-
-            if utility is not None and valid_mask is not None:
-                utility_topk_idx = select_model_topk_indices(
-                    selector_logits=utility,
-                    batch=batch,
-                    k=int(_cfg_value(selector_cfg, "model_topk_eval", 64)),
-                    use_coverage=False,
-                    use_group_unique=bool(_cfg_value(selector_cfg, "use_group_unique_model", False)),
-                )
-
-                utility_metrics = compute_selected_support_metrics(utility_topk_idx, batch)
-                suffix = int(_cfg_value(selector_cfg, "model_topk_eval", 64))
-
-                acc.add_dict({
-                    f"utility_topk_{key}@{suffix}": value
-                    for key, value in utility_metrics.items()
-                })
-
-                if isinstance(util_stats, dict):
-                    for k, v in util_stats.items():
-                        if torch.is_tensor(v):
-                            acc.add(f"val_{k}", v.detach().item())
+            acc.add_dict(audit_metrics)
     return acc.mean_dict()
