@@ -318,6 +318,7 @@ def apply_teacher_topk_to_target(
     k = max(1, min(int(topk), int(target.shape[1])))
 
     masked = target.masked_fill(fm <= 0.5, 0.0)
+
     idx = torch.topk(masked, k=k, dim=1).indices
 
     keep = torch.zeros_like(masked)
@@ -328,7 +329,6 @@ def apply_teacher_topk_to_target(
     out = _normalize_target_probs(out, fm, eps=eps)
 
     return out, keep
-
 def compute_formula_target_probs_from_batch(
     batch,
     official_bin_width=0.01,
