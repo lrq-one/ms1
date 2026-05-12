@@ -4452,6 +4452,7 @@ def train_mssubsetnet():
                             formulae_mask,
                             ks=k_list,
                         )
+                    use_coverage_topk = os.environ.get("USE_COVERAGE_AWARE_TOPK", "0") == "1"
                     for k in k_list:
                         if use_coverage_topk:
                             peak_idx = batch.get("formulae_peaks_official_idx", None)

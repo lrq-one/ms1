@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from rassp.model.model_utils import neg_mask_fill_value as _neg_mask_fill_value
+from rassp.model.selector_topk import coverage_aware_topk, group_unique_topk, plain_topk
 from rassp.training.formula_targets import (
     _build_true_official_dense_from_cached_sparse_batch,
     get_formulae_official_intensity_from_batch,
@@ -533,3 +534,96 @@ def _mask_ratio_in_topk(source_mask, topk_mask):
     ratio = ((sm > 0.5).float() * (tm > 0.5).float()).sum(dim=-1) / denom
 
     return float(ratio.mean().detach().cpu().item())
+
+
+def select_model_topk_indices(
+    selector_logits,
+    batch,
+    k,
+    use_coverage=False,
+    use_group_unique=False,
+):
+    formulae_mask = batch.get("formulae_mask", None)
+    group_id = batch.get("formulae_instance_group_id", None)
+
+    if use_coverage:
+        return coverage_aware_topk(
+            selector_logits,
+            batch.get("formulae_peaks_official_idx", None),
+            batch.get("formulae_peaks_official_intensity", None),
+            formulae_mask=formulae_mask,
+            group_id=group_id,
+            k=k,
+            duplicate_penalty=float(os.environ.get("COVERAGE_TOPK_DUP_PENALTY", "0.35")),
+            novelty_bonus=float(os.environ.get("COVERAGE_TOPK_NOVELTY_BONUS", "0.10")),
+        )
+
+    if use_group_unique:
+        return group_unique_topk(
+            selector_logits,
+            group_id,
+            k=k,
+            mask=formulae_mask,
+        )
+
+    return plain_topk(
+        selector_logits,
+        k=k,
+        mask=formulae_mask,
+    )
+
+
+def compute_selected_support_metrics(topk_idx, batch, eps=1e-8):
+    cand_idx = batch.get("formulae_peaks_official_idx", None)
+    cand_int = batch.get("formulae_peaks_official_intensity", None)
+    if cand_idx is None or cand_int is None:
+        cand_idx = batch.get("formulae_peaks_mass_idx", None)
+        cand_int = batch.get("formulae_peaks_intensity", None)
+
+    true_idx_obj = batch.get("true_all_official_idx", None)
+    if true_idx_obj is None:
+        true_idx_obj = batch.get("true_official_idx", None)
+
+    if not (torch.is_tensor(topk_idx) and torch.is_tensor(cand_idx) and torch.is_tensor(cand_int)):
+        return {}
+
+    true_mass_list = []
+    false_mass_list = []
+    batch_n = int(min(topk_idx.shape[0], cand_idx.shape[0], cand_int.shape[0]))
+
+    for b in range(batch_n):
+        if torch.is_tensor(true_idx_obj):
+            true_idx = true_idx_obj[b].detach().to(cand_idx.device).long().reshape(-1)
+        else:
+            try:
+                true_idx = torch.as_tensor(true_idx_obj[b], dtype=torch.long, device=cand_idx.device).reshape(-1)
+            except Exception:
+                continue
+
+        true_idx = true_idx[true_idx >= 0]
+        if true_idx.numel() == 0:
+            continue
+
+        sel = topk_idx[b].long().clamp(0, max(0, int(cand_idx.shape[1]) - 1))
+        idx_b = cand_idx[b, sel].long()
+        int_b = cand_int[b, sel].float()
+
+        valid = (idx_b >= 0) & torch.isfinite(int_b) & (int_b > 0)
+        total = torch.where(valid, int_b, torch.zeros_like(int_b)).sum()
+        if float(total.detach().item()) <= eps:
+            continue
+
+        hit = valid & torch.isin(idx_b, true_idx)
+        true_mass = torch.where(hit, int_b, torch.zeros_like(int_b)).sum()
+        ratio_true = true_mass / total.clamp_min(eps)
+
+        true_mass_list.append(ratio_true)
+        false_mass_list.append(1.0 - ratio_true)
+
+    if len(true_mass_list) == 0:
+        return {}
+
+    return {
+        "selected_true_hit_mass": float(torch.stack(true_mass_list).mean().detach().cpu().item()),
+        "selected_false_mass": float(torch.stack(false_mass_list).mean().detach().cpu().item()),
+    }
