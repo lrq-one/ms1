@@ -89,6 +89,7 @@ from rassp.training.selector_metrics import (
 )
 from rassp.training.selector_losses import (
     compute_selector_false_support_loss,
+    compute_selector_soft_false_support_loss,
     compute_selector_utility_target_loss,
 )
 from rassp.training.config import (
@@ -310,6 +311,70 @@ def _masked_selector_bce(selector_logits, target_mask, formulae_mask=None, pos_w
     pos_part_w = float(np.clip(pos_part_w, 0.0, 1.0))
 
     return pos_part_w * pos_loss + (1.0 - pos_part_w) * neg_loss
+
+
+def _masked_selector_recall_bce(
+    selector_logits,
+    target_mask,
+    formulae_mask=None,
+    pos_part=0.75,
+    neg_part=0.25,
+):
+    if (not torch.is_tensor(selector_logits)) or (not torch.is_tensor(target_mask)):
+        return None
+
+    logits = selector_logits.float()
+    target = target_mask.float()
+
+    if logits.dim() == 1:
+        logits = logits.unsqueeze(0)
+    elif logits.dim() > 2:
+        logits = logits.reshape(logits.shape[0], -1)
+
+    if target.dim() == 1:
+        target = target.unsqueeze(0)
+    elif target.dim() > 2:
+        target = target.reshape(target.shape[0], -1)
+
+    use_b = min(int(logits.shape[0]), int(target.shape[0]))
+    use_m = min(int(logits.shape[1]), int(target.shape[1]))
+    if use_b <= 0 or use_m <= 0:
+        return None
+
+    logits = logits[:use_b, :use_m]
+    target = target[:use_b, :use_m].to(device=logits.device, dtype=logits.dtype)
+
+    if torch.is_tensor(formulae_mask):
+        fm = formulae_mask.float()
+        if fm.dim() > 2:
+            fm = fm.reshape(fm.shape[0], -1)
+        fm = fm[:use_b, :use_m].to(device=logits.device)
+        valid = fm > 0.5
+    else:
+        valid = torch.ones_like(target, dtype=torch.bool)
+
+    if not bool(valid.any().item()):
+        return logits.sum() * 0.0
+
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits,
+        target,
+        reduction='none',
+    )
+
+    pos = valid & (target > 0.5)
+    neg = valid & (target <= 0.5)
+
+    pos_loss = loss[pos].mean() if bool(pos.any().item()) else logits.sum() * 0.0
+    neg_loss = loss[neg].mean() if bool(neg.any().item()) else logits.sum() * 0.0
+
+    pos_w = float(np.clip(pos_part, 0.0, 1.0))
+    neg_w = float(np.clip(neg_part, 0.0, 1.0))
+    weight_sum = max(pos_w + neg_w, 1e-8)
+    pos_w = pos_w / weight_sum
+    neg_w = neg_w / weight_sum
+
+    return pos_w * pos_loss + neg_w * neg_loss
 
 
 def _rerank_teacher_ratio_for_epoch(
@@ -876,6 +941,10 @@ def train_mssubsetnet():
         0.0,
         float(os.environ.get('FALSE_SUPPORT_LOSS_WEIGHT', '0.0')),
     )
+    soft_false_support_loss_weight = max(
+        0.0,
+        float(os.environ.get('SOFT_FALSE_SUPPORT_LOSS_WEIGHT', '0.0')),
+    )
     selector_utility_loss_weight = max(
         0.0,
         float(os.environ.get('SELECTOR_UTILITY_LOSS_WEIGHT', '0.0')),
@@ -907,6 +976,8 @@ def train_mssubsetnet():
     # 2) listwise ranking distribution over candidates
     selector_bce_weight = max(0.0, float(os.environ.get('SELECTOR_BCE_WEIGHT', '0.2')))
     selector_kl_weight = max(0.0, float(os.environ.get('SELECTOR_KL_WEIGHT', '0.2')))
+    selector_recall_bce_weight = max(0.0, float(os.environ.get('SELECTOR_RECALL_BCE_WEIGHT', '0.0')))
+    selector_recall_target_topk = max(1, int(os.environ.get('SELECTOR_RECALL_TARGET_TOPK', str(max(128, selector_topk)))))
     use_selector_local_utility = os.environ.get("USE_SELECTOR_LOCAL_UTILITY", "0") == "1"
     selector_pairwise_weight = max(
         0.0,
@@ -1035,8 +1106,13 @@ def train_mssubsetnet():
     log(
         f'馃З selector_components: bce_weight={selector_bce_weight:.3f} '
         f'kl_weight={selector_kl_weight:.3f} '
+        f'recall_bce_weight={selector_recall_bce_weight:.3f} '
         f'pairwise_weight={selector_pairwise_weight:.3f} '
         f'utility_kl_weight={selector_utility_kl_weight:.3f}'
+    )
+    log(
+        f'馃З selector_recall_target_topk={selector_recall_target_topk} '
+        f'soft_false_support_weight={soft_false_support_loss_weight:.3f}'
     )
     log(f'馃З train_selector_only_stage={int(train_selector_only_stage)}')
     log(f'馃З selector_only_warmup_epochs={selector_only_warmup_epochs}')
@@ -1410,8 +1486,14 @@ def train_mssubsetnet():
             )
 
             teacher_formula_mask = batch.get('formulae_mask', None)
+            selector_recall_target_mask = None
             teacher_topk_for_train = int(teacher_topk_train) if int(teacher_topk_train) > 0 else int(selector_topk)
             if torch.is_tensor(teacher_target_full):
+                _, selector_recall_target_mask = apply_teacher_topk_to_target(
+                    teacher_target_full,
+                    teacher_formula_mask,
+                    topk=selector_recall_target_topk,
+                )
                 if use_group_unique_teacher:
                     teacher_positive_mask = (teacher_target_full > 0)
 
@@ -1517,6 +1599,7 @@ def train_mssubsetnet():
                 selector_mask_full = formulae_mask
 
                 selector_bce_loss = res_full['spect'].sum() * 0.0
+                selector_recall_bce_loss = res_full['spect'].sum() * 0.0
                 selector_kl_loss = res_full['spect'].sum() * 0.0
                 selector_pairwise_loss = res_full['spect'].sum() * 0.0
                 selector_utility_kl_loss = res_full['spect'].sum() * 0.0
@@ -1563,6 +1646,17 @@ def train_mssubsetnet():
                     selector_bce_loss = (
                         bce_raw * selector_valid_mask
                     ).sum() / selector_valid_mask.sum().clamp_min(1.0)
+
+                    if torch.is_tensor(selector_recall_target_mask):
+                        selector_recall_bce_loss = _masked_selector_recall_bce(
+                            selector_logits_for_loss,
+                            selector_recall_target_mask,
+                            formulae_mask=selector_valid_mask,
+                            pos_part=0.75,
+                            neg_part=0.25,
+                        )
+                        if selector_recall_bce_loss is None:
+                            selector_recall_bce_loss = res_full['spect'].sum() * 0.0
 
                     try:
                         gamma = float(os.environ.get("QUALITY_TARGET_GAMMA", "2.0"))
@@ -1790,6 +1884,7 @@ def train_mssubsetnet():
                 selector_loss = (
                     float(selector_bce_weight) * selector_bce_loss
                     + float(selector_kl_weight) * selector_kl_loss
+                    + float(selector_recall_bce_weight) * selector_recall_bce_loss
                     + float(selector_pairwise_weight) * selector_pairwise_loss
                     + float(selector_utility_kl_weight) * selector_utility_kl_loss
                 )
@@ -1899,6 +1994,7 @@ def train_mssubsetnet():
                 # so that TRAIN_SELECTOR_ONLY_STAGE=1 can still use it.
                 # ============================================================
                 selector_false_support_loss = selector_loss.new_zeros(())
+                selector_soft_false_support_loss = selector_loss.new_zeros(())
                 selector_utility_loss = selector_loss.new_zeros(())
 
                 if selector_utility_loss_weight > 0.0:
@@ -1919,6 +2015,15 @@ def train_mssubsetnet():
 
                     if (not torch.is_tensor(selector_false_support_loss)) or (not torch.isfinite(selector_false_support_loss)):
                         selector_false_support_loss = selector_loss.new_zeros(())
+
+                if float(soft_false_support_loss_weight) > 0.0 and os.environ.get("USE_SELECTOR_FALSE_SUPPORT_LOSS", "1") == "1":
+                    selector_soft_false_support_loss = compute_selector_soft_false_support_loss(
+                        selector_logits=selector_logits_for_topk,
+                        batch=batch,
+                    )
+
+                    if (not torch.is_tensor(selector_soft_false_support_loss)) or (not torch.isfinite(selector_soft_false_support_loss)):
+                        selector_soft_false_support_loss = selector_loss.new_zeros(())
                 # ============================================================
                 # Optional Stage 1: selector-only training.
                 # In this stage, do NOT run rerank / official projection / peak / OOS.
@@ -1937,7 +2042,7 @@ def train_mssubsetnet():
                     # Important:
                     # In selector-only stage, false_support_loss should mean selector-level
                     # false-support loss, not dense spectral false-support loss.
-                    false_support_loss = selector_false_support_loss
+                    false_support_loss = selector_false_support_loss + selector_soft_false_support_loss
 
                     loss = float(selector_loss_weight) * selector_loss
 
@@ -1945,7 +2050,9 @@ def train_mssubsetnet():
                         loss = loss + float(selector_utility_loss_weight) * selector_utility_loss
 
                     if float(false_support_loss_weight) > 0.0:
-                        loss = loss + float(false_support_loss_weight) * false_support_loss
+                        loss = loss + float(false_support_loss_weight) * selector_false_support_loss
+                    if float(soft_false_support_loss_weight) > 0.0:
+                        loss = loss + float(soft_false_support_loss_weight) * selector_soft_false_support_loss
 
                     if epoch >= precursor_loss_start_epoch and precursor_loss_weight > 0:
                         loss = loss + float(precursor_loss_weight) * precursor_loss
@@ -2125,6 +2232,8 @@ def train_mssubsetnet():
                         loss = loss + float(formula_entropy_loss_weight) * formula_entropy_loss
                     if epoch >= spectral_loss_start_epoch and false_support_loss_weight > 0:
                         loss = loss + float(false_support_loss_weight) * false_support_loss
+                    if float(soft_false_support_loss_weight) > 0.0:
+                        loss = loss + float(soft_false_support_loss_weight) * selector_soft_false_support_loss
 
                     if epoch >= spectral_loss_start_epoch and official_spectral_loss_weight > 0:
                         loss = loss + float(official_spectral_loss_weight) * official_spectral_loss
@@ -2363,9 +2472,15 @@ def train_mssubsetnet():
                 )
 
                 teacher_formula_mask = batch.get('formulae_mask', None)
+                selector_recall_target_mask = None
                 teacher_topk_for_eval = int(teacher_topk_eval) if int(teacher_topk_eval) > 0 else int(model_topk_eval)
 
                 if torch.is_tensor(teacher_target_full):
+                    _, selector_recall_target_mask = apply_teacher_topk_to_target(
+                        teacher_target_full,
+                        teacher_formula_mask,
+                        topk=selector_recall_target_topk,
+                    )
                     if use_group_unique_teacher:
                         teacher_positive_mask = (teacher_target_full > 0)
 
@@ -2510,6 +2625,7 @@ def train_mssubsetnet():
                     selector_logits_for_topk = _apply_selector_aux_logit_bias(selector_logits, batch)
 
                     val_selector_bce = res_full['spect'].sum() * 0.0
+                    val_selector_recall_bce = res_full['spect'].sum() * 0.0
                     val_selector_kl = res_full['spect'].sum() * 0.0
                     val_selector_pairwise = res_full['spect'].sum() * 0.0
                     val_selector_utility_kl = res_full['spect'].sum() * 0.0
@@ -2556,6 +2672,17 @@ def train_mssubsetnet():
                         val_selector_bce = (
                             bce_raw * selector_valid_mask
                         ).sum() / selector_valid_mask.sum().clamp_min(1.0)
+
+                        if torch.is_tensor(selector_recall_target_mask):
+                            val_selector_recall_bce = _masked_selector_recall_bce(
+                                selector_logits_for_loss,
+                                selector_recall_target_mask,
+                                formulae_mask=selector_valid_mask,
+                                pos_part=0.75,
+                                neg_part=0.25,
+                            )
+                            if val_selector_recall_bce is None:
+                                val_selector_recall_bce = res_full['spect'].sum() * 0.0
 
                         try:
                             gamma = float(os.environ.get("QUALITY_TARGET_GAMMA", "2.0"))
@@ -2817,6 +2944,7 @@ def train_mssubsetnet():
                     val_selector_loss = (
                         float(selector_bce_weight) * val_selector_bce
                         + float(selector_kl_weight) * val_selector_kl
+                        + float(selector_recall_bce_weight) * val_selector_recall_bce
                         + float(selector_pairwise_weight) * val_selector_pairwise
                         + float(selector_utility_kl_weight) * val_selector_utility_kl
                     )
@@ -3626,12 +3754,17 @@ def train_mssubsetnet():
             'val_false_support': avg_val_false_support,
             'val_selected_true_hit_mass@64': avg_val_selected_true_hit_mass_64,
             'val_selected_false_mass@64': avg_val_selected_false_mass_64,
+            'val_selected_true_hit_mass@128': avg_val_selected_true_hit_mass_128,
+            'val_selected_false_mass@128': avg_val_selected_false_mass_128,
             'val_teacher_oracle_cos': avg_val_teacher_oracle_cos,
             'val_teacher_oracle_false_support': avg_val_teacher_oracle_false_support,
         }
         if int(eval_k_used) == 64:
             epoch_metrics['val_model_topk_oracle_cos@64'] = avg_val_model_topk_oracle_cos_eval
             epoch_metrics['val_model_topk_oracle_false_support@64'] = avg_val_model_topk_oracle_false_support_eval
+        elif int(eval_k_used) == 128:
+            epoch_metrics['val_model_topk_oracle_cos@128'] = avg_val_model_topk_oracle_cos_eval
+            epoch_metrics['val_model_topk_oracle_false_support@128'] = avg_val_model_topk_oracle_false_support_eval
 
         epoch_line = format_metric_line(f'Epoch {epoch+1}/{epochs}', epoch_metrics)
         if is_best:
