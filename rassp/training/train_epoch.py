@@ -14,16 +14,12 @@ from rassp.training.runtime_selector_targets import (
     build_selector_teacher_dist_from_official_overlap,
     build_selector_teacher_dist_setcover,
 )
-
 from rassp.training.selector_losses import (
     compute_selector_false_support_loss,
     compute_selector_utility_target_loss,
-    build_selector_utility_tensors,
 )
 
-from rassp.training.train_loss_components import (
-    selector_pairwise_utility_loss,
-)
+
 def _cfg_value(cfg, name, default):
     return getattr(cfg, name, default) if cfg is not None else default
 
@@ -91,32 +87,7 @@ def train_one_epoch(
                     util_loss = compute_selector_utility_target_loss(selector_logits, batch)
                     loss = loss + float(_cfg_value(loss_cfg, "selector_utility_weight", 0.0)) * util_loss
                     acc.add("selector_utility", util_loss.detach().item())
-                pairwise_w = float(_cfg_value(loss_cfg, "selector_pairwise_weight", 0.0))
-                if pairwise_w > 0:
-                    utility, utility_dist, valid_mask, util_stats = build_selector_utility_tensors(
-                        selector_logits,
-                        batch,
-                    )
 
-                    if utility is not None and valid_mask is not None:
-                        pairwise_loss = selector_pairwise_utility_loss(
-                            selector_logits=selector_logits,
-                            utility=utility,
-                            valid_mask=valid_mask,
-                            high_q=0.80,
-                            low_q=0.40,
-                            margin=0.2,
-                            max_pairs=2048,
-                        )
-
-                        if pairwise_loss is not None:
-                            loss = loss + pairwise_w * pairwise_loss
-                            acc.add("selector_pairwise", pairwise_loss.detach().item())
-
-                        if isinstance(util_stats, dict):
-                            for k, v in util_stats.items():
-                                if torch.is_tensor(v):
-                                    acc.add(k, v.detach().item())
             precursor_loss = compute_precursor_loss_from_batch(batch, res)
             if precursor_loss is not None and float(_cfg_value(loss_cfg, "precursor_weight", 0.0)) > 0:
                 loss = loss + float(_cfg_value(loss_cfg, "precursor_weight", 0.0)) * precursor_loss
