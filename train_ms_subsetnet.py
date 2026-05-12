@@ -84,6 +84,7 @@ from rassp.training.selector_metrics import (
     compute_candidate_support_stats,
     compute_selector_eval_pack,
     compute_selector_quality_metrics,
+    select_model_topk_indices,
 )
 from rassp.training.selector_losses import (
     compute_selector_false_support_loss,
@@ -2704,21 +2705,21 @@ def train_mssubsetnet():
                             formulae_mask=batch.get('formulae_mask', None),
                         )
 
-                    if use_group_unique_model:
-                        model_topk_mask = build_group_unique_topk_mask_from_scores(
-                            selector_logits_for_topk,
-                            formulae_mask=batch.get('formulae_mask', None),
-                            group_id=batch.get("formulae_instance_group_id", None),
-                            topk=model_topk_eval,
-                            candidate_mask=topk_candidate_mask_val,
-                        )
-                    else:
-                        model_topk_mask = build_topk_mask_from_scores(
-                            selector_logits_for_topk,
-                            formulae_mask=batch.get('formulae_mask', None),
-                            topk=model_topk_eval,
-                            candidate_mask=topk_candidate_mask_val,
-                        )
+                    use_coverage_topk = os.environ.get("USE_COVERAGE_AWARE_TOPK", "0") == "1"
+                    model_topk_idx = select_model_topk_indices(
+                        selector_logits=selector_logits_for_topk,
+                        batch=batch,
+                        k=model_topk_eval,
+                        use_coverage=use_coverage_topk,
+                        use_group_unique=use_group_unique_model,
+                        candidate_mask=topk_candidate_mask_val,
+                    )
+                    model_topk_mask = build_mask_from_topk_indices(
+                        model_topk_idx,
+                        selector_logits_for_topk,
+                        formulae_mask=batch.get('formulae_mask', None),
+                        candidate_mask=topk_candidate_mask_val,
+                    )
 
                     model_topk_teacher_recall = mask_recall(model_topk_mask, teacher_topk_mask)
 
@@ -2732,74 +2733,21 @@ def train_mssubsetnet():
                             formulae_mask,
                             ks=k_list,
                         )
-                    use_coverage_topk = os.environ.get("USE_COVERAGE_AWARE_TOPK", "0") == "1"
                     for k in k_list:
-                        if use_coverage_topk:
-                            peak_idx = batch.get("formulae_peaks_official_idx", None)
-                            peak_int = batch.get("formulae_peaks_official_intensity", None)
-                            if peak_idx is None or peak_int is None:
-                                peak_idx = batch.get("formulae_peaks_mass_idx", None)
-                                peak_int = batch.get("formulae_peaks_intensity", None)
-
-                            coverage_mask_k = batch.get('formulae_mask', None)
-                            if torch.is_tensor(coverage_mask_k):
-                                coverage_mask_k = coverage_mask_k.float()
-                                if coverage_mask_k.dim() > 2:
-                                    coverage_mask_k = coverage_mask_k.reshape(coverage_mask_k.shape[0], -1)
-
-                            if torch.is_tensor(topk_candidate_mask_val):
-                                cm = topk_candidate_mask_val.float()
-                                if cm.dim() > 2:
-                                    cm = cm.reshape(cm.shape[0], -1)
-
-                                if not torch.is_tensor(coverage_mask_k):
-                                    coverage_mask_k = torch.ones_like(cm)
-
-                                use_b = min(int(coverage_mask_k.shape[0]), int(cm.shape[0]))
-                                use_m = min(int(coverage_mask_k.shape[1]), int(cm.shape[1]))
-                                coverage_mask_k = coverage_mask_k[:use_b, :use_m]
-                                cm = cm[:use_b, :use_m]
-
-                                fm_full = coverage_mask_k
-                                fm_active = coverage_mask_k * (cm > 0.5).float()
-
-                                row_has_active = fm_active.sum(dim=-1, keepdim=True) > 0
-                                coverage_mask_k = torch.where(row_has_active, fm_active, fm_full)
-
-                            group_id = None
-                            if use_group_unique_model:
-                                group_id = batch.get("formulae_instance_group_id", None)
-
-                            topk_idx = coverage_aware_topk(
-                                selector_logits_for_topk,
-                                peak_idx,
-                                peak_int,
-                                formulae_mask=coverage_mask_k,
-                                group_id=group_id,
-                                k=k,
-                                duplicate_penalty=float(os.environ.get("COVERAGE_TOPK_DUP_PENALTY", "0.35")),
-                                novelty_bonus=float(os.environ.get("COVERAGE_TOPK_NOVELTY_BONUS", "0.10")),
-                            )
-                            selector_masks[k] = build_mask_from_topk_indices(
-                                topk_idx,
-                                selector_logits_for_topk,
-                                formulae_mask=coverage_mask_k,
-                            )
-                        elif use_group_unique_model:
-                            selector_masks[k] = build_group_unique_topk_mask_from_scores(
-                                selector_logits_for_topk,
-                                formulae_mask=batch.get('formulae_mask', None),
-                                group_id=batch.get("formulae_instance_group_id", None),
-                                topk=k,
-                                candidate_mask=topk_candidate_mask_val,
-                            )
-                        else:
-                            selector_masks[k] = build_topk_mask_from_scores(
-                                selector_logits_for_topk,
-                                formulae_mask=batch.get('formulae_mask', None),
-                                topk=k,
-                                candidate_mask=topk_candidate_mask_val,
-                            )
+                        topk_idx = select_model_topk_indices(
+                            selector_logits=selector_logits_for_topk,
+                            batch=batch,
+                            k=k,
+                            use_coverage=use_coverage_topk,
+                            use_group_unique=use_group_unique_model,
+                            candidate_mask=topk_candidate_mask_val,
+                        )
+                        selector_masks[k] = build_mask_from_topk_indices(
+                            topk_idx,
+                            selector_logits_for_topk,
+                            formulae_mask=batch.get('formulae_mask', None),
+                            candidate_mask=topk_candidate_mask_val,
+                        )
 
                     fragaux_model_topk_ratio_32 = float("nan")
                     fragaux_model_topk_ratio_64 = float("nan")

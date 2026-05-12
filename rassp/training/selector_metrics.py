@@ -551,8 +551,32 @@ def select_model_topk_indices(
     k,
     use_coverage=False,
     use_group_unique=False,
+    candidate_mask=None,
 ):
     formulae_mask = batch.get("formulae_mask", None)
+    if torch.is_tensor(candidate_mask):
+        cm = candidate_mask.float()
+        if cm.dim() == 1:
+            cm = cm.unsqueeze(0)
+        elif cm.dim() > 2:
+            cm = cm.reshape(cm.shape[0], -1)
+
+        if torch.is_tensor(formulae_mask):
+            fm = formulae_mask.float()
+            if fm.dim() == 1:
+                fm = fm.unsqueeze(0)
+            elif fm.dim() > 2:
+                fm = fm.reshape(fm.shape[0], -1)
+            use_b = min(int(fm.shape[0]), int(cm.shape[0]))
+            use_m = min(int(fm.shape[1]), int(cm.shape[1]))
+            fm = fm[:use_b, :use_m]
+            cm = cm[:use_b, :use_m]
+            fm_active = fm * (cm > 0.5).float()
+            row_has_active = fm_active.sum(dim=-1, keepdim=True) > 0
+            formulae_mask = torch.where(row_has_active, fm_active, fm)
+        else:
+            formulae_mask = cm
+
     group_id = batch.get("formulae_instance_group_id", None)
 
     if use_coverage:
@@ -672,6 +696,7 @@ def compute_selector_eval_pack(
                 k=int(k),
                 use_coverage=True,
                 use_group_unique=False,
+                candidate_mask=active_mask,
             )
             pred_mask = _build_mask_from_topk_indices(
                 topk_idx,
@@ -680,18 +705,35 @@ def compute_selector_eval_pack(
                 candidate_mask=active_mask,
             )
         elif use_group_unique:
-            pred_mask = _build_group_unique_topk_mask_from_scores(
+            topk_idx = select_model_topk_indices(
+                selector_logits=selector_logits,
+                batch=batch,
+                k=int(k),
+                use_coverage=False,
+                use_group_unique=True,
+                candidate_mask=active_mask,
+            )
+
+            pred_mask = _build_mask_from_topk_indices(
+                topk_idx,
                 selector_logits,
                 formulae_mask=formulae_mask,
-                group_id=group_id,
-                topk=int(k),
                 candidate_mask=active_mask,
             )
         else:
-            pred_mask = _build_topk_mask_from_scores(
+            topk_idx = select_model_topk_indices(
+                selector_logits=selector_logits,
+                batch=batch,
+                k=int(k),
+                use_coverage=False,
+                use_group_unique=False,
+                candidate_mask=active_mask,
+            )
+
+            pred_mask = _build_mask_from_topk_indices(
+                topk_idx,
                 selector_logits,
                 formulae_mask=formulae_mask,
-                topk=int(k),
                 candidate_mask=active_mask,
             )
 
