@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 from rassp.featurize import msutil
 from rassp.msutil import masscompute
 from rassp import dataset, netutil
-from rassp.model.selector_topk import coverage_aware_topk
+from rassp.model.selector_topk import coverage_aware_topk, group_unique_topk, plain_topk
 from rassp.model.model_utils import neg_mask_fill_value as _neg_mask_fill_value
 from rassp.training.batch_utils import (
     ADDUCT_VOCAB,
@@ -804,6 +804,23 @@ def train_mssubsetnet():
     selector_cfg = get_selector_config()
     loss_cfg = get_loss_config()
 
+    use_group_unique_teacher = str(os.environ.get("USE_GROUP_UNIQUE_TEACHER", "0")).strip().lower() in {
+        "1", "true", "yes", "y", "on"
+    }
+    use_group_unique_model = str(os.environ.get("USE_GROUP_UNIQUE_MODEL", "0")).strip().lower() in {
+        "1", "true", "yes", "y", "on"
+    }
+    use_group_unique_prune = str(os.environ.get("USE_GROUP_UNIQUE_PRUNE", "0")).strip().lower() in {
+        "1", "true", "yes", "y", "on"
+    }
+    print(
+        "group_unique_env:",
+        "teacher=", use_group_unique_teacher,
+        "model=", use_group_unique_model,
+        "prune=", use_group_unique_prune,
+        flush=True,
+    )
+
     seed = int(os.environ.get('SEED', '1024'))
     random.seed(seed)
     np.random.seed(seed)
@@ -1378,7 +1395,7 @@ def train_mssubsetnet():
             teacher_formula_mask = batch.get('formulae_mask', None)
             teacher_topk_for_train = int(teacher_topk_train) if int(teacher_topk_train) > 0 else int(selector_topk)
             if torch.is_tensor(teacher_target_full):
-                if os.environ.get("USE_GROUP_UNIQUE_TEACHER_TOPK", "0") == "1":
+                if use_group_unique_teacher:
                     teacher_positive_mask = (teacher_target_full > 0)
 
                     teacher_topk_mask = build_group_unique_topk_mask_from_scores(
@@ -1415,7 +1432,22 @@ def train_mssubsetnet():
                 teacher_topk_mask = None
 
             if torch.is_tensor(selector_pos_label):
-                teacher_topk_mask = selector_pos_label
+                if use_group_unique_teacher:
+                    selector_positive_mask = selector_pos_label > 0
+                    unique_selector_pos = build_group_unique_topk_mask_from_scores(
+                        selector_pos_label.float(),
+                        formulae_mask=teacher_formula_mask,
+                        group_id=batch.get("formulae_instance_group_id", None),
+                        topk=teacher_topk_for_train,
+                        candidate_mask=selector_positive_mask,
+                    )
+                    teacher_topk_mask = (
+                        unique_selector_pos
+                        if torch.is_tensor(unique_selector_pos)
+                        else selector_pos_label
+                    )
+                else:
+                    teacher_topk_mask = selector_pos_label
                 teacher_topk_probs = None
 
             true_official_dense = build_true_official_dense_for_batch(
@@ -1861,7 +1893,7 @@ def train_mssubsetnet():
                             formulae_mask=batch.get('formulae_mask', None),
                         )
 
-                    if os.environ.get("USE_GROUP_UNIQUE_MODEL_TOPK", "0") == "1":
+                    if use_group_unique_model:
                         model_topk_mask_train = build_group_unique_topk_mask_from_scores(
                             selector_logits_for_topk,
                             formulae_mask=batch.get('formulae_mask', None),
@@ -1890,7 +1922,7 @@ def train_mssubsetnet():
                         keep_topk=selector_topk,
                         fill_scores=selector_logits_for_topk.detach(),
                         group_id=batch.get("formulae_instance_group_id", None),
-                        group_unique=(os.environ.get("USE_GROUP_UNIQUE_PRUNE", "0") == "1"),
+                        group_unique=(use_group_unique_prune),
                     )
 
                     if torch.is_tensor(batch_rerank.get('teacher_formula_probs', None)):
@@ -2262,7 +2294,7 @@ def train_mssubsetnet():
                 teacher_topk_for_eval = int(teacher_topk_eval) if int(teacher_topk_eval) > 0 else int(model_topk_eval)
 
                 if torch.is_tensor(teacher_target_full):
-                    if os.environ.get("USE_GROUP_UNIQUE_TEACHER_TOPK", "0") == "1":
+                    if use_group_unique_teacher:
                         teacher_positive_mask = (teacher_target_full > 0)
 
                         teacher_topk_mask = build_group_unique_topk_mask_from_scores(
@@ -2299,7 +2331,22 @@ def train_mssubsetnet():
                     teacher_topk_mask = None
 
                 if torch.is_tensor(selector_pos_label):
-                    teacher_topk_mask = selector_pos_label
+                    if use_group_unique_teacher:
+                        selector_positive_mask = selector_pos_label > 0
+                        unique_selector_pos = build_group_unique_topk_mask_from_scores(
+                            selector_pos_label.float(),
+                            formulae_mask=teacher_formula_mask,
+                            group_id=batch.get("formulae_instance_group_id", None),
+                            topk=teacher_topk_for_eval,
+                            candidate_mask=selector_positive_mask,
+                        )
+                        teacher_topk_mask = (
+                            unique_selector_pos
+                            if torch.is_tensor(unique_selector_pos)
+                            else selector_pos_label
+                        )
+                    else:
+                        teacher_topk_mask = selector_pos_label
                     teacher_topk_probs = None
 
                 teacher_target_full = _renormalize_target_probs(
@@ -2657,7 +2704,7 @@ def train_mssubsetnet():
                             formulae_mask=batch.get('formulae_mask', None),
                         )
 
-                    if os.environ.get("USE_GROUP_UNIQUE_MODEL_TOPK", "0") == "1":
+                    if use_group_unique_model:
                         model_topk_mask = build_group_unique_topk_mask_from_scores(
                             selector_logits_for_topk,
                             formulae_mask=batch.get('formulae_mask', None),
@@ -2720,7 +2767,7 @@ def train_mssubsetnet():
                                 coverage_mask_k = torch.where(row_has_active, fm_active, fm_full)
 
                             group_id = None
-                            if os.environ.get("USE_GROUP_UNIQUE_MODEL_TOPK", "0") == "1":
+                            if use_group_unique_model:
                                 group_id = batch.get("formulae_instance_group_id", None)
 
                             topk_idx = coverage_aware_topk(
@@ -2738,7 +2785,7 @@ def train_mssubsetnet():
                                 selector_logits_for_topk,
                                 formulae_mask=coverage_mask_k,
                             )
-                        elif os.environ.get("USE_GROUP_UNIQUE_MODEL_TOPK", "0") == "1":
+                        elif use_group_unique_model:
                             selector_masks[k] = build_group_unique_topk_mask_from_scores(
                                 selector_logits_for_topk,
                                 formulae_mask=batch.get('formulae_mask', None),
@@ -2899,9 +2946,9 @@ def train_mssubsetnet():
                             "teacher_prob_n=", teacher_prob_n,
                             "teacher_topk_n=", teacher_topk_n,
                             "model_topk_n=", model_topk_n,
-                            "use_group_unique_teacher=", os.environ.get("USE_GROUP_UNIQUE_TEACHER_TOPK", "0"),
-                            "use_group_unique_model=", os.environ.get("USE_GROUP_UNIQUE_MODEL_TOPK", "0"),
-                            "use_group_unique_prune=", os.environ.get("USE_GROUP_UNIQUE_PRUNE", "0"),
+                            "use_group_unique_teacher=", str(int(bool(use_group_unique_teacher))),
+                            "use_group_unique_model=", str(int(bool(use_group_unique_model))),
+                            "use_group_unique_prune=", str(int(bool(use_group_unique_prune))),
                             flush=True,
                         )
                     # ========= ===================================================
@@ -2917,7 +2964,7 @@ def train_mssubsetnet():
                         keep_topk=model_topk_eval,
                         fill_scores=selector_logits_for_topk.detach(),
                         group_id=batch.get("formulae_instance_group_id", None),
-                        group_unique=(os.environ.get("USE_GROUP_UNIQUE_PRUNE", "0") == "1"),
+                        group_unique=(use_group_unique_prune),
                     )
                     if torch.is_tensor(batch_rerank.get('teacher_formula_probs', None)):
                         batch_rerank['teacher_formula_probs'] = _renormalize_target_probs(
@@ -3918,5 +3965,6 @@ def _save_training_curves(history, out_dir='outputs'):
 
 if __name__ == '__main__':
     train_mssubsetnet()
+
 
 
