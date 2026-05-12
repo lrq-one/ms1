@@ -281,9 +281,13 @@ def apply_teacher_topk_to_target(
 ):
     """
     Keep only target topK and renormalize.
+
+    Returns:
+        topk_probs: [B, M]
+        topk_mask:  [B, M]
     """
     if not torch.is_tensor(target_probs):
-        return target_probs
+        return target_probs, None
 
     target = target_probs.float()
 
@@ -294,7 +298,9 @@ def apply_teacher_topk_to_target(
 
     if torch.is_tensor(formulae_mask):
         fm = formulae_mask.float().to(device=target.device)
-        if fm.dim() > 2:
+        if fm.dim() == 1:
+            fm = fm.unsqueeze(0)
+        elif fm.dim() > 2:
             fm = fm.reshape(fm.shape[0], -1)
 
         use_b = min(int(target.shape[0]), int(fm.shape[0]))
@@ -306,6 +312,9 @@ def apply_teacher_topk_to_target(
     else:
         fm = torch.ones_like(target)
 
+    if target.numel() <= 0 or int(target.shape[1]) <= 0:
+        return target, torch.zeros_like(target)
+
     k = max(1, min(int(topk), int(target.shape[1])))
 
     masked = target.masked_fill(fm <= 0.5, 0.0)
@@ -313,10 +322,12 @@ def apply_teacher_topk_to_target(
 
     keep = torch.zeros_like(masked)
     keep.scatter_(1, idx, 1.0)
+    keep = keep * (fm > 0.5).float()
 
     out = masked * keep
-    return _normalize_target_probs(out, fm, eps=eps)
+    out = _normalize_target_probs(out, fm, eps=eps)
 
+    return out, keep
 
 def compute_formula_target_probs_from_batch(
     batch,
@@ -346,7 +357,13 @@ def compute_formula_target_probs_from_batch(
             tk = int(os.environ.get("TARGET_SUPPORT_TOPK", str(support_topk)))
         except Exception:
             tk = int(support_topk)
-        return apply_teacher_topk_to_target(teacher, formulae_mask=formulae_mask, topk=tk, eps=eps)
+        teacher_topk, _ = apply_teacher_topk_to_target(
+            teacher,
+            formulae_mask=formulae_mask,
+            topk=tk,
+            eps=eps,
+        )
+        return teacher_topk
 
     off_idx = _get_formulae_official_idx_from_batch(batch)
     off_int = get_formulae_official_intensity_from_batch(batch)
@@ -453,6 +470,11 @@ def compute_formula_target_probs_from_batch(
         topk = int(support_topk)
 
     if topk > 0:
-        target = apply_teacher_topk_to_target(target, formulae_mask=fm, topk=topk, eps=eps)
+        target, _ = apply_teacher_topk_to_target(
+            target,
+            formulae_mask=fm,
+            topk=topk,
+            eps=eps,
+        )
 
     return target
