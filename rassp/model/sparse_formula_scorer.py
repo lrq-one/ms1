@@ -421,6 +421,82 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
         p_sparse = p_sparse / denom.clamp_min(1e-8)
         return p_sparse
 
+    def _selector_logits_to_formula_probs(
+        self,
+        selector_logits,
+        formulae_mask,
+        kwargs,
+        batch_n,
+        formula_n,
+        device,
+    ):
+        """
+        FraGNNet-lite path:
+        Convert selector logits into a probability distribution over all valid candidates.
+        """
+        if not torch.is_tensor(selector_logits):
+            return None
+
+        logits = selector_logits.float()
+
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+        elif logits.dim() > 2:
+            logits = logits.reshape(logits.shape[0], -1)
+
+        use_b = min(int(logits.shape[0]), int(batch_n))
+        use_m = min(int(logits.shape[1]), int(formula_n))
+        logits = logits[:use_b, :use_m]
+
+        if torch.is_tensor(formulae_mask):
+            fm = formulae_mask.float()
+            if fm.dim() == 1:
+                fm = fm.unsqueeze(0)
+            elif fm.dim() > 2:
+                fm = fm.reshape(fm.shape[0], -1)
+
+            mask = torch.zeros_like(logits)
+            mb = min(use_b, int(fm.shape[0]))
+            mm = min(use_m, int(fm.shape[1]))
+            mask[:mb, :mm] = fm[:mb, :mm].to(device=logits.device, dtype=logits.dtype)
+        else:
+            mask = torch.ones_like(logits)
+
+        valid = mask > 0.5
+        logits = logits.masked_fill(~valid, _neg_mask_fill_value(logits))
+
+        try:
+            temp = float(os.environ.get("SELECTOR_PROB_TEMP", "1.0"))
+        except Exception:
+            temp = 1.0
+        temp = max(temp, 1e-6)
+        logits = logits / temp
+
+        group_id = self._get_group_ids_for_candidates(
+            kwargs=kwargs,
+            batch_n=use_b,
+            formula_n=use_m,
+            device=logits.device,
+        )
+
+        if torch.is_tensor(group_id) and os.environ.get("USE_GROUPMAX_PROB", "1") == "1":
+            probs = self._groupmax_softmax_to_instance_probs(
+                scores=logits,
+                formulae_mask=mask,
+                group_id=group_id,
+            )
+        else:
+            probs = torch.softmax(logits, dim=1)
+            probs = probs * valid.float()
+            probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+        probs = torch.where(torch.isfinite(probs), probs, torch.zeros_like(probs))
+        probs = probs.clamp_min(0.0)
+        probs = probs * valid.float()
+        probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+        return probs
+
     def _get_group_ids_for_candidates(self, kwargs, batch_n, formula_n, device):
         """
         Return [B, M] group ids.
@@ -1027,6 +1103,121 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
                 "fragment_node_logits": fragment_node_logits,
                 "fn_based_formula_logits": fn_based_formula_logits,
             }
+
+        use_selector_prob_spectrum = os.environ.get("USE_SELECTOR_PROB_SPECTRUM", "0") == "1"
+        if use_selector_prob_spectrum:
+            selector_probs = self._selector_logits_to_formula_probs(
+                selector_logits=selector_logits,
+                formulae_mask=formulae_mask,
+                kwargs=kwargs,
+                batch_n=batch_n,
+                formula_n=formula_n,
+                device=device,
+            )
+
+            if torch.is_tensor(selector_probs):
+                formulae_probs = selector_probs
+                formulae_probs_render = formulae_probs
+
+                if not self.training:
+                    formulae_probs_render = self._sparsify_formula_probs_for_render(
+                        formulae_probs_render,
+                        formulae_mask=formulae_mask,
+                    )
+
+                spect_bin_n = self.spect_bin.get_num_bins()
+                spect_out = project_formula_probs_to_spectrum_dense(
+                    formulae_probs_render,
+                    formulae_peaks_mass_idx,
+                    formulae_peaks_intensity,
+                    spect_bin_n,
+                    formulae_mask=formulae_mask,
+                    mass_shift_probs=None,
+                    mass_shift_offsets=None,
+                )
+
+                official_bin_width = float(os.environ.get("OFFICIAL_BIN_WIDTH", "0.01"))
+                official_max_mz = float(os.environ.get("OFFICIAL_MAX_MZ", "1005.0"))
+                official_bin_n = int(np.floor(official_max_mz / official_bin_width)) + 1
+
+                official_idx_for_render = self._coerce_peak_tensor(
+                    kwargs.get('formulae_peaks_official_idx', None),
+                    batch_n=batch_n,
+                    formula_n=formula_n,
+                    device=device,
+                    dtype=torch.long,
+                    fill_value=-1,
+                )
+                official_int_for_render = self._coerce_peak_tensor(
+                    kwargs.get('formulae_peaks_official_intensity', None),
+                    batch_n=batch_n,
+                    formula_n=formula_n,
+                    device=device,
+                    dtype=torch.float32,
+                    fill_value=0.0,
+                )
+
+                if official_idx_for_render is None or official_int_for_render is None:
+                    official_idx_for_render = self._coerce_peak_tensor(
+                        kwargs.get('formulae_peaks_official_idx_agg', None),
+                        batch_n=batch_n,
+                        formula_n=formula_n,
+                        device=device,
+                        dtype=torch.long,
+                        fill_value=-1,
+                    )
+                    official_int_for_render = self._coerce_peak_tensor(
+                        kwargs.get('formulae_peaks_official_intensity_agg', None),
+                        batch_n=batch_n,
+                        formula_n=formula_n,
+                        device=device,
+                        dtype=torch.float32,
+                        fill_value=0.0,
+                    )
+
+                if official_idx_for_render is None or official_int_for_render is None:
+                    official_idx_for_render = formulae_peaks_mass_idx
+                    official_int_for_render = formulae_peaks_intensity
+
+                spect_out_official = project_formula_probs_to_spectrum_dense(
+                    formulae_probs_render,
+                    official_idx_for_render,
+                    official_int_for_render,
+                    official_bin_n,
+                    formulae_mask=formulae_mask,
+                    mass_shift_probs=None,
+                    mass_shift_offsets=None,
+                )
+
+                if os.environ.get('OFFICIAL_EXCLUDE_PRECURSOR', '1') == '1':
+                    spect_out_official = self._zero_precursor_bin_dense(
+                        spect_out_official,
+                        kwargs.get('precursor_mz', None),
+                        official_bin_width,
+                    )
+
+                if self.normalize_1_output:
+                    spect_out = spect_out / (torch.sum(torch.abs(spect_out), dim=1, keepdim=True) + 1e-6)
+                    spect_out_official = spect_out_official / (torch.sum(torch.abs(spect_out_official), dim=1, keepdim=True) + 1e-6)
+
+                return {
+                    "spect_out": spect_out,
+                    "spect": spect_out,
+                    "spect_out_coarse": spect_out,
+                    "spect_out_official": spect_out_official,
+                    "formulae_probs": formulae_probs,
+                    "formulae_probs_render": formulae_probs_render,
+                    "formulae_scores": selector_logits,
+                    "formulae_scores_raw": selector_logits,
+                    "formulae_scores_raw_setwise": selector_logits,
+                    "formulae_scores_train": selector_logits,
+                    "selector_logits": selector_logits,
+                    "selector_probs": selector_probs,
+                    "precursor_logit": precursor_logit,
+                    "precursor_prob": precursor_prob,
+                    "fragment_node_logits": fragment_node_logits,
+                    "fn_based_formula_logits": fn_based_formula_logits,
+                }
 
         mask3 = formulae_mask.unsqueeze(-1)
         mask3_sum = mask3.sum(dim=1, keepdim=True).clamp_min(1.0)

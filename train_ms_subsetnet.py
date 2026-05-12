@@ -967,6 +967,7 @@ def train_mssubsetnet():
     teacher_topk_train = max(0, int(os.environ.get('TEACHER_TOPK_TRAIN', str(selector_topk))))
     teacher_topk_eval = max(0, int(os.environ.get('TEACHER_TOPK_EVAL', str(selector_topk))))
     model_topk_eval = max(1, int(os.environ.get('MODEL_TOPK_EVAL', str(selector_topk))))
+    use_selector_prob_spectrum = os.environ.get("USE_SELECTOR_PROB_SPECTRUM", "0") == "1"
 
     selector_loss_weight = max(0.0, float(os.environ.get('SELECTOR_LOSS_WEIGHT', '1.0')))
     selector_pos_weight = max(1.0, float(os.environ.get('SELECTOR_POS_WEIGHT', '4.0')))
@@ -1097,6 +1098,7 @@ def train_mssubsetnet():
     log(f'馃З teacher_topk_train={teacher_topk_train}')
     log(f'馃З teacher_topk_eval={teacher_topk_eval}')
     log(f'馃З selector_topk={selector_topk} model_topk_eval={model_topk_eval}')
+    log(f'馃З use_selector_prob_spectrum={int(use_selector_prob_spectrum)}')
     log(
         f'馃З step_limits: '
         f'train={max_train_steps if max_train_steps is not None else "<full>"} '
@@ -2028,7 +2030,55 @@ def train_mssubsetnet():
                 # Optional Stage 1: selector-only training.
                 # In this stage, do NOT run rerank / official projection / peak / OOS.
                 # ============================================================
-                if bool(train_selector_only_stage):
+                if bool(use_selector_prob_spectrum):
+                    rerank_teacher_ratio = 0.0
+
+                    pred_spect_coarse = res['spect'] if isinstance(res, dict) else res
+                    pred_spect_official = res.get('spect_out_official', None) if isinstance(res, dict) else None
+
+                    main_candidate_kl = selector_loss.new_zeros(())
+                    rerank_kl = selector_loss.new_zeros(())
+                    rerank_bce = selector_loss.new_zeros(())
+                    official_spectral_loss = selector_loss.new_zeros(())
+                    peak_aux_loss = selector_loss.new_zeros(())
+                    oos_loss = selector_loss.new_zeros(())
+                    formula_entropy_loss = selector_loss.new_zeros(())
+                    false_support_loss = selector_loss.new_zeros(())
+
+                    if torch.is_tensor(pred_spect_official) and torch.is_tensor(true_official_dense):
+                        official_spectral_loss = compute_official_dense_spectral_loss(
+                            pred_spect_official,
+                            true_official_dense,
+                            kl_weight=float(os.environ.get("OFFICIAL_DENSE_KL_WEIGHT", str(official_spectral_kl_weight))),
+                        )
+                        false_support_loss = _false_support_mass_loss_dense(
+                            pred_spect_official,
+                            true_official_dense,
+                        )
+                        if not torch.is_tensor(false_support_loss):
+                            false_support_loss = pred_spect_coarse.sum() * 0.0
+                    else:
+                        official_spectral_loss = pred_spect_coarse.sum() * 0.0
+                        false_support_loss = pred_spect_coarse.sum() * 0.0
+
+                    loss = selector_loss.new_zeros(())
+                    if float(official_spectral_loss_weight) > 0.0:
+                        loss = loss + float(official_spectral_loss_weight) * official_spectral_loss
+
+                    if float(formula_entropy_loss_weight) > 0.0:
+                        formulae_scores = _get_reranker_scores_from_res(res)
+                        formula_entropy_loss = _masked_formula_entropy_loss(
+                            formulae_scores,
+                            batch.get('formulae_mask', None),
+                        )
+                        if not torch.is_tensor(formula_entropy_loss):
+                            formula_entropy_loss = pred_spect_coarse.sum() * 0.0
+                        loss = loss + float(formula_entropy_loss_weight) * formula_entropy_loss
+
+                    if epoch >= precursor_loss_start_epoch and precursor_loss_weight > 0:
+                        loss = loss + float(precursor_loss_weight) * precursor_loss
+
+                elif bool(train_selector_only_stage):
                     rerank_teacher_ratio = 1.0
 
                     main_candidate_kl = selector_loss.new_zeros(())
@@ -3221,58 +3271,91 @@ def train_mssubsetnet():
                     # ========= ===================================================
                     # PASS 2: model-top64 reranker
                     # ============================================================
-                    batch_with_teacher = dict(batch)
-                    if torch.is_tensor(teacher_target_full):
-                        batch_with_teacher['teacher_formula_probs'] = teacher_target_full
+                    if bool(use_selector_prob_spectrum):
+                        pred_spect_coarse = res['spect'] if isinstance(res, dict) else res
+                        pred_spect_official = res.get('spect_out_official', None) if isinstance(res, dict) else None
 
-                    batch_rerank = _prune_batch_by_candidate_mask(
-                        batch_with_teacher,
-                        model_topk_mask,
-                        keep_topk=model_topk_eval,
-                        fill_scores=selector_logits_for_topk.detach(),
-                        group_id=batch.get("formulae_instance_group_id", None),
-                        group_unique=(use_group_unique_prune),
-                    )
-                    if torch.is_tensor(batch_rerank.get('teacher_formula_probs', None)):
-                        batch_rerank['teacher_formula_probs'] = _renormalize_target_probs(
-                            batch_rerank.get('teacher_formula_probs', None),
+                        formulae_scores = _get_reranker_scores_from_res(res)
+                        val_formula_entropy = _masked_formula_entropy_loss(
+                            formulae_scores,
+                            batch.get('formulae_mask', None),
+                        )
+                        if not torch.is_tensor(val_formula_entropy):
+                            val_formula_entropy = pred_spect_coarse.sum() * 0.0
+
+                        if torch.is_tensor(pred_spect_official) and torch.is_tensor(true_official_dense):
+                            val_official_spectral = compute_official_dense_spectral_loss(
+                                pred_spect_official,
+                                true_official_dense,
+                                kl_weight=float(os.environ.get("OFFICIAL_DENSE_KL_WEIGHT", str(official_spectral_kl_weight))),
+                            )
+                            val_false_support = _false_support_mass_loss_dense(
+                                pred_spect_official,
+                                true_official_dense,
+                            )
+                            if not torch.is_tensor(val_false_support):
+                                val_false_support = pred_spect_coarse.sum() * 0.0
+                        else:
+                            val_official_spectral = pred_spect_coarse.sum() * 0.0
+                            val_false_support = pred_spect_coarse.sum() * 0.0
+
+                        val_rerank_kl = pred_spect_coarse.sum() * 0.0
+                        val_rerank_bce = pred_spect_coarse.sum() * 0.0
+                        val_rerank_loss = pred_spect_coarse.sum() * 0.0
+                    else:
+                        batch_with_teacher = dict(batch)
+                        if torch.is_tensor(teacher_target_full):
+                            batch_with_teacher['teacher_formula_probs'] = teacher_target_full
+
+                        batch_rerank = _prune_batch_by_candidate_mask(
+                            batch_with_teacher,
+                            model_topk_mask,
+                            keep_topk=model_topk_eval,
+                            fill_scores=selector_logits_for_topk.detach(),
+                            group_id=batch.get("formulae_instance_group_id", None),
+                            group_unique=(use_group_unique_prune),
+                        )
+                        if torch.is_tensor(batch_rerank.get('teacher_formula_probs', None)):
+                            batch_rerank['teacher_formula_probs'] = _renormalize_target_probs(
+                                batch_rerank.get('teacher_formula_probs', None),
+                                batch_rerank.get('formulae_mask', None),
+                            )
+
+                        res = model(**batch_rerank)
+                        pred_spect_coarse = res['spect'] if isinstance(res, dict) else res
+                        pred_spect_official = res.get('spect_out_official', None) if isinstance(res, dict) else None
+
+                        formulae_scores = _get_reranker_scores_from_res(res)
+                        val_formula_entropy = _masked_formula_entropy_loss(
+                            formulae_scores,
                             batch_rerank.get('formulae_mask', None),
                         )
+                        if not torch.is_tensor(val_formula_entropy):
+                            val_formula_entropy = pred_spect_coarse.sum() * 0.0
 
-                    res = model(**batch_rerank)
-                    pred_spect_coarse = res['spect'] if isinstance(res, dict) else res
-                    pred_spect_official = res.get('spect_out_official', None) if isinstance(res, dict) else None
-
-                    formulae_scores = _get_reranker_scores_from_res(res)
-                    val_formula_entropy = _masked_formula_entropy_loss(
-                        formulae_scores,
-                        batch_rerank.get('formulae_mask', None),
-                    )
-                    if not torch.is_tensor(val_formula_entropy):
-                        val_formula_entropy = pred_spect_coarse.sum() * 0.0
-
-                    if torch.is_tensor(pred_spect_official) and torch.is_tensor(true_official_dense):
-                        val_official_spectral = compute_official_dense_spectral_loss(
-                            pred_spect_official,
-                            true_official_dense,
-                            kl_weight=official_spectral_kl_weight,
-                        )
-                        val_false_support = _false_support_mass_loss_dense(
-                            pred_spect_official,
-                            true_official_dense,
-                        )
-                        if not torch.is_tensor(val_false_support):
+                        if torch.is_tensor(pred_spect_official) and torch.is_tensor(true_official_dense):
+                            val_official_spectral = compute_official_dense_spectral_loss(
+                                pred_spect_official,
+                                true_official_dense,
+                                kl_weight=official_spectral_kl_weight,
+                            )
+                            val_false_support = _false_support_mass_loss_dense(
+                                pred_spect_official,
+                                true_official_dense,
+                            )
+                            if not torch.is_tensor(val_false_support):
+                                val_false_support = pred_spect_coarse.sum() * 0.0
+                        else:
+                            val_official_spectral = pred_spect_coarse.sum() * 0.0
                             val_false_support = pred_spect_coarse.sum() * 0.0
-                    else:
-                        val_official_spectral = pred_spect_coarse.sum() * 0.0
-                        val_false_support = pred_spect_coarse.sum() * 0.0
 
 
                 rerank_logits_pool = res.get('rerank_logits_pool', None)
                 pool_idx = res.get('selector_pool_idx', None)
-                val_rerank_kl = pred_spect_coarse.sum() * 0.0
-                val_rerank_bce = pred_spect_coarse.sum() * 0.0
-                val_rerank_loss = pred_spect_coarse.sum() * 0.0
+                if not bool(use_selector_prob_spectrum):
+                    val_rerank_kl = pred_spect_coarse.sum() * 0.0
+                    val_rerank_bce = pred_spect_coarse.sum() * 0.0
+                    val_rerank_loss = pred_spect_coarse.sum() * 0.0
 
                 if torch.is_tensor(rerank_logits_pool) and torch.is_tensor(pool_idx):
                     formulae_mask_rerank = batch_rerank.get('formulae_mask', None)
@@ -3333,49 +3416,63 @@ def train_mssubsetnet():
 
                     val_rerank_loss = float(rerank_kl_weight) * val_rerank_kl + float(rerank_bce_weight) * val_rerank_bce
 
-                val_main_kl = val_rerank_loss
-
-                val_peak_aux = _compute_peak_aux_loss_from_batch(
-                    batch_rerank,
-                    res if isinstance(res, dict) else {},
-                    official_bin_width=official_metric_cfg['bin_width'],
-                    official_max_mz=official_metric_cfg['max_mz'],
-                )
-                if (not torch.is_tensor(val_peak_aux)) or (not torch.isfinite(val_peak_aux)):
+                if bool(use_selector_prob_spectrum):
+                    val_main_kl = pred_spect_coarse.sum() * 0.0
                     val_peak_aux = pred_spect_coarse.sum() * 0.0
-
-                val_oos = _compute_oos_loss_from_batch(
-                    batch_rerank,
-                    res if isinstance(res, dict) else {},
-                    official_bin_width=official_metric_cfg['bin_width'],
-                    official_max_mz=official_metric_cfg['max_mz'],
-                )
-                if not torch.is_tensor(val_oos):
                     val_oos = pred_spect_coarse.sum() * 0.0
+                else:
+                    val_main_kl = val_rerank_loss
 
-                val_loss = float(selector_loss_weight) * val_selector_loss
+                    val_peak_aux = _compute_peak_aux_loss_from_batch(
+                        batch_rerank,
+                        res if isinstance(res, dict) else {},
+                        official_bin_width=official_metric_cfg['bin_width'],
+                        official_max_mz=official_metric_cfg['max_mz'],
+                    )
+                    if (not torch.is_tensor(val_peak_aux)) or (not torch.isfinite(val_peak_aux)):
+                        val_peak_aux = pred_spect_coarse.sum() * 0.0
 
-                if epoch >= precursor_loss_start_epoch and precursor_loss_weight > 0:
-                    val_loss = val_loss + float(precursor_loss_weight) * val_precursor_loss
+                    val_oos = _compute_oos_loss_from_batch(
+                        batch_rerank,
+                        res if isinstance(res, dict) else {},
+                        official_bin_width=official_metric_cfg['bin_width'],
+                        official_max_mz=official_metric_cfg['max_mz'],
+                    )
+                    if not torch.is_tensor(val_oos):
+                        val_oos = pred_spect_coarse.sum() * 0.0
 
-                if os.environ.get("TRAIN_FRAGMENT_NODE_SELECTOR", "0") == "1":
-                    val_loss = val_loss + float(os.environ.get("FN_LOSS_WEIGHT", "1.0")) * val_fn_loss
+                if bool(use_selector_prob_spectrum):
+                    val_loss = val_selector_loss.new_zeros(())
+                    if epoch >= precursor_loss_start_epoch and precursor_loss_weight > 0:
+                        val_loss = val_loss + float(precursor_loss_weight) * val_precursor_loss
+                    if formula_entropy_loss_weight > 0:
+                        val_loss = val_loss + float(formula_entropy_loss_weight) * val_formula_entropy
+                    if official_spectral_loss_weight > 0:
+                        val_loss = val_loss + float(official_spectral_loss_weight) * val_official_spectral
+                else:
+                    val_loss = float(selector_loss_weight) * val_selector_loss
 
-                if epoch >= selector_only_warmup_epochs:
-                    val_loss = val_loss + float(main_candidate_kl_weight) * val_main_kl
+                    if epoch >= precursor_loss_start_epoch and precursor_loss_weight > 0:
+                        val_loss = val_loss + float(precursor_loss_weight) * val_precursor_loss
 
-                if epoch >= selector_only_warmup_epochs and formula_entropy_loss_weight > 0:
-                    val_loss = val_loss + float(formula_entropy_loss_weight) * val_formula_entropy
-                if epoch >= spectral_loss_start_epoch and false_support_loss_weight > 0:
-                    val_loss = val_loss + float(false_support_loss_weight) * val_false_support
-                if epoch >= spectral_loss_start_epoch and official_spectral_loss_weight > 0:
-                    val_loss = val_loss + float(official_spectral_loss_weight) * val_official_spectral
+                    if os.environ.get("TRAIN_FRAGMENT_NODE_SELECTOR", "0") == "1":
+                        val_loss = val_loss + float(os.environ.get("FN_LOSS_WEIGHT", "1.0")) * val_fn_loss
 
-                if epoch >= peak_aux_start_epoch and peak_aux_loss_weight > 0:
-                    val_loss = val_loss + float(peak_aux_loss_weight) * val_peak_aux
+                    if epoch >= selector_only_warmup_epochs:
+                        val_loss = val_loss + float(main_candidate_kl_weight) * val_main_kl
 
-                if epoch >= oos_loss_start_epoch and oos_loss_weight > 0:
-                    val_loss = val_loss + float(oos_loss_weight) * val_oos
+                    if epoch >= selector_only_warmup_epochs and formula_entropy_loss_weight > 0:
+                        val_loss = val_loss + float(formula_entropy_loss_weight) * val_formula_entropy
+                    if epoch >= spectral_loss_start_epoch and false_support_loss_weight > 0:
+                        val_loss = val_loss + float(false_support_loss_weight) * val_false_support
+                    if epoch >= spectral_loss_start_epoch and official_spectral_loss_weight > 0:
+                        val_loss = val_loss + float(official_spectral_loss_weight) * val_official_spectral
+
+                    if epoch >= peak_aux_start_epoch and peak_aux_loss_weight > 0:
+                        val_loss = val_loss + float(peak_aux_loss_weight) * val_peak_aux
+
+                    if epoch >= oos_loss_start_epoch and oos_loss_weight > 0:
+                        val_loss = val_loss + float(oos_loss_weight) * val_oos
 
                 pred_spect_for_metric = pred_spect_official if torch.is_tensor(pred_spect_official) else pred_spect_coarse
 

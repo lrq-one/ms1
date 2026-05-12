@@ -252,3 +252,93 @@ def compute_selector_utility_target_loss(
         return selector_logits.new_tensor(0.0)
 
     return torch.stack(losses).mean()
+
+
+def build_selector_utility_tensors(
+    selector_logits,
+    batch,
+    eps=1e-8,
+):
+    """
+    Compatibility shim for older imports.
+
+    Returns:
+        utility: [B, M]
+        target_dist: [B, M]
+    """
+    if selector_logits is None or not torch.is_tensor(selector_logits):
+        return None, None
+
+    formulae_mask = batch.get("formulae_mask", None)
+    cand_idx = batch.get("formulae_peaks_official_idx", None)
+    cand_int = batch.get("formulae_peaks_official_intensity", None)
+
+    true_idx_obj = batch.get("true_all_official_idx", None)
+    if true_idx_obj is None:
+        true_idx_obj = batch.get("true_official_idx", None)
+
+    if cand_idx is None or cand_int is None or true_idx_obj is None:
+        return None, None
+
+    if not torch.is_tensor(cand_idx) or not torch.is_tensor(cand_int):
+        return None, None
+
+    if cand_idx.dim() != 3 or cand_int.dim() != 3:
+        return None, None
+
+    device = selector_logits.device
+    B, M = selector_logits.shape[:2]
+
+    if formulae_mask is None or not torch.is_tensor(formulae_mask):
+        formulae_mask = torch.ones_like(selector_logits, dtype=torch.float32, device=device)
+    else:
+        formulae_mask = formulae_mask.float().to(device)
+
+    try:
+        lambda_false = float(os.environ.get("SELECTOR_UTILITY_FALSE_LAMBDA", "0.25"))
+    except Exception:
+        lambda_false = 0.25
+
+    try:
+        gamma = float(os.environ.get("SELECTOR_UTILITY_GAMMA", "1.0"))
+    except Exception:
+        gamma = 1.0
+
+    utility = torch.zeros((B, M), dtype=torch.float32, device=device)
+
+    for b in range(B):
+        if torch.is_tensor(true_idx_obj):
+            t = true_idx_obj[b].detach().to(device).long().reshape(-1)
+        else:
+            try:
+                t = torch.as_tensor(true_idx_obj[b], dtype=torch.long, device=device).reshape(-1)
+            except Exception:
+                continue
+
+        t = t[t >= 0]
+        if t.numel() == 0:
+            continue
+
+        idx_b = cand_idx[b].to(device).long()
+        int_b = cand_int[b].to(device).float()
+
+        valid = (idx_b >= 0) & torch.isfinite(int_b) & (int_b > 0)
+        total_mass = torch.where(valid, int_b, torch.zeros_like(int_b)).sum(dim=1)
+
+        hit = valid & torch.isin(idx_b, t)
+        hit_mass = torch.where(hit, int_b, torch.zeros_like(int_b)).sum(dim=1)
+
+        hit_share = hit_mass / total_mass.clamp_min(eps)
+        false_share = 1.0 - hit_share
+
+        util_b = hit_share - float(lambda_false) * false_share
+        util_b = torch.clamp(util_b, min=0.0)
+        if gamma != 1.0:
+            util_b = torch.pow(util_b.clamp_min(0.0), gamma)
+        util_b = util_b * torch.log1p(hit_mass)
+        utility[b] = util_b * formulae_mask[b].float()
+
+    target_dist = utility.clamp_min(0.0)
+    target_dist = target_dist / target_dist.sum(dim=1, keepdim=True).clamp_min(eps)
+
+    return utility, target_dist
