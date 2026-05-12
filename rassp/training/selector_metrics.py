@@ -536,6 +536,15 @@ def _mask_ratio_in_topk(source_mask, topk_mask):
     return float(ratio.mean().detach().cpu().item())
 
 
+build_group_unique_topk_mask_from_scores = _build_group_unique_topk_mask_from_scores
+build_mask_from_topk_indices = _build_mask_from_topk_indices
+build_topk_mask_from_scores = _build_topk_mask_from_scores
+build_true_official_dense_for_batch = _build_true_official_dense_for_batch
+mask_precision = _mask_precision
+mask_ratio_in_topk = _mask_ratio_in_topk
+mask_recall = _mask_recall
+
+
 def select_model_topk_indices(
     selector_logits,
     batch,
@@ -627,3 +636,85 @@ def compute_selected_support_metrics(topk_idx, batch, eps=1e-8):
         "selected_true_hit_mass": float(torch.stack(true_mass_list).mean().detach().cpu().item()),
         "selected_false_mass": float(torch.stack(false_mass_list).mean().detach().cpu().item()),
     }
+
+
+def compute_selector_eval_pack(
+    selector_logits,
+    batch,
+    formulae_mask=None,
+    teacher_mask=None,
+    active_mask=None,
+    topk_list=(32, 64, 128, 256),
+    use_group_unique=False,
+    use_coverage=False,
+):
+    """
+    High-level selector eval wrapper.
+
+    This keeps train_ms_subsetnet.py from depending on private mask helpers.
+    """
+    out = {}
+
+    if selector_logits is None or not torch.is_tensor(selector_logits):
+        return out
+
+    if formulae_mask is None:
+        formulae_mask = batch.get("formulae_mask", None)
+
+    group_id = batch.get("formulae_instance_group_id", None)
+
+    for k in topk_list:
+        topk_idx = None
+        if use_coverage:
+            topk_idx = select_model_topk_indices(
+                selector_logits=selector_logits,
+                batch=batch,
+                k=int(k),
+                use_coverage=True,
+                use_group_unique=False,
+            )
+            pred_mask = _build_mask_from_topk_indices(
+                topk_idx,
+                selector_logits,
+                formulae_mask=formulae_mask,
+                candidate_mask=active_mask,
+            )
+        elif use_group_unique:
+            pred_mask = _build_group_unique_topk_mask_from_scores(
+                selector_logits,
+                formulae_mask=formulae_mask,
+                group_id=group_id,
+                topk=int(k),
+                candidate_mask=active_mask,
+            )
+        else:
+            pred_mask = _build_topk_mask_from_scores(
+                selector_logits,
+                formulae_mask=formulae_mask,
+                topk=int(k),
+                candidate_mask=active_mask,
+            )
+
+        if pred_mask is None:
+            continue
+
+        if torch.is_tensor(teacher_mask):
+            out[f"selector_recall@{k}"] = _mask_recall(pred_mask, teacher_mask)
+            out[f"selector_precision@{k}"] = _mask_precision(pred_mask, teacher_mask)
+
+        if topk_idx is None:
+            if torch.is_tensor(formulae_mask):
+                masked_logits = selector_logits.masked_fill(formulae_mask <= 0.5, -1e9)
+            else:
+                masked_logits = selector_logits
+            topk_idx = torch.topk(
+                masked_logits,
+                k=min(int(k), int(selector_logits.shape[1])),
+                dim=1,
+            ).indices
+
+        support_metrics = compute_selected_support_metrics(topk_idx, batch)
+        for kk, vv in support_metrics.items():
+            out[f"{kk}@{k}"] = vv
+
+    return out

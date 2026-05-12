@@ -78,6 +78,9 @@ def _build_true_official_dense_from_cached_sparse_batch(batch, batch_n, device, 
     return out, used_cache
 
 
+build_true_official_dense_from_cached_sparse_batch = _build_true_official_dense_from_cached_sparse_batch
+
+
 def _build_cached_true_top20_tensors(batch, batch_n, official_bin_n, device, default_k=20):
     k = max(1, int(default_k))
     out_idx = torch.full((int(batch_n), k), -1, dtype=torch.long, device=device)

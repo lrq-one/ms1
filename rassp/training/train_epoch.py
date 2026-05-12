@@ -3,9 +3,17 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from rassp.training.batch_utils import move_batch_to_device, prepare_batch_cpu
-from rassp.training.formula_targets import compute_formula_target_probs_from_batch
+from rassp.training.formula_targets import (
+    apply_teacher_topk_to_target,
+    compute_formula_target_probs_from_batch,
+)
 from rassp.training.logging_utils import MetricAccumulator
 from rassp.training.loss_utils import compute_precursor_loss_from_batch, masked_prob_kl
+from rassp.training.runtime_selector_targets import (
+    build_candidate_local_quality_target,
+    build_selector_teacher_dist_from_official_overlap,
+    build_selector_teacher_dist_setcover,
+)
 from rassp.training.selector_losses import (
     compute_selector_false_support_loss,
     compute_selector_utility_target_loss,

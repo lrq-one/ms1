@@ -5,6 +5,7 @@ from rassp.training.batch_utils import move_batch_to_device, prepare_batch_cpu
 from rassp.training.logging_utils import MetricAccumulator
 from rassp.training.official_metrics import compute_batch_official_metrics
 from rassp.training.selector_metrics import (
+    compute_selector_eval_pack,
     compute_selected_support_metrics,
     select_model_topk_indices,
 )
