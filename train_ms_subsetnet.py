@@ -1,4 +1,4 @@
-# Clean minimal training entry for current mainline
+﻿# Clean minimal training entry for current mainline
 # Focus: setwise scorer + candidate-local peak head
 # Objective: selector + rerank + spectral + peak + oos
 
