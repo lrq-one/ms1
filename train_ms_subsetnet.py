@@ -2733,6 +2733,29 @@ def train_mssubsetnet():
                             formulae_mask,
                             ks=k_list,
                         )
+                    if step == 1:
+                        if torch.is_tensor(topk_candidate_mask_val):
+                            print(
+                                "[ACTIVE_DEBUG]",
+                                "active_mean=",
+                                float(topk_candidate_mask_val.float().mean().detach().cpu().item()),
+                                "active_n=",
+                                float(topk_candidate_mask_val.float().sum(dim=1).mean().detach().cpu().item()),
+                                flush=True,
+                            )
+                        else:
+                            print("[ACTIVE_DEBUG] active_mask=None", flush=True)
+
+                    selector_eval = compute_selector_eval_pack(
+                        selector_logits=selector_logits_for_topk,
+                        batch=batch,
+                        formulae_mask=formulae_mask,
+                        teacher_mask=teacher_topk_mask,
+                        active_mask=topk_candidate_mask_val,
+                        topk_list=tuple(k_list),
+                        use_group_unique=use_group_unique_model,
+                        use_coverage=use_coverage_topk,
+                    )
                     for k in k_list:
                         topk_idx = select_model_topk_indices(
                             selector_logits=selector_logits_for_topk,
@@ -2783,10 +2806,16 @@ def train_mssubsetnet():
 
                     for k in k_list:
                         mask_k = selector_masks.get(k, None)
-                        rec_k = mask_recall(mask_k, teacher_topk_mask)
+                        rec_k = selector_eval.get(
+                            f'selector_recall@{k}',
+                            mask_recall(mask_k, teacher_topk_mask),
+                        )
                         prec_k = quality_metrics.get(
                             f'selector_precision_at_{k}',
-                            mask_precision(mask_k, teacher_topk_mask),
+                            selector_eval.get(
+                                f'selector_precision@{k}',
+                                mask_precision(mask_k, teacher_topk_mask),
+                            ),
                         )
                         q_mean_k = quality_metrics.get(
                             f'selector_quality_mean_at_{k}',
@@ -2802,35 +2831,39 @@ def train_mssubsetnet():
                             official_bin_width=official_metric_cfg['bin_width'],
                             official_max_mz=official_metric_cfg['max_mz'],
                         )
+                        selected_true_k = selector_eval.get(
+                            f'selected_true_hit_mass@{k}',
+                            stats_k.get('pred_int_on_true', float('nan')) if stats_k else float('nan'),
+                        )
+                        selected_false_k = selector_eval.get(
+                            f'selected_false_mass@{k}',
+                            stats_k.get('false_support', float('nan')) if stats_k else float('nan'),
+                        )
 
                         if k == 32:
                             val_selector_recall_32_vals.append(rec_k)
                             val_selector_precision_32_vals.append(prec_k)
                             val_selector_quality_mean_32_vals.append(q_mean_k)
-                            if stats_k:
-                                val_selected_true_hit_mass_32_vals.append(stats_k.get('pred_int_on_true', float('nan')))
-                                val_selected_false_mass_32_vals.append(stats_k.get('false_support', float('nan')))
+                            val_selected_true_hit_mass_32_vals.append(selected_true_k)
+                            val_selected_false_mass_32_vals.append(selected_false_k)
                         elif k == 64:
                             val_selector_recall_64_vals.append(rec_k)
                             val_selector_precision_64_vals.append(prec_k)
                             val_selector_quality_mean_64_vals.append(q_mean_k)
-                            if stats_k:
-                                val_selected_true_hit_mass_64_vals.append(stats_k.get('pred_int_on_true', float('nan')))
-                                val_selected_false_mass_64_vals.append(stats_k.get('false_support', float('nan')))
+                            val_selected_true_hit_mass_64_vals.append(selected_true_k)
+                            val_selected_false_mass_64_vals.append(selected_false_k)
                         elif k == 128:
                             val_selector_recall_128_vals.append(rec_k)
                             val_selector_precision_128_vals.append(prec_k)
                             val_selector_quality_mean_128_vals.append(q_mean_k)
-                            if stats_k:
-                                val_selected_true_hit_mass_128_vals.append(stats_k.get('pred_int_on_true', float('nan')))
-                                val_selected_false_mass_128_vals.append(stats_k.get('false_support', float('nan')))
+                            val_selected_true_hit_mass_128_vals.append(selected_true_k)
+                            val_selected_false_mass_128_vals.append(selected_false_k)
                         elif k == 256:
                             val_selector_recall_256_vals.append(rec_k)
                             val_selector_precision_256_vals.append(prec_k)
                             val_selector_quality_mean_256_vals.append(q_mean_k)
-                            if stats_k:
-                                val_selected_true_hit_mass_256_vals.append(stats_k.get('pred_int_on_true', float('nan')))
-                                val_selected_false_mass_256_vals.append(stats_k.get('false_support', float('nan')))
+                            val_selected_true_hit_mass_256_vals.append(selected_true_k)
+                            val_selected_false_mass_256_vals.append(selected_false_k)
 
                     if teacher_stats:
                         val_teacher_oracle_cos_vals.append(teacher_stats.get('official_cos', float('nan')))
@@ -3913,6 +3946,7 @@ def _save_training_curves(history, out_dir='outputs'):
 
 if __name__ == '__main__':
     train_mssubsetnet()
+
 
 
 
