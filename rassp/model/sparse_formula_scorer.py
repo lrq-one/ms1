@@ -1357,7 +1357,194 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
         refined_peak_intensity = refined_peak_intensity / refined_peak_intensity.sum(
             dim=-1, keepdim=True
         ).clamp_min(1e-8)
+        # ------------------------------------------------------------
+        # FraGNNet-lite final probability-spectrum branch.
+        #
+        # IMPORTANT:
+        # This branch must be placed AFTER peak_reweight_logits /
+        # peak_reweight_probs are computed, otherwise peak head cannot
+        # participate in spectrum rendering.
+        # ------------------------------------------------------------
+        if use_selector_prob_spectrum and torch.is_tensor(selector_prob_formulae_probs):
+            formulae_probs = selector_prob_formulae_probs
+            formulae_probs_render = self._sparsify_formula_probs_for_render(
+                formulae_probs,
+                formulae_mask=formulae_mask,
+            )
 
+            spect_bin_n = self.spect_bin.get_num_bins()
+
+            # ----- coarse spectrum render -----
+            coarse_int_for_prob = formulae_peaks_intensity
+
+            if (
+                use_peak_reweight_in_prob
+                and torch.is_tensor(refined_peak_intensity)
+                and torch.is_tensor(formulae_peaks_intensity)
+                and refined_peak_intensity.shape == formulae_peaks_intensity.shape
+            ):
+                coarse_int_for_prob = refined_peak_intensity
+            elif (
+                use_peak_reweight_in_prob
+                and torch.is_tensor(peak_intensity_for_render)
+                and torch.is_tensor(formulae_peaks_intensity)
+                and peak_intensity_for_render.shape == formulae_peaks_intensity.shape
+            ):
+                coarse_int_for_prob = peak_intensity_for_render
+
+            spect_out = project_formula_probs_to_spectrum_dense(
+                formulae_probs_render,
+                formulae_peaks_mass_idx,
+                coarse_int_for_prob,
+                spect_bin_n,
+                formulae_mask=formulae_mask,
+                mass_shift_probs=None,
+                mass_shift_offsets=None,
+            )
+
+            # ----- official spectrum render -----
+            # Peak head was computed from peak_idx_for_head / peak_int_for_head,
+            # so for official render this is the most aligned pair.
+            official_idx_for_prob = peak_idx_for_head
+            official_int_for_prob = peak_int_for_head
+
+            if (
+                use_peak_reweight_in_prob
+                and torch.is_tensor(refined_peak_intensity)
+                and torch.is_tensor(peak_int_for_head)
+                and refined_peak_intensity.shape == peak_int_for_head.shape
+            ):
+                official_int_for_prob = refined_peak_intensity
+
+            spect_out_official = project_formula_probs_to_spectrum_dense(
+                formulae_probs_render,
+                official_idx_for_prob,
+                official_int_for_prob,
+                official_bin_n,
+                formulae_mask=formulae_mask,
+                mass_shift_probs=None,
+                mass_shift_offsets=None,
+            )
+
+            spect_out_official_formula = spect_out_official
+
+            if os.environ.get('OFFICIAL_EXCLUDE_PRECURSOR', '1') == '1':
+                spect_out_official = self._zero_precursor_bin_dense(
+                    spect_out_official,
+                    kwargs.get('precursor_mz', None),
+                    official_bin_width,
+                )
+
+            if self.normalize_1_output:
+                spect_out = spect_out / (
+                    torch.sum(torch.abs(spect_out), dim=1, keepdim=True) + 1e-6
+                )
+                spect_out_official = spect_out_official / (
+                    torch.sum(torch.abs(spect_out_official), dim=1, keepdim=True) + 1e-6
+                )
+
+            # Optional exact sparse peaks. Keep it simple in first version.
+            pred_exact_peaks = None
+
+            if not hasattr(self, "_printed_prob_peak_fusion_debug"):
+                with torch.no_grad():
+                    print(
+                        "[PROB_PEAK_FUSION_DEBUG]",
+                        "use_selector_prob_spectrum=", int(use_selector_prob_spectrum),
+                        "use_peak_reweight=", int(use_peak_reweight_in_prob),
+                        "has_peak_logits=", int(torch.is_tensor(peak_reweight_logits)),
+                        "prob_shape=", tuple(formulae_probs.shape),
+                        "prob_nonzero_first=",
+                        int((formulae_probs[0] > 1e-8).sum().detach().cpu().item()),
+                        "raw_int_sum_first=",
+                        float(formulae_peaks_intensity[0].sum().detach().cpu().item()),
+                        "coarse_render_int_sum_first=",
+                        float(coarse_int_for_prob[0].sum().detach().cpu().item()),
+                        "official_render_int_sum_first=",
+                        float(official_int_for_prob[0].sum().detach().cpu().item()),
+                        "spect_sum_first=",
+                        float(spect_out[0].sum().detach().cpu().item()),
+                        "official_spect_sum_first=",
+                        float(spect_out_official[0].sum().detach().cpu().item()),
+                    )
+                self._printed_prob_peak_fusion_debug = True
+
+            out = {
+                'spect_out': spect_out,
+                'spect_out_coarse': spect_out,
+                'spect_out_official': spect_out_official,
+
+                'formulae_probs': formulae_probs,
+                'formulae_probs_render': formulae_probs_render,
+
+                # In prob-spectrum mode, selector logits are the formula scores.
+                'formulae_logits': selector_logits,
+                'formulae_scores': selector_logits,
+                'formulae_scores_raw': selector_logits,
+                'formulae_scores_raw_setwise': formulae_scores_raw_setwise,
+                'formulae_scores_train': selector_logits,
+
+                'selector_logits': selector_logits,
+                'selector_probs': selector_probs,
+                'selector_pool_idx': pool_idx,
+
+                # Keep rerank diagnostics, even if not used for probability spectrum.
+                'rerank_delta_pool': rerank_delta_pool,
+                'raw_rerank_delta_pool': raw_rerank_delta_pool.detach(),
+                'rerank_logits_pool': final_pool_logits,
+                'use_rerank_delta': torch.tensor(
+                    1.0 if use_rerank_delta else 0.0,
+                    device=device,
+                    dtype=torch.float32,
+                ),
+                'rerank_delta_pool_mean': rerank_delta_pool_mean,
+                'rerank_delta_pool_std': rerank_delta_pool_std,
+                'selector_logits_pool_std': selector_logits_pool_std,
+                'base_score_raw': selector_logits,
+
+                'formulae_encoded': formulae_encoded,
+                'vert_att_reduce': vert_att_reduce,
+                'cond_embed': cond_embed,
+
+                'pred_exact_peaks': pred_exact_peaks,
+
+                'oos_logit': oos_logit,
+                'oos_prob': torch.sigmoid(oos_logit),
+
+                'candidate_peak_feat': candidate_peak_feat,
+                'candidate_peak_feat_raw': candidate_peak_feat_raw,
+
+                'peak_reweight_logits': peak_reweight_logits,
+                'peak_reweight_probs': peak_reweight_probs,
+                'refined_peak_intensity': refined_peak_intensity,
+                'refined_peak_intensity_official': refined_peak_intensity,
+                'peak_idx_for_head': peak_idx_for_head,
+                'peak_int_for_head': peak_int_for_head,
+                'spect_out_official_formula': spect_out_official_formula,
+
+                'precursor_logit': precursor_logit,
+                'precursor_prob': precursor_prob,
+
+                'fragment_node_logits': fragment_node_logits,
+                'fn_based_formula_logits': fn_based_formula_logits,
+            }
+
+            if torch.is_tensor(frag_has_source):
+                out['frag_aux_has_source_ratio'] = frag_has_source.mean().detach()
+            else:
+                out['frag_aux_has_source_ratio'] = torch.tensor(
+                    0.0,
+                    device=device,
+                    dtype=torch.float32,
+                )
+
+            out['frag_aux_scale'] = torch.tensor(
+                float(self.fragment_local_aux_scale),
+                device=device,
+                dtype=torch.float32,
+            )
+
+            return out
         # New: logit sharpening controls.
         try:
             score_temperature = float(os.environ.get('FORMULA_SCORE_TEMPERATURE', '1.0'))
