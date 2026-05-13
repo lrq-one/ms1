@@ -3364,6 +3364,10 @@ def train_mssubsetnet():
                     val_rerank_loss = pred_spect_coarse.sum() * 0.0
 
                 if torch.is_tensor(rerank_logits_pool) and torch.is_tensor(pool_idx):
+                    # In USE_SELECTOR_PROB_SPECTRUM mode, there may be no physical rerank/pruned batch.
+                    # Fall back to the original validation batch.
+                    if 'batch_rerank' not in locals() or batch_rerank is None:
+                        batch_rerank = batch
                     formulae_mask_rerank = batch_rerank.get('formulae_mask', None)
                     if torch.is_tensor(formulae_mask_rerank):
                         formulae_mask_rerank = formulae_mask_rerank.float()
