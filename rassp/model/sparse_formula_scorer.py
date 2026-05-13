@@ -1105,8 +1105,10 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
             }
 
         use_selector_prob_spectrum = os.environ.get("USE_SELECTOR_PROB_SPECTRUM", "0") == "1"
+        selector_prob_formulae_probs = None
+
         if use_selector_prob_spectrum:
-            selector_probs = self._selector_logits_to_formula_probs(
+            selector_prob_formulae_probs = self._selector_logits_to_formula_probs(
                 selector_logits=selector_logits,
                 formulae_mask=formulae_mask,
                 kwargs=kwargs,
@@ -1114,111 +1116,6 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
                 formula_n=formula_n,
                 device=device,
             )
-
-            if torch.is_tensor(selector_probs):
-                formulae_probs = selector_probs
-                formulae_probs_render = formulae_probs
-
-                if not self.training:
-                    formulae_probs_render = self._sparsify_formula_probs_for_render(
-                        formulae_probs_render,
-                        formulae_mask=formulae_mask,
-                    )
-
-                spect_bin_n = self.spect_bin.get_num_bins()
-                spect_out = project_formula_probs_to_spectrum_dense(
-                    formulae_probs_render,
-                    formulae_peaks_mass_idx,
-                    formulae_peaks_intensity,
-                    spect_bin_n,
-                    formulae_mask=formulae_mask,
-                    mass_shift_probs=None,
-                    mass_shift_offsets=None,
-                )
-
-                official_bin_width = float(os.environ.get("OFFICIAL_BIN_WIDTH", "0.01"))
-                official_max_mz = float(os.environ.get("OFFICIAL_MAX_MZ", "1005.0"))
-                official_bin_n = int(np.floor(official_max_mz / official_bin_width)) + 1
-
-                official_idx_for_render = self._coerce_peak_tensor(
-                    kwargs.get('formulae_peaks_official_idx', None),
-                    batch_n=batch_n,
-                    formula_n=formula_n,
-                    device=device,
-                    dtype=torch.long,
-                    fill_value=-1,
-                )
-                official_int_for_render = self._coerce_peak_tensor(
-                    kwargs.get('formulae_peaks_official_intensity', None),
-                    batch_n=batch_n,
-                    formula_n=formula_n,
-                    device=device,
-                    dtype=torch.float32,
-                    fill_value=0.0,
-                )
-
-                if official_idx_for_render is None or official_int_for_render is None:
-                    official_idx_for_render = self._coerce_peak_tensor(
-                        kwargs.get('formulae_peaks_official_idx_agg', None),
-                        batch_n=batch_n,
-                        formula_n=formula_n,
-                        device=device,
-                        dtype=torch.long,
-                        fill_value=-1,
-                    )
-                    official_int_for_render = self._coerce_peak_tensor(
-                        kwargs.get('formulae_peaks_official_intensity_agg', None),
-                        batch_n=batch_n,
-                        formula_n=formula_n,
-                        device=device,
-                        dtype=torch.float32,
-                        fill_value=0.0,
-                    )
-
-                if official_idx_for_render is None or official_int_for_render is None:
-                    official_idx_for_render = formulae_peaks_mass_idx
-                    official_int_for_render = formulae_peaks_intensity
-
-                spect_out_official = project_formula_probs_to_spectrum_dense(
-                    formulae_probs_render,
-                    official_idx_for_render,
-                    official_int_for_render,
-                    official_bin_n,
-                    formulae_mask=formulae_mask,
-                    mass_shift_probs=None,
-                    mass_shift_offsets=None,
-                )
-
-                if os.environ.get('OFFICIAL_EXCLUDE_PRECURSOR', '1') == '1':
-                    spect_out_official = self._zero_precursor_bin_dense(
-                        spect_out_official,
-                        kwargs.get('precursor_mz', None),
-                        official_bin_width,
-                    )
-
-                if self.normalize_1_output:
-                    spect_out = spect_out / (torch.sum(torch.abs(spect_out), dim=1, keepdim=True) + 1e-6)
-                    spect_out_official = spect_out_official / (torch.sum(torch.abs(spect_out_official), dim=1, keepdim=True) + 1e-6)
-
-                return {
-                    "spect_out": spect_out,
-                    "spect": spect_out,
-                    "spect_out_coarse": spect_out,
-                    "spect_out_official": spect_out_official,
-                    "formulae_probs": formulae_probs,
-                    "formulae_probs_render": formulae_probs_render,
-                    "formulae_scores": selector_logits,
-                    "formulae_scores_raw": selector_logits,
-                    "formulae_scores_raw_setwise": selector_logits,
-                    "formulae_scores_train": selector_logits,
-                    "selector_logits": selector_logits,
-                    "selector_probs": selector_probs,
-                    "precursor_logit": precursor_logit,
-                    "precursor_prob": precursor_prob,
-                    "fragment_node_logits": fragment_node_logits,
-                    "fn_based_formula_logits": fn_based_formula_logits,
-                }
-
         mask3 = formulae_mask.unsqueeze(-1)
         mask3_sum = mask3.sum(dim=1, keepdim=True).clamp_min(1.0)
 
@@ -1418,6 +1315,37 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
         )
 
         peak_reweight_probs = torch.softmax(peak_reweight_logits, dim=-1)
+        peak_intensity_for_render = formulae_peaks_intensity
+
+        use_peak_reweight_in_prob = (
+            os.environ.get("USE_PEAK_REWEIGHT_IN_PROB_SPECTRUM", "0") == "1"
+        )
+
+        if use_selector_prob_spectrum and use_peak_reweight_in_prob and torch.is_tensor(peak_reweight_probs):
+            # 推荐第一版用 redistribute，不用 sigmoid 直接压强度
+            # 这样只是重新分配每个 candidate 内部峰强度，不改变该 candidate 总强度
+            use_b = min(int(peak_reweight_probs.shape[0]), int(formulae_peaks_intensity.shape[0]))
+            use_m = min(int(peak_reweight_probs.shape[1]), int(formulae_peaks_intensity.shape[1]))
+            use_k = min(int(peak_reweight_probs.shape[2]), int(formulae_peaks_intensity.shape[2]))
+
+            orig_int = formulae_peaks_intensity[:use_b, :use_m, :use_k].float()
+            pr = peak_reweight_probs[:use_b, :use_m, :use_k].float()
+
+            valid_peak = (
+                (formulae_peaks_mass_idx[:use_b, :use_m, :use_k] >= 0)
+                & torch.isfinite(orig_int)
+                & (orig_int > 0)
+            )
+
+            pr = pr * valid_peak.float()
+            pr = pr / pr.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+            orig_total = (orig_int * valid_peak.float()).sum(dim=-1, keepdim=True)
+
+            new_int = pr * orig_total
+
+            peak_intensity_for_render = formulae_peaks_intensity.clone()
+            peak_intensity_for_render[:use_b, :use_m, :use_k] = new_int
         peak_reweight_probs = torch.where(
             peak_valid,
             peak_reweight_probs,
