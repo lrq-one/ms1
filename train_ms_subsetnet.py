@@ -1259,15 +1259,16 @@ def train_mssubsetnet():
     )
     log(f'馃З selector_pos_weight={selector_pos_weight:.3f}')
     log(
-        f'馃З selector_components: bce_weight={selector_bce_weight:.3f} '
-        f'kl_weight={selector_kl_weight:.3f} '
-        f'recall_bce_weight={selector_recall_bce_weight:.3f} '
-        f'pairwise_weight={selector_pairwise_weight:.3f} '
-        f'utility_kl_weight={selector_utility_kl_weight:.3f}'
+        f'馃З selector_components: bce_weight={loss_cfg.selector_bce_weight:.3f} '
+        f'kl_weight={loss_cfg.selector_kl_weight:.3f} '
+        f'recall_bce_weight={loss_cfg.selector_recall_bce_weight:.3f} '
+        f'pairwise_weight={loss_cfg.selector_pairwise_weight:.3f} '
+        f'utility_weight={loss_cfg.selector_utility_weight:.3f} '
+        f'false_support_weight={loss_cfg.false_support_weight:.3f}'
     )
     log(
         f'馃З selector_recall_target_topk={selector_recall_target_topk} '
-        f'soft_false_support_weight={soft_false_support_loss_weight:.3f}'
+        f'soft_false_support_weight={loss_cfg.soft_false_support_weight:.3f}'
     )
     log(f'馃З train_selector_only_stage={int(train_selector_only_stage)}')
     log(f'馃З selector_only_warmup_epochs={selector_only_warmup_epochs}')
@@ -1436,6 +1437,83 @@ def train_mssubsetnet():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    if os.environ.get("USE_CLEAN_ENGINE", "1") == "1":
+        log("馃З clean_engine=1 using rassp.training.train_epoch / validate_epoch")
+
+        def _select_metric_value(metrics, name):
+            if not isinstance(metrics, dict):
+                return None
+            candidates = [name]
+            if not str(name).startswith("val_"):
+                candidates.append(f"val_{name}")
+            if isinstance(name, str) and "_" in name:
+                parts = name.rsplit("_", 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    at_name = f"{parts[0]}@{parts[1]}"
+                    candidates.append(at_name)
+                    if not at_name.startswith("val_"):
+                        candidates.append(f"val_{at_name}")
+            for key in candidates:
+                if key in metrics:
+                    return metrics[key]
+            return None
+
+        best_metric = None
+        best_ckpt_path = os.environ.get("BEST_CKPT_PATH", "checkpoints/best_clean_engine.pt")
+        spect_bin_centers = spect_bin.get_bin_centers().astype(np.float32)
+
+        for epoch_idx in range(1, int(run_cfg.epochs) + 1):
+            train_metrics = train_one_epoch(
+                model=model,
+                loader=train_dl,
+                optimizer=optimizer,
+                scaler=scaler,
+                device=device,
+                spect_bin=spect_bin,
+                epoch=epoch_idx,
+                run_cfg=run_cfg,
+                selector_cfg=selector_cfg,
+                loss_cfg=loss_cfg,
+                metric_cfg=official_metric_cfg,
+            )
+            val_metrics = validate_one_epoch(
+                model=model,
+                loader=val_dl,
+                device=device,
+                spect_bin=spect_bin,
+                spect_bin_centers=spect_bin_centers,
+                epoch=epoch_idx,
+                run_cfg=run_cfg,
+                selector_cfg=selector_cfg,
+                metric_cfg=official_metric_cfg,
+            )
+
+            epoch_metrics = {}
+            epoch_metrics.update({f"train_{k}": v for k, v in train_metrics.items()})
+            epoch_metrics.update({f"val_{k}": v for k, v in val_metrics.items()})
+
+            select_metric = run_cfg.model_select_metric
+            current_metric = _select_metric_value(epoch_metrics, select_metric)
+            is_best = is_better_metric(current_metric, best_metric, mode="max")
+            if is_best:
+                best_metric = current_metric
+                save_checkpoint(
+                    best_ckpt_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    epoch=epoch_idx,
+                    metrics=epoch_metrics,
+                )
+
+            line = format_metric_line(f"Epoch {epoch_idx}/{run_cfg.epochs}", epoch_metrics)
+            if is_best:
+                line += " | BEST"
+            log(line)
+            scheduler.step()
+
+        return
 
 
     os.makedirs('checkpoints', exist_ok=True)

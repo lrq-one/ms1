@@ -6,6 +6,8 @@ from rassp.training.batch_utils import move_batch_to_device, prepare_batch_cpu
 from rassp.training.logging_utils import MetricAccumulator
 from rassp.training.official_metrics import compute_batch_official_metrics
 from rassp.training.selector_metrics import (
+    build_mask_from_topk_indices,
+    compute_candidate_support_stats,
     compute_selector_eval_pack,
     compute_selected_support_metrics,
     select_model_topk_indices,
@@ -60,16 +62,47 @@ def validate_one_epoch(
 
         selector_logits = res.get("selector_logits", None) if isinstance(res, dict) else None
         if torch.is_tensor(selector_logits):
+            suffix = int(_cfg_value(selector_cfg, "model_topk_eval", 64))
             topk_idx = select_model_topk_indices(
                 selector_logits=selector_logits,
                 batch=batch,
-                k=int(_cfg_value(selector_cfg, "model_topk_eval", 64)),
-                use_coverage=bool(_cfg_value(selector_cfg, "use_coverage_aware_topk", False)),
+                k=suffix,
+                use_coverage=False,
                 use_group_unique=bool(_cfg_value(selector_cfg, "use_group_unique_model", False)),
             )
             selector_metrics = compute_selected_support_metrics(topk_idx, batch)
-            suffix = int(_cfg_value(selector_cfg, "model_topk_eval", 64))
             acc.add_dict({f"{key}@{suffix}": value for key, value in selector_metrics.items()})
+
+            topk_mask = build_mask_from_topk_indices(
+                topk_idx,
+                selector_logits,
+                formulae_mask=batch.get("formulae_mask", None),
+            )
+            support_stats = compute_candidate_support_stats(
+                batch,
+                topk_mask,
+                official_bin_width=float(metric_cfg.get("bin_width", 0.01)),
+                official_max_mz=float(metric_cfg.get("max_mz", 1005.0)),
+            )
+            if isinstance(support_stats, dict):
+                if "official_cos" in support_stats:
+                    acc.add(f"model_topk_oracle_cos@{suffix}", support_stats["official_cos"])
+                if "false_support" in support_stats:
+                    acc.add(f"model_topk_oracle_false_support@{suffix}", support_stats["false_support"])
+
+        teacher_probs = batch.get("teacher_formula_probs", None)
+        if torch.is_tensor(teacher_probs):
+            teacher_stats = compute_candidate_support_stats(
+                batch,
+                teacher_probs,
+                official_bin_width=float(metric_cfg.get("bin_width", 0.01)),
+                official_max_mz=float(metric_cfg.get("max_mz", 1005.0)),
+            )
+            if isinstance(teacher_stats, dict):
+                if "official_cos" in teacher_stats:
+                    acc.add("teacher_oracle_cos", teacher_stats["official_cos"])
+                if "false_support" in teacher_stats:
+                    acc.add("teacher_oracle_false_support", teacher_stats["false_support"])
         if os.environ.get("ENABLE_TEACHER_AUDIT", "0") == "1":
             audit_metrics = compute_teacher_audit_pack(
                 selector_logits=selector_logits,

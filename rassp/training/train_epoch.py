@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -16,12 +18,91 @@ from rassp.training.runtime_selector_targets import (
 )
 from rassp.training.selector_losses import (
     compute_selector_false_support_loss,
+    compute_selector_soft_false_support_loss,
     compute_selector_utility_target_loss,
 )
+from rassp.training.train_loss_components import selector_pairwise_utility_loss
 
 
 def _cfg_value(cfg, name, default):
     return getattr(cfg, name, default) if cfg is not None else default
+
+
+def _as_2d(x):
+    if not torch.is_tensor(x):
+        return None
+    if x.dim() == 1:
+        return x.unsqueeze(0)
+    if x.dim() > 2:
+        return x.reshape(x.shape[0], -1)
+    return x
+
+
+def _align_2d(*items):
+    tensors = [_as_2d(x) for x in items]
+    if any(x is None for x in tensors):
+        return None
+    batch_n = min(int(x.shape[0]) for x in tensors)
+    item_n = min(int(x.shape[1]) for x in tensors)
+    if batch_n <= 0 or item_n <= 0:
+        return None
+    return tuple(x[:batch_n, :item_n] for x in tensors)
+
+
+def _masked_selector_bce(selector_logits, target_mask, formulae_mask=None, pos_weight=5.0):
+    if not (torch.is_tensor(selector_logits) and torch.is_tensor(target_mask)):
+        return None
+    if formulae_mask is None:
+        formulae_mask = torch.ones_like(selector_logits)
+
+    aligned = _align_2d(selector_logits, target_mask, formulae_mask)
+    if aligned is None:
+        return None
+    logits, target, mask = aligned
+    logits = logits.float()
+    target = (target > 0.5).float().to(device=logits.device, dtype=logits.dtype)
+    mask = (mask > 0.5).float().to(device=logits.device, dtype=logits.dtype)
+
+    if float(mask.sum().detach().item()) <= 0.0:
+        return logits.sum() * 0.0
+
+    raw = F.binary_cross_entropy_with_logits(
+        logits.masked_fill(mask <= 0.5, 0.0),
+        target,
+        reduction="none",
+        pos_weight=logits.new_tensor(float(pos_weight)),
+    )
+    return (raw * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def _masked_selector_recall_bce(
+    selector_logits,
+    target_mask,
+    formulae_mask=None,
+    pos_part=0.80,
+    neg_part=0.20,
+):
+    if not (torch.is_tensor(selector_logits) and torch.is_tensor(target_mask)):
+        return None
+    if formulae_mask is None:
+        formulae_mask = torch.ones_like(selector_logits)
+
+    aligned = _align_2d(selector_logits, target_mask, formulae_mask)
+    if aligned is None:
+        return None
+    logits, target, mask = aligned
+    logits = logits.float()
+    target = (target > 0.5).float().to(device=logits.device, dtype=logits.dtype)
+    valid = (mask > 0.5).to(device=logits.device)
+
+    raw = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    pos = valid & (target > 0.5)
+    neg = valid & (target <= 0.5)
+
+    zero = logits.sum() * 0.0
+    pos_loss = raw[pos].mean() if bool(pos.any().item()) else zero
+    neg_loss = raw[neg].mean() if bool(neg.any().item()) else zero
+    return float(pos_part) * pos_loss + float(neg_part) * neg_loss
 
 
 def train_one_epoch(
@@ -58,6 +139,7 @@ def train_one_epoch(
 
             selector_logits = res.get("selector_logits", None) if isinstance(res, dict) else None
             formulae_mask = batch.get("formulae_mask", None)
+            selector_loss_total = None
             if torch.is_tensor(selector_logits) and torch.is_tensor(formulae_mask):
                 target_probs = compute_formula_target_probs_from_batch(
                     batch,
@@ -65,28 +147,120 @@ def train_one_epoch(
                     max_mz=float(metric_cfg.get("max_mz", 1005.0)),
                     support_topk=int(_cfg_value(selector_cfg, "target_support_topk", 64)),
                 )
-                if torch.is_tensor(target_probs):
-                    pred_prob = torch.softmax(
-                        selector_logits.masked_fill(formulae_mask <= 0, -1e9),
-                        dim=-1,
-                    )
-                    selector_kl = masked_prob_kl(pred_prob, target_probs, formulae_mask)
-                    loss = loss + float(_cfg_value(loss_cfg, "selector_kl_weight", 0.45)) * selector_kl
-                    acc.add("selector_kl", selector_kl.detach().item())
+                official_bin_width = float(metric_cfg.get("bin_width", 0.01))
+                official_max_mz = float(metric_cfg.get("max_mz", 1005.0))
+                official_bin_n = int(official_max_mz / max(official_bin_width, 1e-8)) + 1
+                teacher_dist = build_selector_teacher_dist_setcover(
+                    batch=batch,
+                    formulae_mask=formulae_mask,
+                    official_bin_n=official_bin_n,
+                )
+                if not torch.is_tensor(teacher_dist):
+                    teacher_dist = target_probs
 
-                if float(_cfg_value(loss_cfg, "false_support_weight", 0.0)) > 0:
+                aligned = _align_2d(selector_logits, teacher_dist, formulae_mask)
+                if aligned is not None:
+                    logits_use, target_use, mask_use = aligned
+                    logits_use = logits_use.float()
+                    target_use = target_use.to(device=logits_use.device, dtype=logits_use.dtype).clamp_min(0.0)
+                    mask_use = (mask_use > 0.5).to(device=logits_use.device)
+
+                    target_use = target_use * mask_use.float()
+                    target_sum = target_use.sum(dim=-1, keepdim=True)
+                    target_use = target_use / target_sum.clamp_min(1e-12)
+                    target_mask = (target_use > 0).float()
+
+                    selector_loss_total = logits_use.sum() * 0.0
+
+                    bce_w = float(_cfg_value(loss_cfg, "selector_bce_weight", 0.0))
+                    if bce_w > 0:
+                        bce_loss = _masked_selector_bce(
+                            logits_use,
+                            target_mask,
+                            formulae_mask=mask_use,
+                            pos_weight=float(_cfg_value(loss_cfg, "selector_pos_weight", 5.0)),
+                        )
+                        if torch.is_tensor(bce_loss):
+                            selector_loss_total = selector_loss_total + bce_w * bce_loss
+                            acc.add("selector_bce", bce_loss.detach().item())
+
+                    recall_w = float(_cfg_value(loss_cfg, "selector_recall_bce_weight", 0.0))
+                    if recall_w > 0:
+                        try:
+                            recall_topk = int(os.environ.get("SELECTOR_RECALL_TARGET_TOPK", "128"))
+                        except Exception:
+                            recall_topk = 128
+                        _, recall_mask = apply_teacher_topk_to_target(
+                            target_use,
+                            formulae_mask=mask_use.float(),
+                            topk=recall_topk,
+                        )
+                        if not torch.is_tensor(recall_mask):
+                            recall_mask = target_mask
+                        recall_bce_loss = _masked_selector_recall_bce(
+                            logits_use,
+                            recall_mask,
+                            formulae_mask=mask_use,
+                            pos_part=0.80,
+                            neg_part=0.20,
+                        )
+                        if torch.is_tensor(recall_bce_loss):
+                            selector_loss_total = selector_loss_total + recall_w * recall_bce_loss
+                            acc.add("selector_recall_bce", recall_bce_loss.detach().item())
+
+                    kl_w = float(_cfg_value(loss_cfg, "selector_kl_weight", 0.0))
+                    if kl_w > 0:
+                        pred_prob = torch.softmax(
+                            logits_use.masked_fill(mask_use <= 0, -1e9),
+                            dim=-1,
+                        )
+                        selector_kl = masked_prob_kl(pred_prob, target_use, mask_use.float())
+                        selector_loss_total = selector_loss_total + kl_w * selector_kl
+                        acc.add("selector_kl", selector_kl.detach().item())
+
+                    pairwise_w = float(_cfg_value(loss_cfg, "selector_pairwise_weight", 0.0))
+                    if pairwise_w > 0:
+                        pairwise_loss = selector_pairwise_utility_loss(
+                            logits_use,
+                            target_use,
+                            valid_mask=mask_use,
+                        )
+                        if torch.is_tensor(pairwise_loss):
+                            selector_loss_total = selector_loss_total + pairwise_w * pairwise_loss
+                            acc.add("selector_pairwise", pairwise_loss.detach().item())
+
+                    utility_w = float(_cfg_value(loss_cfg, "selector_utility_weight", 0.0))
+                    if utility_w > 0:
+                        util_loss = compute_selector_utility_target_loss(logits_use, batch)
+                        if torch.is_tensor(util_loss):
+                            selector_loss_total = selector_loss_total + utility_w * util_loss
+                            acc.add("selector_utility", util_loss.detach().item())
+
+                    if selector_loss_total is not None:
+                        loss = loss + float(_cfg_value(loss_cfg, "selector_weight", 1.0)) * selector_loss_total
+                        acc.add("selector_loss", selector_loss_total.detach().item())
+
+                false_total = None
+                hard_false_w = float(_cfg_value(loss_cfg, "false_support_weight", 0.0))
+                if hard_false_w > 0:
                     fs_loss = compute_selector_false_support_loss(
                         selector_logits,
                         batch,
                         topk=int(_cfg_value(selector_cfg, "selector_topk", 64)),
                     )
-                    loss = loss + float(_cfg_value(loss_cfg, "false_support_weight", 0.0)) * fs_loss
-                    acc.add("false_support", fs_loss.detach().item())
+                    if torch.is_tensor(fs_loss):
+                        loss = loss + hard_false_w * fs_loss
+                        false_total = fs_loss if false_total is None else false_total + fs_loss
 
-                if float(_cfg_value(loss_cfg, "selector_utility_weight", 0.0)) > 0:
-                    util_loss = compute_selector_utility_target_loss(selector_logits, batch)
-                    loss = loss + float(_cfg_value(loss_cfg, "selector_utility_weight", 0.0)) * util_loss
-                    acc.add("selector_utility", util_loss.detach().item())
+                soft_false_w = float(_cfg_value(loss_cfg, "soft_false_support_weight", 0.0))
+                if soft_false_w > 0:
+                    soft_fs_loss = compute_selector_soft_false_support_loss(selector_logits, batch)
+                    if torch.is_tensor(soft_fs_loss):
+                        loss = loss + soft_false_w * soft_fs_loss
+                        false_total = soft_fs_loss if false_total is None else false_total + soft_fs_loss
+
+                if torch.is_tensor(false_total):
+                    acc.add("false_support", false_total.detach().item())
 
             precursor_loss = compute_precursor_loss_from_batch(batch, res)
             if precursor_loss is not None and float(_cfg_value(loss_cfg, "precursor_weight", 0.0)) > 0:

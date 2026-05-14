@@ -23,6 +23,11 @@ def format_metric_line(prefix, metrics):
     keep_keys = [
         "train_loss",
         "train_selector_loss",
+        "train_selector_bce",
+        "train_selector_recall_bce",
+        "train_selector_kl",
+        "train_selector_pairwise",
+        "train_selector_utility",
         "train_false_support",
         "val_loss",
         "val_official_cos_no_precursor",
