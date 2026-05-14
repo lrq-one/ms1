@@ -166,3 +166,12 @@ class GraphVertSpect(nn.Module):
         )
 
         pred_dense_spect = pred_dense_spect_dict['spect_out']
+
+        if isinstance(pred_dense_spect_dict, dict):
+            if 'spect_out' not in pred_dense_spect_dict:
+                pred_dense_spect_dict['spect_out'] = pred_dense_spect
+            if 'spect' not in pred_dense_spect_dict:
+                pred_dense_spect_dict['spect'] = pred_dense_spect
+            return pred_dense_spect_dict
+
+        return pred_dense_spect
