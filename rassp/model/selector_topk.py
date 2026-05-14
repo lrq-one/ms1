@@ -41,6 +41,77 @@ def group_unique_topk(logits, group_ids, k, mask=None):
         scores = scores.reshape(scores.shape[0], -1)
 
     B, M = int(scores.shape[0]), int(scores.shape[1])
+    device = scores.device
+
+    if torch.is_tensor(mask):
+        fm = mask.float()
+        if fm.dim() == 1:
+            fm = fm.unsqueeze(0)
+        elif fm.dim() > 2:
+            fm = fm.reshape(fm.shape[0], -1)
+        use_b = min(B, int(fm.shape[0]))
+        use_m = min(M, int(fm.shape[1]))
+        scores = scores[:use_b, :use_m]
+        fm = fm[:use_b, :use_m]
+        scores = scores.masked_fill(fm <= 0, _neg_mask_fill_value(scores))
+
+    if torch.is_tensor(group_ids):
+        gid = group_ids.to(device=device, dtype=torch.long)
+        if gid.dim() == 1:
+            gid = gid.unsqueeze(0)
+        elif gid.dim() > 2:
+            gid = gid.reshape(gid.shape[0], -1)
+        use_b = min(B, int(gid.shape[0]))
+        use_m = min(M, int(gid.shape[1]))
+        gid_full = torch.arange(M, device=device, dtype=torch.long).view(1, -1).expand(B, -1).clone()
+        gid_full[:use_b, :use_m] = gid[:use_b, :use_m].clamp_min(0)
+        gid = gid_full
+    else:
+        gid = torch.arange(M, device=device, dtype=torch.long).view(1, -1).expand(B, -1)
+
+    kk = max(1, min(int(k), M))
+    out = []
+
+    for b in range(B):
+        order = torch.argsort(scores[b], descending=True)
+        used = set()
+        chosen = []
+
+        for oi in order.detach().cpu().tolist():
+            idx = int(oi)
+            g = int(gid[b, idx].detach().cpu().item())
+            if g in used:
+                continue
+            used.add(g)
+            chosen.append(idx)
+            if len(chosen) >= kk:
+                break
+
+        if len(chosen) < kk:
+            for oi in order.detach().cpu().tolist():
+                idx = int(oi)
+                if idx in chosen:
+                    continue
+                chosen.append(idx)
+                if len(chosen) >= kk:
+                    break
+
+        out.append(torch.as_tensor(chosen[:kk], dtype=torch.long, device=device))
+
+    return torch.stack(out, dim=0)
+
+
+def coverage_aware_topk(
+    logits,
+    peak_idx,
+    peak_int,
+    formulae_mask=None,
+    group_id=None,
+    k=64,
+    duplicate_penalty=0.35,
+    novelty_bonus=0.10,
+    eps=1e-8,
+):
     """
     Fast coverage-aware topK.
 
