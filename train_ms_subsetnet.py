@@ -202,6 +202,23 @@ def _finite_mean(values):
     return float(arr.mean())
 
 
+def _zero_loss_like(res=None, batch=None, device=None):
+    if isinstance(res, dict):
+        for value in res.values():
+            if torch.is_tensor(value):
+                return value.sum() * 0.0
+
+    if isinstance(batch, dict):
+        for value in batch.values():
+            if torch.is_tensor(value):
+                return value.sum() * 0.0
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    return torch.zeros((), device=device)
+
+
 def _parse_formula_oh_sizes(raw_value, element_n):
     if not raw_value:
         return None
@@ -1688,24 +1705,17 @@ def train_mssubsetnet():
 
                 precursor_loss = compute_precursor_loss_from_batch(batch, res_full)
                 if not torch.is_tensor(precursor_loss):
-                    if isinstance(res_full, dict) and torch.is_tensor(res_full.get("spect", None)):
-                        precursor_loss = res_full["spect"].sum() * 0.0
-                    elif isinstance(res, dict) and torch.is_tensor(res.get("selector_logits", None)):
-                        precursor_loss = res["selector_logits"].sum() * 0.0
-                    elif isinstance(res, dict):
-                        _anchor = None
-                        for _v in res.values():
-                            if torch.is_tensor(_v):
-                                _anchor = _v
-                                break
-                        if _anchor is not None:
-                            precursor_loss = _anchor.sum() * 0.0
-                        else:
-                            precursor_loss = torch.zeros((), device=device)
-                    else:
-                        precursor_loss = torch.zeros((), device=device)
+                    precursor_loss = _zero_loss_like(
+                        res=res_full if isinstance(res_full, dict) else res,
+                        batch=batch,
+                        device=device,
+                    )
 
-                fn_loss = res_full['spect'].sum() * 0.0
+                fn_loss = _zero_loss_like(
+                    res=res_full if isinstance(res_full, dict) else res,
+                    batch=batch,
+                    device=device,
+                )
                 if os.environ.get("TRAIN_FRAGMENT_NODE_SELECTOR", "0") == "1":
                     fn_logits = res_full.get('fragment_node_logits', None)
                     fn_label = batch.get('fragment_node_label', None)
@@ -1738,14 +1748,14 @@ def train_mssubsetnet():
                 selector_target_mask = selector_pos_label
                 selector_mask_full = formulae_mask
 
-                selector_bce_loss = res_full['spect'].sum() * 0.0
-                selector_recall_bce_loss = res_full['spect'].sum() * 0.0
-                selector_kl_loss = res_full['spect'].sum() * 0.0
-                selector_pairwise_loss = res_full['spect'].sum() * 0.0
-                selector_utility_kl_loss = res_full['spect'].sum() * 0.0
-                selector_pos_rate = res_full['spect'].sum() * 0.0
-                selector_quality_mean = res_full['spect'].sum() * 0.0
-                selector_dyn_pos_weight = res_full['spect'].sum() * 0.0
+                selector_bce_loss = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                selector_recall_bce_loss = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                selector_kl_loss = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                selector_pairwise_loss = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                selector_utility_kl_loss = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                selector_pos_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                selector_quality_mean = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                selector_dyn_pos_weight = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
 
                 if (
                     torch.is_tensor(selector_quality)
@@ -1796,7 +1806,7 @@ def train_mssubsetnet():
                             neg_part=0.25,
                         )
                         if selector_recall_bce_loss is None:
-                            selector_recall_bce_loss = res_full['spect'].sum() * 0.0
+                            selector_recall_bce_loss = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
 
                     try:
                         gamma = float(os.environ.get("QUALITY_TARGET_GAMMA", "2.0"))
@@ -1914,7 +1924,7 @@ def train_mssubsetnet():
                             max_pairs=int(os.environ.get("SELECTOR_PAIRWISE_MAX_PAIRS", "2048")),
                         )
                         if (not torch.is_tensor(selector_pairwise_loss)) or (not torch.isfinite(selector_pairwise_loss)):
-                            selector_pairwise_loss = res_full['spect'].sum() * 0.0
+                            selector_pairwise_loss = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
 
                     if torch.is_tensor(utility_dist_t):
                         utility_log_probs = F.log_softmax(
@@ -1934,17 +1944,17 @@ def train_mssubsetnet():
                             selector_utility_kl_loss * valid_rows
                         ).sum() / valid_rows.sum().clamp_min(1.0)
                         if (not torch.is_tensor(selector_utility_kl_loss)) or (not torch.isfinite(selector_utility_kl_loss)):
-                            selector_utility_kl_loss = res_full['spect'].sum() * 0.0
+                            selector_utility_kl_loss = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
 
-                target_pos_false_mass = res_full['spect'].sum() * 0.0
-                target_pos_overlap_exact = res_full['spect'].sum() * 0.0
-                target_clean_pos_rate = res_full['spect'].sum() * 0.0
-                target_pool_pos_rate = res_full['spect'].sum() * 0.0
-                target_pool_pos_false_mass = res_full['spect'].sum() * 0.0
-                target_pool_pos_overlap_tol = res_full['spect'].sum() * 0.0
-                target_teacher_pos_rate = res_full['spect'].sum() * 0.0
-                target_teacher_dist_n = res_full['spect'].sum() * 0.0
-                target_teacher_added_rate = res_full['spect'].sum() * 0.0
+                target_pos_false_mass = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                target_pos_overlap_exact = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                target_clean_pos_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                target_pool_pos_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                target_pool_pos_false_mass = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                target_pool_pos_overlap_tol = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                target_teacher_pos_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                target_teacher_dist_n = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                target_teacher_added_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
                 if (
                     isinstance(selector_extra, dict)
                     and torch.is_tensor(selector_pos_label)
@@ -2029,9 +2039,9 @@ def train_mssubsetnet():
                     + float(selector_utility_kl_weight) * selector_utility_kl_loss
                 )
 
-                target_pos_exact_support_mass = res_full['spect'].sum() * 0.0
-                target_strict_keep_rate = res_full['spect'].sum() * 0.0
-                target_fallback_rate = res_full['spect'].sum() * 0.0
+                target_pos_exact_support_mass = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                target_strict_keep_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                target_fallback_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
 
                 if (
                     isinstance(selector_extra, dict)
@@ -2872,9 +2882,17 @@ def train_mssubsetnet():
 
                     val_precursor_loss = compute_precursor_loss_from_batch(batch, res_full)
                     if not torch.is_tensor(val_precursor_loss):
-                        val_precursor_loss = res_full['spect'].sum() * 0.0
+                        val_precursor_loss = _zero_loss_like(
+                            res=res_full if isinstance(res_full, dict) else res,
+                            batch=batch,
+                            device=device,
+                        )
 
-                    val_fn_loss = res_full['spect'].sum() * 0.0
+                    val_fn_loss = _zero_loss_like(
+                        res=res_full if isinstance(res_full, dict) else res,
+                        batch=batch,
+                        device=device,
+                    )
                     if os.environ.get("TRAIN_FRAGMENT_NODE_SELECTOR", "0") == "1":
                         fn_logits = res_full.get('fragment_node_logits', None)
                         fn_label = batch.get('fragment_node_label', None)
@@ -2903,14 +2921,14 @@ def train_mssubsetnet():
                     # Biased logits only for topK selection.
                     selector_logits_for_topk = _apply_selector_aux_logit_bias(selector_logits, batch)
 
-                    val_selector_bce = res_full['spect'].sum() * 0.0
-                    val_selector_recall_bce = res_full['spect'].sum() * 0.0
-                    val_selector_kl = res_full['spect'].sum() * 0.0
-                    val_selector_pairwise = res_full['spect'].sum() * 0.0
-                    val_selector_utility_kl = res_full['spect'].sum() * 0.0
-                    val_selector_pos_rate = res_full['spect'].sum() * 0.0
-                    val_selector_quality_mean = res_full['spect'].sum() * 0.0
-                    val_selector_dyn_pos_weight = res_full['spect'].sum() * 0.0
+                    val_selector_bce = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_selector_recall_bce = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_selector_kl = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_selector_pairwise = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_selector_utility_kl = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_selector_pos_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_selector_quality_mean = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_selector_dyn_pos_weight = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
 
                     if (
                         torch.is_tensor(selector_quality)
@@ -2961,7 +2979,7 @@ def train_mssubsetnet():
                                 neg_part=0.25,
                             )
                             if val_selector_recall_bce is None:
-                                val_selector_recall_bce = res_full['spect'].sum() * 0.0
+                                val_selector_recall_bce = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
 
                         try:
                             gamma = float(os.environ.get("QUALITY_TARGET_GAMMA", "2.0"))
@@ -3089,7 +3107,7 @@ def train_mssubsetnet():
                                 max_pairs=int(os.environ.get("SELECTOR_PAIRWISE_MAX_PAIRS", "2048")),
                             )
                             if (not torch.is_tensor(val_selector_pairwise)) or (not torch.isfinite(val_selector_pairwise)):
-                                val_selector_pairwise = res_full['spect'].sum() * 0.0
+                                val_selector_pairwise = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
 
                         if torch.is_tensor(utility_dist_t):
                             utility_log_probs = F.log_softmax(
@@ -3109,20 +3127,20 @@ def train_mssubsetnet():
                                 val_selector_utility_kl * valid_rows
                             ).sum() / valid_rows.sum().clamp_min(1.0)
                             if (not torch.is_tensor(val_selector_utility_kl)) or (not torch.isfinite(val_selector_utility_kl)):
-                                val_selector_utility_kl = res_full['spect'].sum() * 0.0
+                                val_selector_utility_kl = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
 
-                    val_target_pos_false_mass = res_full['spect'].sum() * 0.0
-                    val_target_pos_overlap_exact = res_full['spect'].sum() * 0.0
-                    val_target_pos_exact_support_mass = res_full['spect'].sum() * 0.0
-                    val_target_strict_keep_rate = res_full['spect'].sum() * 0.0
-                    val_target_fallback_rate = res_full['spect'].sum() * 0.0
-                    val_target_clean_pos_rate = res_full['spect'].sum() * 0.0
-                    val_target_pool_pos_rate = res_full['spect'].sum() * 0.0
-                    val_target_pool_pos_false_mass = res_full['spect'].sum() * 0.0
-                    val_target_pool_pos_overlap_tol = res_full['spect'].sum() * 0.0
-                    val_target_teacher_pos_rate = res_full['spect'].sum() * 0.0
-                    val_target_teacher_dist_n = res_full['spect'].sum() * 0.0
-                    val_target_teacher_added_rate = res_full['spect'].sum() * 0.0
+                    val_target_pos_false_mass = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_target_pos_overlap_exact = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_target_pos_exact_support_mass = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_target_strict_keep_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_target_fallback_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_target_clean_pos_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_target_pool_pos_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_target_pool_pos_false_mass = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_target_pool_pos_overlap_tol = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_target_teacher_pos_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_target_teacher_dist_n = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_target_teacher_added_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
                     if (
                         isinstance(selector_extra, dict)
                         and torch.is_tensor(selector_pos_label)
