@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 from rassp.featurize import msutil
 from rassp.msutil import masscompute
 from rassp import dataset, netutil
-from rassp.model.selector_topk import coverage_aware_topk, group_unique_topk, plain_topk
+from rassp.model.selector_topk import group_unique_topk, plain_topk
 from rassp.model.model_utils import neg_mask_fill_value as _neg_mask_fill_value
 from rassp.training.batch_utils import (
     ADDUCT_VOCAB,
@@ -3219,12 +3219,12 @@ def train_mssubsetnet():
                             formulae_mask=batch.get('formulae_mask', None),
                         )
 
-                    use_coverage_topk = os.environ.get("USE_COVERAGE_AWARE_TOPK", "0") == "1"
+                    use_coverage_topk = False
                     model_topk_idx = select_model_topk_indices(
                         selector_logits=selector_logits_for_topk,
                         batch=batch,
                         k=model_topk_eval,
-                        use_coverage=use_coverage_topk,
+                        use_coverage=False,
                         use_group_unique=use_group_unique_model,
                         candidate_mask=topk_candidate_mask_val,
                     )
@@ -3268,14 +3268,14 @@ def train_mssubsetnet():
                         active_mask=topk_candidate_mask_val,
                         topk_list=tuple(k_list),
                         use_group_unique=use_group_unique_model,
-                        use_coverage=use_coverage_topk,
+                        use_coverage=False,
                     )
                     for k in k_list:
                         topk_idx = select_model_topk_indices(
                             selector_logits=selector_logits_for_topk,
                             batch=batch,
                             k=k,
-                            use_coverage=use_coverage_topk,
+                            use_coverage=False,
                             use_group_unique=use_group_unique_model,
                             candidate_mask=topk_candidate_mask_val,
                         )
@@ -3307,7 +3307,7 @@ def train_mssubsetnet():
                             selector_logits=selector_logits_for_topk,
                             batch=batch,
                             k=k_eval,
-                            use_coverage=use_coverage_topk,
+                            use_coverage=False,
                             use_group_unique=use_group_unique_model,
                             candidate_mask=topk_candidate_mask_val,
                         )

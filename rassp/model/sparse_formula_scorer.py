@@ -1155,7 +1155,9 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
         )
 
         if use_selector_prob_spectrum and use_peak_reweight_in_prob and torch.is_tensor(peak_reweight_probs):
-            # 推荐第一版用 redistribute，不�?sigmoid 直接压强�?            # 这样只是重新分配每个 candidate 内部峰强度，不改变该 candidate 总强�?            use_b = min(int(peak_reweight_probs.shape[0]), int(formulae_peaks_intensity.shape[0]))
+            # Prefer redistribute in the first pass instead of sigmoid suppression.
+            # We only redistribute intensity within each candidate and keep total mass stable.
+            use_b = min(int(peak_reweight_probs.shape[0]), int(formulae_peaks_intensity.shape[0]))
             use_m = min(int(peak_reweight_probs.shape[1]), int(formulae_peaks_intensity.shape[1]))
             use_k = min(int(peak_reweight_probs.shape[2]), int(formulae_peaks_intensity.shape[2]))
 
