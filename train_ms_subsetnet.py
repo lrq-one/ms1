@@ -2713,6 +2713,89 @@ def train_mssubsetnet():
                     teacher_formula_mask,
                 )
 
+                if os.environ.get("EVAL_TEACHER_PROB_RENDER", "0") == "1":
+                    teacher_probs, teacher_name = _pick_first_tensor_from_locals(
+                        locals(),
+                        [
+                            "selector_teacher_probs",
+                            "formula_target_probs",
+                            "target_probs",
+                            "quality_target_probs",
+                            "teacher_target_probs",
+                            "candidate_target_probs",
+                            "teacher_target_full",
+                            "teacher_topk_probs",
+                        ],
+                    )
+
+                    if teacher_probs is None:
+                        teacher_mask, teacher_name = _pick_first_tensor_from_locals(
+                            locals(),
+                            [
+                                "target_mask",
+                                "selector_target_mask",
+                                "teacher_topk_mask",
+                                "quality_target_mask",
+                                "candidate_target_mask",
+                            ],
+                        )
+                        if torch.is_tensor(teacher_mask):
+                            teacher_probs = teacher_mask.float()
+                            teacher_name = f"{teacher_name}_as_prob"
+
+                    if torch.is_tensor(teacher_probs):
+                        teacher_pred_dense = _render_teacher_prob_spectrum_from_batch(
+                            batch=batch,
+                            teacher_probs=teacher_probs,
+                            official_bin_n=official_bin_n,
+                        )
+
+                        if torch.is_tensor(teacher_pred_dense):
+                            true_dense, used_cached_true = build_true_official_dense_from_cached_sparse_batch(
+                                batch=batch,
+                                batch_n=int(teacher_pred_dense.shape[0]),
+                                device=teacher_pred_dense.device,
+                                official_bin_n=int(teacher_pred_dense.shape[1]),
+                            )
+
+                            if not used_cached_true:
+                                true_dense = build_true_official_dense_from_raw(
+                                    spect_raw_list=batch.get('spect_raw', None),
+                                    precursor_mz=batch.get('precursor_mz', None),
+                                    official_bin_width=official_metric_cfg['bin_width'],
+                                    official_max_mz=official_metric_cfg['max_mz'],
+                                    exclude_precursor=True,
+                                    batch_n=int(teacher_pred_dense.shape[0]),
+                                    device=teacher_pred_dense.device,
+                                )
+
+                            tcos, tfalse = _dense_cos_and_false_support(
+                                teacher_pred_dense,
+                                true_dense,
+                            )
+
+                            if torch.is_tensor(tcos):
+                                teacher_prob_render_cos_vals.extend(
+                                    tcos.detach().cpu().float().tolist()
+                                )
+                            if torch.is_tensor(tfalse):
+                                teacher_prob_render_false_vals.extend(
+                                    tfalse.detach().cpu().float().tolist()
+                                )
+
+                            if not hasattr(model, "_printed_teacher_prob_render_debug"):
+                                print(
+                                    "[TEACHER_PROB_RENDER_DEBUG]",
+                                    "teacher_name=", teacher_name,
+                                    "teacher_probs_shape=", tuple(teacher_probs.shape),
+                                    "pred_shape=", tuple(teacher_pred_dense.shape),
+                                    "cos_mean=",
+                                    float(tcos.mean().detach().cpu().item()) if torch.is_tensor(tcos) else float("nan"),
+                                    "false_mean=",
+                                    float(tfalse.mean().detach().cpu().item()) if torch.is_tensor(tfalse) else float("nan"),
+                                )
+                                model._printed_teacher_prob_render_debug = True
+
                 active_teacher_recall = float("nan")
                 active_mask_diag = _get_active_candidate_mask_from_batch(
                     batch,
@@ -3829,6 +3912,8 @@ def train_mssubsetnet():
         avg_val_teacher_oracle_false_support = _finite_mean(val_teacher_oracle_false_support_vals)
         avg_val_teacher_oracle_pred_int_on_true = _finite_mean(val_teacher_oracle_pred_int_on_true_vals)
         avg_val_teacher_oracle_pred_n = _finite_mean(val_teacher_oracle_pred_n_vals)
+        avg_val_teacher_prob_render_cos = _finite_mean(teacher_prob_render_cos_vals)
+        avg_val_teacher_prob_render_false = _finite_mean(teacher_prob_render_false_vals)
         avg_val_model_topk_oracle_cos_256 = _finite_mean(val_model_topk_oracle_cos_256_vals)
         avg_val_model_topk_oracle_false_support_256 = _finite_mean(val_model_topk_oracle_false_support_256_vals)
         avg_val_utility_top64_oracle_cos = _finite_mean(val_utility_top64_oracle_cos_vals)
@@ -3950,6 +4035,12 @@ def train_mssubsetnet():
         else:
             # 榛樿浠嶇劧鐢?official cos
             model_select_metric = avg_val_cos if np.isfinite(avg_val_cos) else -1e9
+
+        if len(teacher_prob_render_cos_vals) > 0:
+            log(
+                f"[TEACHER_PROB_RENDER] cos={avg_val_teacher_prob_render_cos:.4f} "
+                f"false={avg_val_teacher_prob_render_false:.4f}"
+            )
         is_best = model_select_metric > (best_val_official_cos + early_stop_min_delta)
         if is_best:
             best_val_official_cos = model_select_metric
@@ -3982,6 +4073,8 @@ def train_mssubsetnet():
             'val_selected_false_mass@128': avg_val_selected_false_mass_128,
             'val_teacher_oracle_cos': avg_val_teacher_oracle_cos,
             'val_teacher_oracle_false_support': avg_val_teacher_oracle_false_support,
+            'val_teacher_prob_render_cos': avg_val_teacher_prob_render_cos,
+            'val_teacher_prob_render_false': avg_val_teacher_prob_render_false,
         }
         if int(eval_k_used) == 64:
             epoch_metrics['val_model_topk_oracle_cos@64'] = avg_val_model_topk_oracle_cos_eval
