@@ -967,6 +967,7 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
         # Purpose: test whether selector is failing because it lacks query-aware
         # candidate-vs-spectrum information.
         # ------------------------------------------------------------
+        oracle_align_feat_for_logit = None
         use_oracle_align_selector = os.environ.get("USE_ORACLE_ALIGN_SELECTOR", "0") == "1"
 
         if use_oracle_align_selector:
@@ -1007,6 +1008,7 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
             )
 
             if torch.is_tensor(align_feat):
+                oracle_align_feat_for_logit = align_feat
                 align_h = self.align_to_base_proj(
                     align_feat.to(device=device, dtype=base_h.dtype)
                 )
@@ -1048,6 +1050,48 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
             peak_feat=selector_peak_feat,
             frag_aux=frag_aux_t,
         )
+
+        if (
+            os.environ.get("USE_ORACLE_ALIGN_LOGIT_BIAS", "0") == "1"
+            and torch.is_tensor(oracle_align_feat_for_logit)
+        ):
+            af = oracle_align_feat_for_logit.to(
+                device=selector_logits.device,
+                dtype=selector_logits.dtype,
+            )
+
+            # af[..., 0] = overlap_count / 32
+            # af[..., 1] = int_overlap
+            # af[..., 2] = cosine similarity
+            # af[..., 3] = intensity precision
+            oracle_score = (
+                2.0 * af[..., 0]
+                + 1.0 * af[..., 1]
+                + 8.0 * af[..., 2]
+                + 4.0 * af[..., 3]
+            )
+
+            try:
+                oracle_scale = float(os.environ.get("ORACLE_ALIGN_LOGIT_SCALE", "10.0"))
+            except Exception:
+                oracle_scale = 10.0
+
+            selector_logits = selector_logits + oracle_scale * oracle_score
+
+            if not hasattr(self, "_printed_oracle_logit_bias_debug"):
+                with torch.no_grad():
+                    print(
+                        "[ORACLE_LOGIT_BIAS_DEBUG]",
+                        "oracle_score_mean=",
+                        float(oracle_score.mean().detach().cpu().item()),
+                        "oracle_score_max=",
+                        float(oracle_score.max().detach().cpu().item()),
+                        "oracle_scale=",
+                        float(oracle_scale),
+                        flush=True,
+                    )
+                self._printed_oracle_logit_bias_debug = True
+
         selector_logits = selector_logits.masked_fill(
             invalid_formula,
             torch.finfo(selector_logits.dtype).min,
