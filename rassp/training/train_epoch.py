@@ -8,6 +8,7 @@ from rassp.training.batch_utils import move_batch_to_device, prepare_batch_cpu
 from rassp.training.formula_targets import (
     apply_teacher_topk_to_target,
     compute_formula_target_probs_from_batch,
+    build_true_official_dense_from_cached_sparse_batch,
 )
 from rassp.training.logging_utils import MetricAccumulator
 from rassp.training.loss_utils import compute_precursor_loss_from_batch, masked_prob_kl
@@ -21,12 +22,59 @@ from rassp.training.selector_losses import (
     compute_selector_soft_false_support_loss,
     compute_selector_utility_target_loss,
 )
-from rassp.training.train_loss_components import selector_pairwise_utility_loss
+from rassp.training.train_loss_components import (
+    selector_pairwise_utility_loss,
+    compute_official_dense_spectral_loss,
+    _false_support_mass_loss_dense,
+)
 
 
 def _cfg_value(cfg, name, default):
     return getattr(cfg, name, default) if cfg is not None else default
+def _build_true_dense_like_pred(batch, pred_spect):
+    """
+    Build true dense official spectrum with the same shape as pred_spect.
 
+    pred_spect: [B, bin_n]
+    return: true_dense [B, bin_n] or None
+    """
+    if not torch.is_tensor(pred_spect):
+        return None
+    if pred_spect.dim() != 2:
+        return None
+
+    batch_n = int(pred_spect.shape[0])
+    bin_n = int(pred_spect.shape[1])
+    device = pred_spect.device
+
+    if batch_n <= 0 or bin_n <= 0:
+        return None
+
+    true_dense, used_cache = build_true_official_dense_from_cached_sparse_batch(
+        batch=batch,
+        batch_n=batch_n,
+        device=device,
+        official_bin_n=bin_n,
+    )
+
+    if not torch.is_tensor(true_dense):
+        return None
+
+    true_dense = true_dense[:batch_n, :bin_n].to(
+        device=device,
+        dtype=pred_spect.dtype,
+    )
+
+    true_dense = torch.where(
+        torch.isfinite(true_dense),
+        true_dense,
+        torch.zeros_like(true_dense),
+    ).clamp_min(0.0)
+
+    if float(true_dense.sum().detach().item()) <= 0.0:
+        return None
+
+    return true_dense
 
 def _as_2d(x):
     if not torch.is_tensor(x):
@@ -136,7 +184,45 @@ def train_one_epoch(
             res = model(**batch)
             base = res["spect"] if isinstance(res, dict) and torch.is_tensor(res.get("spect", None)) else None
             loss = base.sum() * 0.0 if torch.is_tensor(base) else torch.zeros((), device=device)
+            # ------------------------------------------------------------
+            # Stage 2: official dense spectral loss
+            # ------------------------------------------------------------
+            pred_spect = (
+                res.get("spect", None)
+                if isinstance(res, dict)
+                else None
+            )
 
+            if torch.is_tensor(pred_spect):
+                official_w = float(_cfg_value(loss_cfg, "official_spectral_weight", 0.0))
+                if official_w > 0.0:
+                    true_dense = _build_true_dense_like_pred(batch, pred_spect)
+
+                    if torch.is_tensor(true_dense):
+                        try:
+                            official_kl_w = float(os.environ.get("OFFICIAL_DENSE_KL_WEIGHT", "0.05"))
+                        except Exception:
+                            official_kl_w = 0.05
+
+                        official_loss = compute_official_dense_spectral_loss(
+                            pred_spect,
+                            true_dense,
+                            kl_weight=official_kl_w,
+                        )
+
+                        if torch.is_tensor(official_loss):
+                            loss = loss + official_w * official_loss
+                            acc.add("official_spectral", official_loss.detach().item())
+
+                        false_dense_w = float(os.environ.get("OFFICIAL_DENSE_FALSE_WEIGHT", "0.0"))
+                        if false_dense_w > 0.0:
+                            dense_false = _false_support_mass_loss_dense(
+                                pred_spect,
+                                true_dense,
+                            )
+                            if torch.is_tensor(dense_false):
+                                loss = loss + false_dense_w * dense_false
+                                acc.add("official_dense_false", dense_false.detach().item())
             selector_logits = res.get("selector_logits", None) if isinstance(res, dict) else None
             formulae_mask = batch.get("formulae_mask", None)
             selector_loss_total = None

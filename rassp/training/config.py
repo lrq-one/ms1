@@ -28,6 +28,7 @@ class RunConfig:
     max_val_steps: int
     batch_size: int
     model_select_metric: str
+    model_select_mode: str
 
 
 @dataclass
@@ -68,9 +69,15 @@ def get_run_config():
         max_train_steps=env_int("MAX_TRAIN_STEPS", 0),
         max_val_steps=env_int("MAX_VAL_STEPS", 0),
         batch_size=env_int("BATCH_SIZE", 4),
-        model_select_metric=os.environ.get("MODEL_SELECT_METRIC", "model_topk_oracle_cos_64"),
+        model_select_metric=os.environ.get(
+            "MODEL_SELECT_METRIC",
+            "official_cos_no_precursor",
+        ),
+        model_select_mode=os.environ.get(
+            "MODEL_SELECT_MODE",
+            "max",
+        ).strip().lower(),
     )
-
 
 def get_selector_config():
     return SelectorConfig(
