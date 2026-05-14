@@ -53,8 +53,14 @@ def validate_one_epoch(
                 pred_spect=pred_spect,
                 spect_bin_centers=spect_bin_centers,
                 metric_cfg=metric_cfg,
-                pred_exact_peaks=res.get("pred_exact_peaks", None),
-                debug_ctx=None,
+                pred_exact_peaks=None,
+                debug_ctx={
+                    "enabled": os.environ.get("DEBUG_EVAL_SUPPORT", "0") == "1",
+                    "epoch": epoch,
+                    "batch": step,
+                    "printed": 0,
+                    "max_samples": int(os.environ.get("DEBUG_EVAL_SUPPORT_N", "2")),
+                },
             )
             if isinstance(official, dict):
                 for key, value in official.items():
