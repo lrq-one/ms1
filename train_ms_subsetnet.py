@@ -1434,7 +1434,17 @@ def train_mssubsetnet():
     assert hasattr(model.spect_out, 'selector_head')
     assert hasattr(model.spect_out, 'peak_score_mlp')
     assert hasattr(model.spect_out, 'oos_head')
+    if os.environ.get("FREEZE_SELECTOR_HEAD", "0") == "1":
+        frozen = 0
+        for name, p in model.named_parameters():
+            if (
+                "selector_head" in name
+                or "selector" in name
+            ):
+                p.requires_grad = False
+                frozen += p.numel()
 
+        log(f"[FREEZE] FREEZE_SELECTOR_HEAD=1 frozen_params={frozen}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -1444,19 +1454,38 @@ def train_mssubsetnet():
         def _select_metric_value(metrics, name):
             if not isinstance(metrics, dict):
                 return None
-            candidates = [name]
-            if not str(name).startswith("val_"):
-                candidates.append(f"val_{name}")
-            if isinstance(name, str) and "_" in name:
-                parts = name.rsplit("_", 1)
-                if len(parts) == 2 and parts[1].isdigit():
-                    at_name = f"{parts[0]}@{parts[1]}"
-                    candidates.append(at_name)
-                    if not at_name.startswith("val_"):
-                        candidates.append(f"val_{at_name}")
+
+            raw = str(name).strip()
+            candidates = []
+
+            def add(x):
+                x = str(x).strip()
+                if x and x not in candidates:
+                    candidates.append(x)
+
+            add(raw)
+
+            if raw.startswith("val_"):
+                add(raw[len("val_"):])
+            else:
+                add(f"val_{raw}")
+
+            # 支持 selected_false_mass_8 -> selected_false_mass@8
+            for base in list(candidates):
+                if "_" in base:
+                    parts = base.rsplit("_", 1)
+                    if len(parts) == 2 and parts[1].isdigit():
+                        at_name = f"{parts[0]}@{parts[1]}"
+                        add(at_name)
+                        if at_name.startswith("val_"):
+                            add(at_name[len("val_"):])
+                        else:
+                            add(f"val_{at_name}")
+
             for key in candidates:
                 if key in metrics:
                     return metrics[key]
+
             return None
 
         best_metric = None
@@ -1495,18 +1524,52 @@ def train_mssubsetnet():
 
             select_metric = run_cfg.model_select_metric
             current_metric = _select_metric_value(epoch_metrics, select_metric)
-            is_best = is_better_metric(current_metric, best_metric, mode="max")
+            select_metric = str(
+                getattr(run_cfg, "model_select_metric", "official_cos_no_precursor")
+            ).strip()
+
+            select_mode = str(
+                getattr(run_cfg, "model_select_mode", "max")
+            ).strip().lower()
+
+            if select_mode not in ("max", "min"):
+                log(f"[WARN] invalid MODEL_SELECT_MODE={select_mode}, fallback to max")
+                select_mode = "max"
+
+            current_metric = _select_metric_value(epoch_metrics, select_metric)
+
+            if current_metric is None:
+                log(
+                    f"[WARN] MODEL_SELECT_METRIC={select_metric} not found. "
+                    f"available_keys={sorted(epoch_metrics.keys())}"
+                )
+
+            is_best = is_better_metric(
+                current=current_metric,
+                best=best_metric,
+                mode=select_mode,
+            )
+
             if is_best:
-                best_metric = current_metric
+                best_metric = float(current_metric)
                 save_checkpoint(
                     best_ckpt_path,
                     model=model,
                     optimizer=optimizer,
                     scaler=scaler,
                     epoch=epoch_idx,
-                    metrics=epoch_metrics,
+                    metrics={
+                        **epoch_metrics,
+                        "model_select_metric": select_metric,
+                        "model_select_mode": select_mode,
+                        "model_select_value": best_metric,
+                    },
                 )
-
+                log(
+                    f"[BEST] epoch={epoch_idx} "
+                    f"{select_metric}={best_metric:.6f} "
+                    f"mode={select_mode}"
+                )
             line = format_metric_line(f"Epoch {epoch_idx}/{run_cfg.epochs}", epoch_metrics)
             if is_best:
                 line += " | BEST"
@@ -1711,10 +1774,8 @@ def train_mssubsetnet():
             # ---------- teacher top64 target ----------
             teacher_target_full = compute_formula_target_probs_from_batch(
                 batch,
-                bin_width=main_target_bin_width,
-                max_mz=main_target_max_mz,
-                target_mode=formula_target_mode,
-                support_temperature=target_support_temperature,
+                official_bin_width=main_target_bin_width,
+                official_max_mz=main_target_max_mz,
                 support_topk=target_support_topk,
             )
             teacher_target_full = _renormalize_target_probs(
@@ -2768,10 +2829,8 @@ def train_mssubsetnet():
                 # teacher target 鍙敤浜庤瘖鏂?KL锛屼笉鐢ㄤ簬楠岃瘉 forward
                 teacher_target_full = compute_formula_target_probs_from_batch(
                     batch,
-                    bin_width=main_target_bin_width,
-                    max_mz=main_target_max_mz,
-                    target_mode=formula_target_mode,
-                    support_temperature=target_support_temperature,
+                    official_bin_width=main_target_bin_width,
+                    official_max_mz=main_target_max_mz,
                     support_topk=target_support_topk,
                 )
 
