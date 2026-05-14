@@ -10,6 +10,7 @@ from rassp.training.formula_targets import (
     compute_formula_target_probs_from_batch,
     build_true_official_dense_from_cached_sparse_batch,
 )
+from rassp.training.spectrum_targets import build_true_official_dense_from_raw
 from rassp.training.logging_utils import MetricAccumulator
 from rassp.training.loss_utils import compute_precursor_loss_from_batch, masked_prob_kl
 from rassp.training.runtime_selector_targets import (
@@ -31,13 +32,21 @@ from rassp.training.train_loss_components import (
 
 def _cfg_value(cfg, name, default):
     return getattr(cfg, name, default) if cfg is not None else default
-def _build_true_dense_like_pred(batch, pred_spect):
+
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, str(default)))
+    except Exception:
+        return float(default)
+def _build_true_dense_like_pred(batch, pred_spect, metric_cfg=None):
     """
     Build true dense official spectrum with the same shape as pred_spect.
 
     pred_spect: [B, bin_n]
     return: true_dense [B, bin_n] or None
     """
+    metric_cfg = metric_cfg or {}
+
     if not torch.is_tensor(pred_spect):
         return None
     if pred_spect.dim() != 2:
@@ -57,6 +66,26 @@ def _build_true_dense_like_pred(batch, pred_spect):
         official_bin_n=bin_n,
     )
 
+    need_raw_fallback = (
+        (not used_cache)
+        or (not torch.is_tensor(true_dense))
+        or float(true_dense.sum().detach().item()) <= 0.0
+    )
+
+    if need_raw_fallback:
+        official_bin_width = float(metric_cfg.get("bin_width", 0.01))
+        official_max_mz = float(metric_cfg.get("max_mz", 1005.0))
+
+        true_dense = build_true_official_dense_from_raw(
+            spect_raw_list=batch.get("spect_raw", None),
+            precursor_mz=batch.get("precursor_mz", None),
+            official_bin_width=official_bin_width,
+            official_max_mz=official_max_mz,
+            exclude_precursor=True,
+            batch_n=batch_n,
+            device=device,
+        )
+
     if not torch.is_tensor(true_dense):
         return None
 
@@ -75,7 +104,6 @@ def _build_true_dense_like_pred(batch, pred_spect):
         return None
 
     return true_dense
-
 def _as_2d(x):
     if not torch.is_tensor(x):
         return None
@@ -187,22 +215,23 @@ def train_one_epoch(
             # ------------------------------------------------------------
             # Stage 2: official dense spectral loss
             # ------------------------------------------------------------
-            pred_spect = (
-                res.get("spect", None)
-                if isinstance(res, dict)
-                else None
-            )
+            pred_spect = None
+            if isinstance(res, dict):
+                pred_spect = res.get("spect_out_official", None)
+                if not torch.is_tensor(pred_spect):
+                    pred_spect = res.get("spect", None)
 
             if torch.is_tensor(pred_spect):
                 official_w = float(_cfg_value(loss_cfg, "official_spectral_weight", 0.0))
                 if official_w > 0.0:
-                    true_dense = _build_true_dense_like_pred(batch, pred_spect)
+                    true_dense = _build_true_dense_like_pred(
+                        batch,
+                        pred_spect,
+                        metric_cfg=metric_cfg,
+                    )
 
                     if torch.is_tensor(true_dense):
-                        try:
-                            official_kl_w = float(os.environ.get("OFFICIAL_DENSE_KL_WEIGHT", "0.05"))
-                        except Exception:
-                            official_kl_w = 0.05
+                        official_kl_w = _env_float("OFFICIAL_DENSE_KL_WEIGHT", 0.05)
 
                         official_loss = compute_official_dense_spectral_loss(
                             pred_spect,
@@ -214,7 +243,7 @@ def train_one_epoch(
                             loss = loss + official_w * official_loss
                             acc.add("official_spectral", official_loss.detach().item())
 
-                        false_dense_w = float(os.environ.get("OFFICIAL_DENSE_FALSE_WEIGHT", "0.0"))
+                        false_dense_w = _env_float("OFFICIAL_DENSE_FALSE_WEIGHT", 0.0)
                         if false_dense_w > 0.0:
                             dense_false = _false_support_mass_loss_dense(
                                 pred_spect,
@@ -227,15 +256,16 @@ def train_one_epoch(
             formulae_mask = batch.get("formulae_mask", None)
             selector_loss_total = None
             if torch.is_tensor(selector_logits) and torch.is_tensor(formulae_mask):
-                target_probs = compute_formula_target_probs_from_batch(
-                    batch,
-                    bin_width=float(metric_cfg.get("bin_width", 0.1)),
-                    max_mz=float(metric_cfg.get("max_mz", 1005.0)),
-                    support_topk=int(_cfg_value(selector_cfg, "target_support_topk", 64)),
-                )
                 official_bin_width = float(metric_cfg.get("bin_width", 0.01))
                 official_max_mz = float(metric_cfg.get("max_mz", 1005.0))
                 official_bin_n = int(official_max_mz / max(official_bin_width, 1e-8)) + 1
+
+                target_probs = compute_formula_target_probs_from_batch(
+                    batch,
+                    official_bin_width=official_bin_width,
+                    official_max_mz=official_max_mz,
+                    support_topk=int(_cfg_value(selector_cfg, "target_support_topk", 64)),
+                )
                 teacher_dist = build_selector_teacher_dist_setcover(
                     batch=batch,
                     formulae_mask=formulae_mask,

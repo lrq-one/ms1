@@ -42,7 +42,11 @@ def validate_one_epoch(
         batch = move_batch_to_device(processed, device)
         res = model(**batch)
 
-        pred_spect = res.get("spect", None) if isinstance(res, dict) else None
+        pred_spect = None
+        if isinstance(res, dict):
+            pred_spect = res.get("spect_out_official", None)
+            if not torch.is_tensor(pred_spect):
+                pred_spect = res.get("spect", None)
         if torch.is_tensor(pred_spect):
             official = compute_batch_official_metrics(
                 raw_batch=batch,

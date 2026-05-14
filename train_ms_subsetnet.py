@@ -1522,8 +1522,6 @@ def train_mssubsetnet():
             epoch_metrics.update({f"train_{k}": v for k, v in train_metrics.items()})
             epoch_metrics.update({f"val_{k}": v for k, v in val_metrics.items()})
 
-            select_metric = run_cfg.model_select_metric
-            current_metric = _select_metric_value(epoch_metrics, select_metric)
             select_metric = str(
                 getattr(run_cfg, "model_select_metric", "official_cos_no_precursor")
             ).strip()
