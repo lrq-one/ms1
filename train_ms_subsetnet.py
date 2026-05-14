@@ -1688,7 +1688,22 @@ def train_mssubsetnet():
 
                 precursor_loss = compute_precursor_loss_from_batch(batch, res_full)
                 if not torch.is_tensor(precursor_loss):
-                    precursor_loss = res_full['spect'].sum() * 0.0
+                    if isinstance(res_full, dict) and torch.is_tensor(res_full.get("spect", None)):
+                        precursor_loss = res_full["spect"].sum() * 0.0
+                    elif isinstance(res, dict) and torch.is_tensor(res.get("selector_logits", None)):
+                        precursor_loss = res["selector_logits"].sum() * 0.0
+                    elif isinstance(res, dict):
+                        _anchor = None
+                        for _v in res.values():
+                            if torch.is_tensor(_v):
+                                _anchor = _v
+                                break
+                        if _anchor is not None:
+                            precursor_loss = _anchor.sum() * 0.0
+                        else:
+                            precursor_loss = torch.zeros((), device=device)
+                    else:
+                        precursor_loss = torch.zeros((), device=device)
 
                 fn_loss = res_full['spect'].sum() * 0.0
                 if os.environ.get("TRAIN_FRAGMENT_NODE_SELECTOR", "0") == "1":
