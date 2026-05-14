@@ -227,7 +227,20 @@ def coverage_aware_topk(
 
         inten = inten / inten.sum(dim=-1, keepdim=True).clamp_min(float(eps))
 
-        base = score_b[pref_idx]
+        base_raw = score_b[pref_idx]
+
+        finite = torch.isfinite(base_raw)
+        if bool(finite.any().item()):
+            center = base_raw[finite].median()
+            scale = base_raw[finite].std().clamp_min(1e-6)
+            base = ((base_raw - center) / scale).clamp(-5.0, 5.0)
+        else:
+            base = torch.zeros_like(base_raw)
+
+        try:
+            base_weight = float(os.environ.get("COVERAGE_BASE_WEIGHT", "0.20"))
+        except Exception:
+            base_weight = 0.20
 
         picked = torch.zeros((pp,), dtype=torch.bool, device=scores.device)
         selected_pos = []
@@ -257,7 +270,7 @@ def coverage_aware_topk(
             novelty = ((1.0 - covered_at).clamp_min(0.0) * inten).sum(dim=-1)
 
             adjusted = (
-                base
+                float(base_weight) * base
                 - float(duplicate_penalty) * overlap
                 + float(novelty_bonus) * novelty
             )
@@ -302,6 +315,31 @@ def coverage_aware_topk(
                     pad = pref_idx[:need - int(rest.shape[0])]
                     rest = torch.cat([rest, pad], dim=0)
                 selected = torch.cat([selected, rest], dim=0)
+
+        if os.environ.get("DEBUG_COVERAGE_TOPK", "0") == "1":
+            if not hasattr(coverage_aware_topk, "_printed_debug"):
+                plain = pref_idx[:kk]
+                sel_tmp = selected[:kk]
+
+                common = torch.isin(sel_tmp.detach().cpu(), plain.detach().cpu()).float().mean().item()
+
+                print(
+                    "[COVERAGE_TOPK_DEBUG]",
+                    "B=", B,
+                    "M=", M,
+                    "k=", kk,
+                    "prefilter=", pp,
+                    "base_raw_min=", float(base_raw.min().detach().cpu().item()),
+                    "base_raw_max=", float(base_raw.max().detach().cpu().item()),
+                    "base_norm_min=", float(base.min().detach().cpu().item()),
+                    "base_norm_max=", float(base.max().detach().cpu().item()),
+                    "base_weight=", float(base_weight),
+                    "dup_penalty=", float(duplicate_penalty),
+                    "novelty_bonus=", float(novelty_bonus),
+                    "selected_plain_overlap_ratio=", float(common),
+                    flush=True,
+                )
+                coverage_aware_topk._printed_debug = True
 
         selected_all.append(selected[:kk])
 
