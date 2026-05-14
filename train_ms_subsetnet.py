@@ -73,6 +73,7 @@ from rassp.training.train_loss_components import (
     compute_official_dense_spectral_loss,
     selector_pairwise_utility_loss,
 )
+from rassp.model.formulaenets_legacy import project_formula_probs_to_spectrum_dense
 from rassp.training.selector_metrics import (
     build_group_unique_topk_mask_from_scores,
     build_mask_from_topk_indices,
@@ -636,6 +637,120 @@ def _compute_oos_loss_from_batch(batch, res, official_bin_width=0.01, official_m
 
     return F.binary_cross_entropy_with_logits(logits[valid], target[valid], reduction='mean')
 
+
+def _pick_first_tensor_from_locals(local_vars, names):
+    for name in names:
+        v = local_vars.get(name, None)
+        if torch.is_tensor(v):
+            return v, name
+    return None, None
+
+
+def _normalize_candidate_probs_for_render(probs, formulae_mask=None):
+    if not torch.is_tensor(probs):
+        return None
+
+    p = probs.float()
+
+    if p.dim() == 1:
+        p = p.unsqueeze(0)
+    elif p.dim() > 2:
+        p = p.reshape(p.shape[0], -1)
+
+    if torch.is_tensor(formulae_mask):
+        fm = formulae_mask.float()
+        if fm.dim() == 1:
+            fm = fm.unsqueeze(0)
+        elif fm.dim() > 2:
+            fm = fm.reshape(fm.shape[0], -1)
+
+        use_b = min(int(p.shape[0]), int(fm.shape[0]))
+        use_m = min(int(p.shape[1]), int(fm.shape[1]))
+
+        p2 = torch.zeros_like(p)
+        p2[:use_b, :use_m] = p[:use_b, :use_m] * fm[:use_b, :use_m].to(
+            device=p.device,
+            dtype=p.dtype,
+        )
+        p = p2
+
+    p = torch.where(torch.isfinite(p), p, torch.zeros_like(p))
+    p = p.clamp_min(0.0)
+    p = p / p.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    return p
+
+
+def _render_teacher_prob_spectrum_from_batch(
+    batch,
+    teacher_probs,
+    official_bin_n,
+):
+    """
+    Render teacher candidate probability distribution into official dense spectrum.
+    This is validation-only / debug-only.
+    """
+    if not torch.is_tensor(teacher_probs):
+        return None
+
+    formulae_mask = batch.get("formulae_mask", None)
+    teacher_probs = _normalize_candidate_probs_for_render(
+        teacher_probs,
+        formulae_mask=formulae_mask,
+    )
+
+    peak_idx = batch.get("formulae_peaks_official_idx_agg", None)
+    peak_int = batch.get("formulae_peaks_official_intensity_agg", None)
+
+    if not torch.is_tensor(peak_idx):
+        peak_idx = batch.get("formulae_peaks_official_idx", None)
+    if not torch.is_tensor(peak_int):
+        peak_int = batch.get("formulae_peaks_official_intensity", None)
+
+    if (not torch.is_tensor(peak_idx)) or (not torch.is_tensor(peak_int)):
+        return None
+
+    pred = project_formula_probs_to_spectrum_dense(
+        teacher_probs,
+        peak_idx,
+        peak_int,
+        int(official_bin_n),
+        formulae_mask=formulae_mask,
+        mass_shift_probs=None,
+        mass_shift_offsets=None,
+    )
+
+    pred = torch.where(torch.isfinite(pred), pred, torch.zeros_like(pred))
+    pred = pred.clamp_min(0.0)
+    pred = pred / pred.sum(dim=1, keepdim=True).clamp_min(1e-12)
+
+    return pred
+
+
+def _dense_cos_and_false_support(pred_dense, true_dense):
+    if (not torch.is_tensor(pred_dense)) or (not torch.is_tensor(true_dense)):
+        return None, None
+
+    use_b = min(int(pred_dense.shape[0]), int(true_dense.shape[0]))
+    use_m = min(int(pred_dense.shape[1]), int(true_dense.shape[1]))
+
+    if use_b <= 0 or use_m <= 0:
+        return None, None
+
+    pred = pred_dense[:use_b, :use_m].float()
+    true = true_dense[:use_b, :use_m].float()
+
+    pred = torch.where(torch.isfinite(pred), pred, torch.zeros_like(pred)).clamp_min(0.0)
+    true = torch.where(torch.isfinite(true), true, torch.zeros_like(true)).clamp_min(0.0)
+
+    pred_l2 = pred / pred.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    true_l2 = true / true.norm(dim=1, keepdim=True).clamp_min(1e-12)
+
+    cos = (pred_l2 * true_l2).sum(dim=1)
+
+    true_support = true > 1e-12
+    false_mass = (pred * (~true_support).float()).sum(dim=1) / pred.sum(dim=1).clamp_min(1e-12)
+
+    return cos.detach(), false_mass.detach()
 def _prune_batch_by_candidate_mask(
     batch,
     cand_mask,
@@ -2464,6 +2579,8 @@ def train_mssubsetnet():
         val_utility_top64_false_support_vals = []
         val_utility_top64_true_hit_mass_vals = []
         val_utility_top64_false_mass_vals = []
+        teacher_prob_render_cos_vals = []
+        teacher_prob_render_false_vals = []
         epoch_best_sparse = None
         epoch_worst_sparse = None
         epoch_best_cos = -1.0
