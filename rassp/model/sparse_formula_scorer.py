@@ -961,6 +961,56 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
             official_bin_width=selector_peak_bin_width,
         )
 
+        # ------------------------------------------------------------
+        # Debug-only oracle alignment feature for selector diagnosis.
+        # This uses true spectrum, so it MUST NOT be used for real inference.
+        # Purpose: test whether selector is failing because it lacks query-aware
+        # candidate-vs-spectrum information.
+        # ------------------------------------------------------------
+        use_oracle_align_selector = os.environ.get("USE_ORACLE_ALIGN_SELECTOR", "0") == "1"
+
+        if use_oracle_align_selector:
+            true_idx = kwargs.get("official_sparse_idx", None)
+            true_val = kwargs.get("official_sparse_val", None)
+
+            if true_idx is None:
+                true_idx = kwargs.get("spect_sparse_idx", None)
+            if true_val is None:
+                true_val = kwargs.get("spect_sparse_val", None)
+
+            if true_idx is None:
+                true_idx = kwargs.get("true_sparse_idx", None)
+            if true_val is None:
+                true_val = kwargs.get("true_sparse_val", None)
+
+            align_feat = self._build_candidate_true_alignment_feat(
+                batch_n=batch_n,
+                formula_n=formula_n,
+                device=device,
+                formulae_mask=formulae_mask,
+                off_idx=peak_idx_for_head if "peak_idx_for_head" in locals() else formulae_peaks_mass_idx,
+                off_int=peak_int_for_head if "peak_int_for_head" in locals() else formulae_peaks_intensity,
+                true_idx=true_idx,
+                true_val=true_val,
+                official_bin_n=official_bin_n if "official_bin_n" in locals() else self.spect_bin.get_num_bins(),
+                official_bin_width=official_bin_width if "official_bin_width" in locals() else 1.0,
+            )
+
+            if torch.is_tensor(align_feat):
+                align_h = self.align_to_base_proj(align_feat.to(device=device, dtype=candidate_h.dtype))
+                candidate_h = candidate_h + align_h
+
+                if not hasattr(self, "_printed_oracle_align_debug"):
+                    with torch.no_grad():
+                        print(
+                            "[ORACLE_ALIGN_SELECTOR_DEBUG]",
+                            "align_feat_shape=", tuple(align_feat.shape),
+                            "align_feat_mean=", float(align_feat.mean().detach().cpu().item()),
+                            "align_feat_max=", float(align_feat.max().detach().cpu().item()),
+                            "align_h_std=", float(align_h.std().detach().cpu().item()),
+                        )
+                    self._printed_oracle_align_debug = True
+
         # debug diagnostics for explanation matching
         matched_subset_per_sample = torch.zeros((batch_n,), dtype=torch.float32, device=device)
         matched_formula_per_sample = torch.zeros((batch_n,), dtype=torch.float32, device=device)
