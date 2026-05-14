@@ -56,3 +56,8 @@ export NUM_WORKERS=4
 export MODEL_SELECT_METRIC=official_cos_no_precursor
 export MODEL_SELECT_MODE=max
 export BEST_CKPT_PATH=checkpoints/stage2_top8_spectral_best.pt
+
+export SELECTOR_ONLY_WARMUP_EPOCHS=0
+export SPECTRAL_LOSS_START_EPOCH=0
+export PEAK_AUX_START_EPOCH=9999
+export OOS_LOSS_START_EPOCH=9999

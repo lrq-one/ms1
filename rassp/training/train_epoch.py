@@ -220,7 +220,21 @@ def train_one_epoch(
                 pred_spect = res.get("spect_out_official", None)
                 if not torch.is_tensor(pred_spect):
                     pred_spect = res.get("spect", None)
-
+            if os.environ.get("DEBUG_OFFICIAL_LOSS", "0") == "1" and step == 0:
+                print(
+                    "[DEBUG_OFFICIAL_LOSS/pre]",
+                    "res_keys=", sorted(list(res.keys())) if isinstance(res, dict) else None,
+                    "has_spect=", torch.is_tensor(res.get("spect", None)) if isinstance(res, dict) else False,
+                    "spect_shape=", tuple(res["spect"].shape) if isinstance(res, dict) and torch.is_tensor(res.get("spect", None)) else None,
+                    "has_spect_out_official=", torch.is_tensor(res.get("spect_out_official", None)) if isinstance(res, dict) else False,
+                    "spect_out_official_shape=", tuple(res["spect_out_official"].shape) if isinstance(res, dict) and torch.is_tensor(res.get("spect_out_official", None)) else None,
+                    "pred_spect_shape=", tuple(pred_spect.shape) if torch.is_tensor(pred_spect) else None,
+                    "official_w=", float(_cfg_value(loss_cfg, "official_spectral_weight", 0.0)),
+                    "batch_has_true_all_idx=", torch.is_tensor(batch.get("true_all_official_idx", None)),
+                    "batch_has_true_idx=", torch.is_tensor(batch.get("true_official_idx", None)),
+                    "batch_has_spect_raw=", batch.get("spect_raw", None) is not None,
+                    flush=True,
+                )
             if torch.is_tensor(pred_spect):
                 official_w = float(_cfg_value(loss_cfg, "official_spectral_weight", 0.0))
                 if official_w > 0.0:
@@ -229,7 +243,17 @@ def train_one_epoch(
                         pred_spect,
                         metric_cfg=metric_cfg,
                     )
-
+                    if os.environ.get("DEBUG_OFFICIAL_LOSS", "0") == "1" and step == 0:
+                        print(
+                            "[DEBUG_OFFICIAL_LOSS/target]",
+                            "true_dense_is_tensor=", torch.is_tensor(true_dense),
+                            "true_dense_shape=", tuple(true_dense.shape) if torch.is_tensor(true_dense) else None,
+                            "true_dense_sum=", float(true_dense.detach().float().sum().cpu().item()) if torch.is_tensor(true_dense) else None,
+                            "pred_sum=", float(pred_spect.detach().float().sum().cpu().item()) if torch.is_tensor(pred_spect) else None,
+                            "pred_min=", float(pred_spect.detach().float().min().cpu().item()) if torch.is_tensor(pred_spect) else None,
+                            "pred_max=", float(pred_spect.detach().float().max().cpu().item()) if torch.is_tensor(pred_spect) else None,
+                            flush=True,
+                        )
                     if torch.is_tensor(true_dense):
                         official_kl_w = _env_float("OFFICIAL_DENSE_KL_WEIGHT", 0.05)
 
@@ -238,7 +262,14 @@ def train_one_epoch(
                             true_dense,
                             kl_weight=official_kl_w,
                         )
-
+                        if os.environ.get("DEBUG_OFFICIAL_LOSS", "0") == "1" and step == 0:
+                            print(
+                                "[DEBUG_OFFICIAL_LOSS/loss]",
+                                "official_loss_is_tensor=", torch.is_tensor(official_loss),
+                                "official_loss=", float(official_loss.detach().cpu().item()) if torch.is_tensor(official_loss) else None,
+                                "official_kl_w=", official_kl_w,
+                                flush=True,
+                            )
                         if torch.is_tensor(official_loss):
                             loss = loss + official_w * official_loss
                             acc.add("official_spectral", official_loss.detach().item())
