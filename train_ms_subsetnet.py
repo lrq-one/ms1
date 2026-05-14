@@ -219,6 +219,23 @@ def _zero_loss_like(res=None, batch=None, device=None):
     return torch.zeros((), device=device)
 
 
+def _require_selector_logits(res_dict, context="selector"):
+    selector_logits = _get_selector_logits_from_res(res_dict)
+    if torch.is_tensor(selector_logits):
+        return selector_logits
+
+    if isinstance(res_dict, dict):
+        try:
+            key_preview = sorted(list(res_dict.keys()))
+        except Exception:
+            key_preview = list(res_dict.keys())
+        raise RuntimeError(
+            f"{context}: missing selector logits in model output; available keys={key_preview}"
+        )
+
+    raise RuntimeError(f"{context}: model output is not a dict, cannot read selector logits")
+
+
 def _parse_formula_oh_sizes(raw_value, element_n):
     if not raw_value:
         return None
@@ -1706,13 +1723,13 @@ def train_mssubsetnet():
                 precursor_loss = compute_precursor_loss_from_batch(batch, res_full)
                 if not torch.is_tensor(precursor_loss):
                     precursor_loss = _zero_loss_like(
-                        res=res_full if isinstance(res_full, dict) else res,
+                        res=res_full,
                         batch=batch,
                         device=device,
                     )
 
                 fn_loss = _zero_loss_like(
-                    res=res_full if isinstance(res_full, dict) else res,
+                    res=res_full,
                     batch=batch,
                     device=device,
                 )
@@ -1736,7 +1753,10 @@ def train_mssubsetnet():
                                 )
                                 fn_loss = bce_loss
 
-                selector_logits = _get_selector_logits_from_res(res_full)
+                selector_logits = _require_selector_logits(
+                    res_full,
+                    context="train selector_only_forward",
+                )
 
                 # Raw logits: only used for trainable selector losses.
                 # Do NOT add rule/prior bias into BCE/KL loss.
@@ -1748,14 +1768,14 @@ def train_mssubsetnet():
                 selector_target_mask = selector_pos_label
                 selector_mask_full = formulae_mask
 
-                selector_bce_loss = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                selector_recall_bce_loss = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                selector_kl_loss = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                selector_pairwise_loss = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                selector_utility_kl_loss = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                selector_pos_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                selector_quality_mean = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                selector_dyn_pos_weight = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                selector_bce_loss = _zero_loss_like(res=res_full, batch=batch, device=device)
+                selector_recall_bce_loss = _zero_loss_like(res=res_full, batch=batch, device=device)
+                selector_kl_loss = _zero_loss_like(res=res_full, batch=batch, device=device)
+                selector_pairwise_loss = _zero_loss_like(res=res_full, batch=batch, device=device)
+                selector_utility_kl_loss = _zero_loss_like(res=res_full, batch=batch, device=device)
+                selector_pos_rate = _zero_loss_like(res=res_full, batch=batch, device=device)
+                selector_quality_mean = _zero_loss_like(res=res_full, batch=batch, device=device)
+                selector_dyn_pos_weight = _zero_loss_like(res=res_full, batch=batch, device=device)
 
                 if (
                     torch.is_tensor(selector_quality)
@@ -1806,7 +1826,7 @@ def train_mssubsetnet():
                             neg_part=0.25,
                         )
                         if selector_recall_bce_loss is None:
-                            selector_recall_bce_loss = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                            selector_recall_bce_loss = _zero_loss_like(res=res_full, batch=batch, device=device)
 
                     try:
                         gamma = float(os.environ.get("QUALITY_TARGET_GAMMA", "2.0"))
@@ -1924,7 +1944,7 @@ def train_mssubsetnet():
                             max_pairs=int(os.environ.get("SELECTOR_PAIRWISE_MAX_PAIRS", "2048")),
                         )
                         if (not torch.is_tensor(selector_pairwise_loss)) or (not torch.isfinite(selector_pairwise_loss)):
-                            selector_pairwise_loss = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                            selector_pairwise_loss = _zero_loss_like(res=res_full, batch=batch, device=device)
 
                     if torch.is_tensor(utility_dist_t):
                         utility_log_probs = F.log_softmax(
@@ -1944,17 +1964,17 @@ def train_mssubsetnet():
                             selector_utility_kl_loss * valid_rows
                         ).sum() / valid_rows.sum().clamp_min(1.0)
                         if (not torch.is_tensor(selector_utility_kl_loss)) or (not torch.isfinite(selector_utility_kl_loss)):
-                            selector_utility_kl_loss = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                            selector_utility_kl_loss = _zero_loss_like(res=res_full, batch=batch, device=device)
 
-                target_pos_false_mass = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                target_pos_overlap_exact = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                target_clean_pos_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                target_pool_pos_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                target_pool_pos_false_mass = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                target_pool_pos_overlap_tol = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                target_teacher_pos_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                target_teacher_dist_n = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                target_teacher_added_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                target_pos_false_mass = _zero_loss_like(res=res_full, batch=batch, device=device)
+                target_pos_overlap_exact = _zero_loss_like(res=res_full, batch=batch, device=device)
+                target_clean_pos_rate = _zero_loss_like(res=res_full, batch=batch, device=device)
+                target_pool_pos_rate = _zero_loss_like(res=res_full, batch=batch, device=device)
+                target_pool_pos_false_mass = _zero_loss_like(res=res_full, batch=batch, device=device)
+                target_pool_pos_overlap_tol = _zero_loss_like(res=res_full, batch=batch, device=device)
+                target_teacher_pos_rate = _zero_loss_like(res=res_full, batch=batch, device=device)
+                target_teacher_dist_n = _zero_loss_like(res=res_full, batch=batch, device=device)
+                target_teacher_added_rate = _zero_loss_like(res=res_full, batch=batch, device=device)
                 if (
                     isinstance(selector_extra, dict)
                     and torch.is_tensor(selector_pos_label)
@@ -2039,9 +2059,9 @@ def train_mssubsetnet():
                     + float(selector_utility_kl_weight) * selector_utility_kl_loss
                 )
 
-                target_pos_exact_support_mass = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                target_strict_keep_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                target_fallback_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                target_pos_exact_support_mass = _zero_loss_like(res=res_full, batch=batch, device=device)
+                target_strict_keep_rate = _zero_loss_like(res=res_full, batch=batch, device=device)
+                target_fallback_rate = _zero_loss_like(res=res_full, batch=batch, device=device)
 
                 if (
                     isinstance(selector_extra, dict)
@@ -2883,13 +2903,13 @@ def train_mssubsetnet():
                     val_precursor_loss = compute_precursor_loss_from_batch(batch, res_full)
                     if not torch.is_tensor(val_precursor_loss):
                         val_precursor_loss = _zero_loss_like(
-                            res=res_full if isinstance(res_full, dict) else res,
+                            res=res_full,
                             batch=batch,
                             device=device,
                         )
 
                     val_fn_loss = _zero_loss_like(
-                        res=res_full if isinstance(res_full, dict) else res,
+                        res=res_full,
                         batch=batch,
                         device=device,
                     )
@@ -2913,7 +2933,10 @@ def train_mssubsetnet():
                                     )
                                     val_fn_loss = bce_loss
 
-                    selector_logits = _get_selector_logits_from_res(res_full)
+                    selector_logits = _require_selector_logits(
+                        res_full,
+                        context="val selector_only_forward",
+                    )
 
                     # Raw logits for diagnostic selector losses.
                     selector_logits_for_loss = selector_logits
@@ -2921,14 +2944,14 @@ def train_mssubsetnet():
                     # Biased logits only for topK selection.
                     selector_logits_for_topk = _apply_selector_aux_logit_bias(selector_logits, batch)
 
-                    val_selector_bce = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_selector_recall_bce = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_selector_kl = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_selector_pairwise = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_selector_utility_kl = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_selector_pos_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_selector_quality_mean = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_selector_dyn_pos_weight = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_selector_bce = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_selector_recall_bce = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_selector_kl = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_selector_pairwise = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_selector_utility_kl = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_selector_pos_rate = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_selector_quality_mean = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_selector_dyn_pos_weight = _zero_loss_like(res=res_full, batch=batch, device=device)
 
                     if (
                         torch.is_tensor(selector_quality)
@@ -2979,7 +3002,7 @@ def train_mssubsetnet():
                                 neg_part=0.25,
                             )
                             if val_selector_recall_bce is None:
-                                val_selector_recall_bce = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                                val_selector_recall_bce = _zero_loss_like(res=res_full, batch=batch, device=device)
 
                         try:
                             gamma = float(os.environ.get("QUALITY_TARGET_GAMMA", "2.0"))
@@ -3107,7 +3130,7 @@ def train_mssubsetnet():
                                 max_pairs=int(os.environ.get("SELECTOR_PAIRWISE_MAX_PAIRS", "2048")),
                             )
                             if (not torch.is_tensor(val_selector_pairwise)) or (not torch.isfinite(val_selector_pairwise)):
-                                val_selector_pairwise = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                                val_selector_pairwise = _zero_loss_like(res=res_full, batch=batch, device=device)
 
                         if torch.is_tensor(utility_dist_t):
                             utility_log_probs = F.log_softmax(
@@ -3127,20 +3150,20 @@ def train_mssubsetnet():
                                 val_selector_utility_kl * valid_rows
                             ).sum() / valid_rows.sum().clamp_min(1.0)
                             if (not torch.is_tensor(val_selector_utility_kl)) or (not torch.isfinite(val_selector_utility_kl)):
-                                val_selector_utility_kl = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                                val_selector_utility_kl = _zero_loss_like(res=res_full, batch=batch, device=device)
 
-                    val_target_pos_false_mass = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_target_pos_overlap_exact = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_target_pos_exact_support_mass = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_target_strict_keep_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_target_fallback_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_target_clean_pos_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_target_pool_pos_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_target_pool_pos_false_mass = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_target_pool_pos_overlap_tol = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_target_teacher_pos_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_target_teacher_dist_n = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
-                    val_target_teacher_added_rate = _zero_loss_like(res=res_full if isinstance(res_full, dict) else res, batch=batch, device=device)
+                    val_target_pos_false_mass = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_target_pos_overlap_exact = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_target_pos_exact_support_mass = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_target_strict_keep_rate = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_target_fallback_rate = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_target_clean_pos_rate = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_target_pool_pos_rate = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_target_pool_pos_false_mass = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_target_pool_pos_overlap_tol = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_target_teacher_pos_rate = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_target_teacher_dist_n = _zero_loss_like(res=res_full, batch=batch, device=device)
+                    val_target_teacher_added_rate = _zero_loss_like(res=res_full, batch=batch, device=device)
                     if (
                         isinstance(selector_extra, dict)
                         and torch.is_tensor(selector_pos_label)

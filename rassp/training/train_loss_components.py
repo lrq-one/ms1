@@ -415,6 +415,10 @@ def _get_selector_logits_from_res(res_dict):
         selector_logits = res_dict.get('formulae_scores_raw', None)
     if not torch.is_tensor(selector_logits):
         selector_logits = res_dict.get('formulae_scores_train', None)
+    if not torch.is_tensor(selector_logits):
+        selector_logits = res_dict.get('formulae_scores', None)
+    if not torch.is_tensor(selector_logits):
+        selector_logits = res_dict.get('formulae_logits', None)
 
     fn_mapped_logits = res_dict.get('fn_based_formula_logits', None)
 
