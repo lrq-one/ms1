@@ -22,6 +22,8 @@ def safe_mean(values, default=0.0):
 def format_metric_line(prefix, metrics):
     keep_keys = [
         "train_loss",
+        "train_official_spectral",
+        "train_official_dense_false",
         "train_selector_loss",
         "train_selector_bce",
         "train_selector_recall_bce",
