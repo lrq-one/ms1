@@ -91,12 +91,34 @@ class GraphVertSpect(nn.Module):
         allow_target_alignment = os.environ.get("MODEL_ALLOW_TARGET_ALIGNMENT_FEAT", "0") == "1"
         strict_kwarg_whitelist = os.environ.get("STRICT_MODEL_KWARG_WHITELIST", "1") == "1"
 
+        # Debug-only oracle selector experiment.
+        # 注意：不要用 MODEL_ALLOW_TARGET_ALIGNMENT_FEAT 来放行这个实验，
+        # 因为 sparse_formula_scorer 里 MODEL_ALLOW_TARGET_ALIGNMENT_FEAT=1
+        # 在 training 模式下会主动报错。
+        allow_oracle_selector_debug = os.environ.get("USE_ORACLE_ALIGN_SELECTOR", "0") == "1"
+
+        oracle_selector_target_keys = {
+            "true_official_idx",
+            "true_official_intensity",
+            "true_all_official_idx",
+            "true_all_official_intensity",
+            "true_top20_official_idx",
+            "true_top20_official_intensity",
+        }
+
         safe_kwargs = {}
         for kk, vv in kwargs.items():
-            if (not allow_target_alignment) and kk in _TARGET_LEAKAGE_KEYS:
+            if kk in _TARGET_LEAKAGE_KEYS and (not allow_target_alignment):
+                # 只在 USE_ORACLE_ALIGN_SELECTOR=1 的诊断实验里，
+                # 放行 true spectrum sparse keys 给 selector oracle block。
+                if allow_oracle_selector_debug and kk in oracle_selector_target_keys:
+                    safe_kwargs[kk] = vv
+                    continue
+
                 if os.environ.get("DEBUG_TARGET_LEAKAGE_CHECK", "0") == "1":
                     print(f"[TARGET_LEAKAGE_BLOCKED] key={kk}", flush=True)
                 continue
+
             safe_kwargs[kk] = vv
 
         if strict_kwarg_whitelist:
@@ -151,8 +173,21 @@ class GraphVertSpect(nn.Module):
             if allow_target_alignment:
                 allowed_model_keys = allowed_model_keys | set(_TARGET_LEAKAGE_KEYS)
 
+            if allow_oracle_selector_debug:
+                allowed_model_keys = allowed_model_keys | oracle_selector_target_keys
+
             safe_kwargs = {kk: vv for kk, vv in safe_kwargs.items() if kk in allowed_model_keys}
 
+        if allow_oracle_selector_debug and not hasattr(self, "_printed_oracle_key_pass_debug"):
+            print(
+                "[GRAPH_ORACLE_KEY_PASS_DEBUG]",
+                "has_true_official_idx=", int("true_official_idx" in safe_kwargs),
+                "has_true_official_intensity=", int("true_official_intensity" in safe_kwargs),
+                "has_true_all_official_idx=", int("true_all_official_idx" in safe_kwargs),
+                "has_true_all_official_intensity=", int("true_all_official_intensity" in safe_kwargs),
+                flush=True,
+            )
+            self._printed_oracle_key_pass_debug = True
         pred_dense_spect_dict = self.spect_out(
             g_squeeze,
             input_mask,
