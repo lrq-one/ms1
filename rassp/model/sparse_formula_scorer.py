@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from .nets import *
 from .model_utils import neg_mask_fill_value as _neg_mask_fill_value
-from .selector_heads import SupportAwareSelectorHead, SelectorRankHeadV2, LocalUtilitySelectorHead
+from .selector_heads import LocalUtilitySelectorHead
 from .formulaenets_legacy import (
     StructuredOneHot,
     project_formula_probs_to_spectrum_dense,
@@ -137,39 +137,16 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
         else:
             self.frag_aux_proj = None
 
-        self.align_to_base_proj = nn.Linear(4, int(internal_d))
-
         try:
             selector_dropout = float(os.environ.get("SELECTOR_HEAD_DROPOUT", "0.0"))
         except Exception:
             selector_dropout = 0.0
-
-        use_local_utility_selector = os.environ.get("USE_LOCAL_UTILITY_SELECTOR", "0") == "1"
-        use_selector_head_v2 = os.environ.get("USE_SELECTOR_HEAD_V2", "0") == "1"
-
-        if use_local_utility_selector:
-            self.selector_head = LocalUtilitySelectorHead(
-                hidden_dim=int(internal_d),
-                peak_feat_dim=6,
-                frag_aux_dim=self.fragment_local_aux_dim,
-                dropout=selector_dropout,
-            )
-        elif use_selector_head_v2:
-            self.selector_head = SelectorRankHeadV2(
-                hidden_dim=int(internal_d),
-                peak_feat_dim=6,
-                frag_aux_dim=self.fragment_local_aux_dim,
-                num_heads=4,
-                dropout=selector_dropout,
-            )
-        else:
-            self.selector_head = SupportAwareSelectorHead(
-                hidden_dim=int(internal_d),
-                peak_feat_dim=6,
-                frag_aux_dim=self.fragment_local_aux_dim,
-                num_heads=4,
-                dropout=selector_dropout,
-            )
+        self.selector_head = LocalUtilitySelectorHead(
+            hidden_dim=int(internal_d),
+            peak_feat_dim=6,
+            frag_aux_dim=self.fragment_local_aux_dim,
+            dropout=selector_dropout,
+        )
 
         # New: set-wise scorer
         self.set_score_norm = nn.LayerNorm(int(internal_d) * 4 + 2)
@@ -259,149 +236,6 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
             )
         else:
             self.fn_selector = None
-
-    def _build_candidate_true_alignment_feat(
-        self,
-        batch_n,
-        formula_n,
-        device,
-        formulae_mask,
-        off_idx,
-        off_int,
-        true_idx,
-        true_val,
-        official_bin_n,
-        official_bin_width,
-    ):
-        """
-        Build per-candidate alignment features between candidate peaks and true spectrum.
-        Returns [B, M, 4] tensor.
-        """
-        del official_bin_width
-        feat_dim = 4
-        out = torch.zeros((batch_n, formula_n, feat_dim), dtype=torch.float32, device=device)
-
-        if off_idx is None or off_int is None or true_idx is None or true_val is None:
-            return out
-        if not torch.is_tensor(off_idx) or not torch.is_tensor(off_int):
-            return out
-
-        true_dense = torch.zeros((batch_n, official_bin_n), dtype=torch.float32, device=device)
-
-        if isinstance(true_idx, (list, tuple)) and isinstance(true_val, (list, tuple)):
-            use_b = min(batch_n, len(true_idx), len(true_val))
-            for b in range(use_b):
-                try:
-                    idx = true_idx[b]
-                    val = true_val[b]
-                except Exception:
-                    continue
-                if idx is None or val is None:
-                    continue
-                if not torch.is_tensor(idx):
-                    idx = torch.as_tensor(idx)
-                if not torch.is_tensor(val):
-                    val = torch.as_tensor(val)
-                idx = idx.to(device=device, dtype=torch.long).reshape(-1)
-                val = val.to(device=device, dtype=torch.float32).reshape(-1)
-                if idx.numel() == 0 or val.numel() == 0:
-                    continue
-                use_n = min(int(idx.shape[0]), int(val.shape[0]))
-                idx = idx[:use_n]
-                val = val[:use_n]
-                valid = (
-                    (idx >= 0)
-                    & (idx < int(official_bin_n))
-                    & torch.isfinite(val)
-                    & (val > 0)
-                )
-                if not bool(valid.any().item()):
-                    continue
-                idx_v = idx[valid].clamp(0, max(0, int(official_bin_n) - 1))
-                val_v = val[valid]
-                true_dense[b].scatter_add_(0, idx_v, val_v)
-
-        elif torch.is_tensor(true_idx) and torch.is_tensor(true_val):
-            idx_t = true_idx
-            val_t = true_val
-            if idx_t.dim() == 1:
-                idx_t = idx_t.unsqueeze(0)
-            if val_t.dim() == 1:
-                val_t = val_t.unsqueeze(0)
-
-            use_b = min(batch_n, int(idx_t.shape[0]), int(val_t.shape[0]))
-            for b in range(use_b):
-                idx = idx_t[b].to(device=device, dtype=torch.long).reshape(-1)
-                val = val_t[b].to(device=device, dtype=torch.float32).reshape(-1)
-                if idx.numel() == 0 or val.numel() == 0:
-                    continue
-                use_n = min(int(idx.shape[0]), int(val.shape[0]))
-                idx = idx[:use_n]
-                val = val[:use_n]
-                valid = (
-                    (idx >= 0)
-                    & (idx < int(official_bin_n))
-                    & torch.isfinite(val)
-                    & (val > 0)
-                )
-                if not bool(valid.any().item()):
-                    continue
-                idx_v = idx[valid].clamp(0, max(0, int(official_bin_n) - 1))
-                val_v = val[valid]
-                true_dense[b].scatter_add_(0, idx_v, val_v)
-        else:
-            return out
-
-        true_support = true_dense > 1e-8
-        true_norm = torch.norm(true_dense, dim=1).clamp_min(1e-8)
-
-        off_idx = off_idx[:batch_n, :formula_n]
-        off_int = off_int[:batch_n, :formula_n]
-
-        for b in range(batch_n):
-            idx_b = off_idx[b].long()
-            int_b = off_int[b].float()
-            valid_peak = (
-                (idx_b >= 0)
-                & (idx_b < int(official_bin_n))
-                & torch.isfinite(int_b)
-                & (int_b > 0)
-            )
-            if not bool(valid_peak.any().item()):
-                continue
-
-            idx_safe = idx_b.clamp(0, max(0, int(official_bin_n) - 1))
-            hit = true_support[b][idx_safe].float() * valid_peak.float()
-            overlap_count = hit.sum(dim=-1)
-            int_overlap = (int_b * hit).sum(dim=-1)
-
-            dot = (int_b * true_dense[b][idx_safe] * valid_peak.float()).sum(dim=-1)
-            cand_norm = torch.sqrt((int_b * int_b * valid_peak.float()).sum(dim=-1)).clamp_min(1e-8)
-            cos_sim = dot / (cand_norm * true_norm[b] + 1e-8)
-
-            cand_total_int = (int_b * valid_peak.float()).sum(dim=-1).clamp_min(1e-8)
-            int_precision = int_overlap / cand_total_int
-
-            feat = torch.stack(
-                [
-                    overlap_count / 32.0,
-                    int_overlap,
-                    cos_sim,
-                    int_precision,
-                ],
-                dim=-1,
-            )
-            out[b, :formula_n] = feat
-
-        if torch.is_tensor(formulae_mask):
-            fm = formulae_mask.float()
-            if fm.dim() > 2:
-                fm = fm.reshape(fm.shape[0], -1)
-            use_b = min(batch_n, int(fm.shape[0]))
-            use_m = min(formula_n, int(fm.shape[1]))
-            out[:use_b, :use_m] = out[:use_b, :use_m] * fm[:use_b, :use_m].unsqueeze(-1)
-
-        return out
 
     def _sparsify_formula_probs_for_render(self, formulae_probs, formulae_mask=None):
         """
@@ -844,31 +678,6 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
             official_bin_n=official_bin_n,
         )
         candidate_peak_feat = self.peak_support_proj(candidate_peak_feat_raw)
-        true_idx = kwargs.get('true_official_idx', None)
-        true_val = kwargs.get('true_official_intensity', None)
-        if true_idx is None:
-            true_idx = kwargs.get('true_all_official_idx', None)
-            true_val = kwargs.get('true_all_official_intensity', None)
-        allow_target_alignment = os.environ.get("MODEL_ALLOW_TARGET_ALIGNMENT_FEAT", "0") == "1"
-        align_feat = None
-        if allow_target_alignment:
-            if self.training:
-                raise RuntimeError(
-                    "MODEL_ALLOW_TARGET_ALIGNMENT_FEAT=1 is forbidden during training: target leakage risk."
-                )
-            align_feat = self._build_candidate_true_alignment_feat(
-                batch_n=batch_n,
-                formula_n=formula_n,
-                device=device,
-                formulae_mask=formulae_mask,
-                off_idx=off_idx,
-                off_int=off_int,
-                true_idx=true_idx,
-                true_val=true_val,
-                official_bin_n=official_bin_n,
-                official_bin_width=official_bin_width,
-            )
-
         frag_aux = kwargs.get('formulae_frag_aux_feat', None)
         frag_aux_t = self._coerce_frag_aux(
             frag_aux,
@@ -888,9 +697,6 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
         base_in = self.base_score_norm(base_in)
         base_h = F.relu(self.base_score_l1(base_in))
         base_h = F.relu(self.base_score_l2(base_h))
-
-        if align_feat is not None:
-            base_h = base_h + self.align_to_base_proj(align_feat)
 
         frag_has_source = None
         if self.frag_aux_proj is not None and torch.is_tensor(frag_aux_t):
@@ -969,84 +775,6 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
             official_bin_width=selector_peak_bin_width,
         )
 
-        # ------------------------------------------------------------
-        # Debug-only oracle alignment feature for selector diagnosis.
-        # This uses true spectrum, so it MUST NOT be used for real inference.
-        # Purpose: test whether selector is failing because it lacks query-aware
-        # candidate-vs-spectrum information.
-        # ------------------------------------------------------------
-        oracle_align_feat_for_logit = None
-        use_oracle_align_selector = os.environ.get("USE_ORACLE_ALIGN_SELECTOR", "0") == "1"
-
-        if use_oracle_align_selector:
-            # 先用项目里已经存在的 official true spectrum key
-            true_idx = kwargs.get("true_official_idx", None)
-            true_val = kwargs.get("true_official_intensity", None)
-
-            if true_idx is None:
-                true_idx = kwargs.get("true_all_official_idx", None)
-                true_val = kwargs.get("true_all_official_intensity", None)
-
-            # 再兼容其他可能的 key
-            if true_idx is None:
-                true_idx = kwargs.get("official_sparse_idx", None)
-                true_val = kwargs.get("official_sparse_val", None)
-
-            if true_idx is None:
-                true_idx = kwargs.get("spect_sparse_idx", None)
-                true_val = kwargs.get("spect_sparse_val", None)
-
-            if true_idx is None:
-                true_idx = kwargs.get("true_sparse_idx", None)
-                true_val = kwargs.get("true_sparse_val", None)
-
-            # 关键：这里用 selector_peak_idx / selector_peak_int，
-            # 不要用 peak_idx_for_head，也不要优先用 formulae_peaks_mass_idx。
-            align_feat = self._build_candidate_true_alignment_feat(
-                batch_n=batch_n,
-                formula_n=formula_n,
-                device=device,
-                formulae_mask=formulae_mask,
-                off_idx=selector_peak_idx,
-                off_int=selector_peak_int,
-                true_idx=true_idx,
-                true_val=true_val,
-                official_bin_n=official_bin_n,
-                official_bin_width=official_bin_width,
-            )
-
-            if torch.is_tensor(align_feat):
-                oracle_align_feat_for_logit = align_feat
-                align_h = self.align_to_base_proj(
-                    align_feat.to(device=device, dtype=base_h.dtype)
-                )
-
-                # 关键：selector_head 输入的是 base_h，所以必须加到 base_h
-                base_h = base_h + align_h
-
-                if not hasattr(self, "_printed_oracle_align_debug"):
-                    with torch.no_grad():
-                        valid_selector_peak = (
-                            torch.is_tensor(selector_peak_idx)
-                            and torch.is_tensor(selector_peak_int)
-                            and ((selector_peak_idx >= 0) & (selector_peak_int > 0)).any()
-                        )
-
-                        print(
-                            "[ORACLE_ALIGN_SELECTOR_DEBUG]",
-                            "has_true_idx=", int(true_idx is not None),
-                            "has_true_val=", int(true_val is not None),
-                            "selector_peak_shape=",
-                            tuple(selector_peak_idx.shape) if torch.is_tensor(selector_peak_idx) else None,
-                            "valid_selector_peak=", int(bool(valid_selector_peak)),
-                            "align_feat_shape=", tuple(align_feat.shape),
-                            "align_feat_mean=", float(align_feat.mean().detach().cpu().item()),
-                            "align_feat_max=", float(align_feat.max().detach().cpu().item()),
-                            "align_feat_nonzero=",
-                            int((align_feat.abs() > 1e-12).sum().detach().cpu().item()),
-                            "align_h_std=", float(align_h.std().detach().cpu().item()),
-                        )
-                    self._printed_oracle_align_debug = True
 
         # debug diagnostics for explanation matching
         matched_subset_per_sample = torch.zeros((batch_n,), dtype=torch.float32, device=device)
@@ -1059,46 +787,6 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
             frag_aux=frag_aux_t,
         )
 
-        if (
-            os.environ.get("USE_ORACLE_ALIGN_LOGIT_BIAS", "0") == "1"
-            and torch.is_tensor(oracle_align_feat_for_logit)
-        ):
-            af = oracle_align_feat_for_logit.to(
-                device=selector_logits.device,
-                dtype=selector_logits.dtype,
-            )
-
-            # af[..., 0] = overlap_count / 32
-            # af[..., 1] = int_overlap
-            # af[..., 2] = cosine similarity
-            # af[..., 3] = intensity precision
-            oracle_score = (
-                2.0 * af[..., 0]
-                + 1.0 * af[..., 1]
-                + 8.0 * af[..., 2]
-                + 4.0 * af[..., 3]
-            )
-
-            try:
-                oracle_scale = float(os.environ.get("ORACLE_ALIGN_LOGIT_SCALE", "10.0"))
-            except Exception:
-                oracle_scale = 10.0
-
-            selector_logits = selector_logits + oracle_scale * oracle_score
-
-            if not hasattr(self, "_printed_oracle_logit_bias_debug"):
-                with torch.no_grad():
-                    print(
-                        "[ORACLE_LOGIT_BIAS_DEBUG]",
-                        "oracle_score_mean=",
-                        float(oracle_score.mean().detach().cpu().item()),
-                        "oracle_score_max=",
-                        float(oracle_score.max().detach().cpu().item()),
-                        "oracle_scale=",
-                        float(oracle_scale),
-                        flush=True,
-                    )
-                self._printed_oracle_logit_bias_debug = True
 
         selector_logits = selector_logits.masked_fill(
             invalid_formula,
@@ -1467,9 +1155,7 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
         )
 
         if use_selector_prob_spectrum and use_peak_reweight_in_prob and torch.is_tensor(peak_reweight_probs):
-            # 推荐第一版用 redistribute，不用 sigmoid 直接压强度
-            # 这样只是重新分配每个 candidate 内部峰强度，不改变该 candidate 总强度
-            use_b = min(int(peak_reweight_probs.shape[0]), int(formulae_peaks_intensity.shape[0]))
+            # 推荐第一版用 redistribute，不�?sigmoid 直接压强�?            # 这样只是重新分配每个 candidate 内部峰强度，不改变该 candidate 总强�?            use_b = min(int(peak_reweight_probs.shape[0]), int(formulae_peaks_intensity.shape[0]))
             use_m = min(int(peak_reweight_probs.shape[1]), int(formulae_peaks_intensity.shape[1]))
             use_k = min(int(peak_reweight_probs.shape[2]), int(formulae_peaks_intensity.shape[2]))
 

@@ -83,6 +83,7 @@ from rassp.training.selector_metrics import (
     mask_ratio_in_topk,
     mask_recall,
     build_true_official_dense_from_batch,
+    compute_selected_support_metrics,
     compute_candidate_support_stats,
     compute_selector_eval_pack,
     compute_selector_quality_metrics,
@@ -1493,10 +1494,14 @@ def train_mssubsetnet():
         'val_selector_quality_mean@64': [],
         'val_selector_quality_mean@128': [],
         'val_selector_quality_mean@256': [],
+        'val_selected_true_hit_mass@8': [],
+        'val_selected_true_hit_mass@16': [],
         'val_selected_true_hit_mass@32': [],
         'val_selected_true_hit_mass@64': [],
         'val_selected_true_hit_mass@128': [],
         'val_selected_true_hit_mass@256': [],
+        'val_selected_false_mass@8': [],
+        'val_selected_false_mass@16': [],
         'val_selected_false_mass@32': [],
         'val_selected_false_mass@64': [],
         'val_selected_false_mass@128': [],
@@ -2561,10 +2566,14 @@ def train_mssubsetnet():
         val_selector_quality_mean_64_vals = []
         val_selector_quality_mean_128_vals = []
         val_selector_quality_mean_256_vals = []
+        val_selected_true_hit_mass_8_vals = []
+        val_selected_true_hit_mass_16_vals = []
         val_selected_true_hit_mass_32_vals = []
         val_selected_true_hit_mass_64_vals = []
         val_selected_true_hit_mass_128_vals = []
         val_selected_true_hit_mass_256_vals = []
+        val_selected_false_mass_8_vals = []
+        val_selected_false_mass_16_vals = []
         val_selected_false_mass_32_vals = []
         val_selected_false_mass_64_vals = []
         val_selected_false_mass_128_vals = []
@@ -3277,6 +3286,37 @@ def train_mssubsetnet():
                             candidate_mask=topk_candidate_mask_val,
                         )
 
+                    selected_support_k_list = [8, 16, 32, 64, 128]
+                    selected_true_vals = {
+                        8: val_selected_true_hit_mass_8_vals,
+                        16: val_selected_true_hit_mass_16_vals,
+                        32: val_selected_true_hit_mass_32_vals,
+                        64: val_selected_true_hit_mass_64_vals,
+                        128: val_selected_true_hit_mass_128_vals,
+                    }
+                    selected_false_vals = {
+                        8: val_selected_false_mass_8_vals,
+                        16: val_selected_false_mass_16_vals,
+                        32: val_selected_false_mass_32_vals,
+                        64: val_selected_false_mass_64_vals,
+                        128: val_selected_false_mass_128_vals,
+                    }
+
+                    for k_eval in selected_support_k_list:
+                        topk_idx_k = select_model_topk_indices(
+                            selector_logits=selector_logits_for_topk,
+                            batch=batch,
+                            k=k_eval,
+                            use_coverage=use_coverage_topk,
+                            use_group_unique=use_group_unique_model,
+                            candidate_mask=topk_candidate_mask_val,
+                        )
+                        support_metrics_k = compute_selected_support_metrics(topk_idx_k, batch)
+                        true_k = support_metrics_k.get('selected_true_hit_mass', float('nan'))
+                        false_k = support_metrics_k.get('selected_false_mass', float('nan'))
+                        selected_true_vals[k_eval].append(true_k)
+                        selected_false_vals[k_eval].append(false_k)
+
                     fragaux_model_topk_ratio_32 = float("nan")
                     fragaux_model_topk_ratio_64 = float("nan")
                     fragaux_model_topk_ratio_128 = float("nan")
@@ -3349,20 +3389,14 @@ def train_mssubsetnet():
                             val_selector_recall_32_vals.append(rec_k)
                             val_selector_precision_32_vals.append(prec_k)
                             val_selector_quality_mean_32_vals.append(q_mean_k)
-                            val_selected_true_hit_mass_32_vals.append(selected_true_k)
-                            val_selected_false_mass_32_vals.append(selected_false_k)
                         elif k == 64:
                             val_selector_recall_64_vals.append(rec_k)
                             val_selector_precision_64_vals.append(prec_k)
                             val_selector_quality_mean_64_vals.append(q_mean_k)
-                            val_selected_true_hit_mass_64_vals.append(selected_true_k)
-                            val_selected_false_mass_64_vals.append(selected_false_k)
                         elif k == 128:
                             val_selector_recall_128_vals.append(rec_k)
                             val_selector_precision_128_vals.append(prec_k)
                             val_selector_quality_mean_128_vals.append(q_mean_k)
-                            val_selected_true_hit_mass_128_vals.append(selected_true_k)
-                            val_selected_false_mass_128_vals.append(selected_false_k)
                         elif k == 256:
                             val_selector_recall_256_vals.append(rec_k)
                             val_selector_precision_256_vals.append(prec_k)
@@ -3900,10 +3934,14 @@ def train_mssubsetnet():
         avg_val_selector_quality_mean_64 = _finite_mean(val_selector_quality_mean_64_vals)
         avg_val_selector_quality_mean_128 = _finite_mean(val_selector_quality_mean_128_vals)
         avg_val_selector_quality_mean_256 = _finite_mean(val_selector_quality_mean_256_vals)
+        avg_val_selected_true_hit_mass_8 = _finite_mean(val_selected_true_hit_mass_8_vals)
+        avg_val_selected_true_hit_mass_16 = _finite_mean(val_selected_true_hit_mass_16_vals)
         avg_val_selected_true_hit_mass_32 = _finite_mean(val_selected_true_hit_mass_32_vals)
         avg_val_selected_true_hit_mass_64 = _finite_mean(val_selected_true_hit_mass_64_vals)
         avg_val_selected_true_hit_mass_128 = _finite_mean(val_selected_true_hit_mass_128_vals)
         avg_val_selected_true_hit_mass_256 = _finite_mean(val_selected_true_hit_mass_256_vals)
+        avg_val_selected_false_mass_8 = _finite_mean(val_selected_false_mass_8_vals)
+        avg_val_selected_false_mass_16 = _finite_mean(val_selected_false_mass_16_vals)
         avg_val_selected_false_mass_32 = _finite_mean(val_selected_false_mass_32_vals)
         avg_val_selected_false_mass_64 = _finite_mean(val_selected_false_mass_64_vals)
         avg_val_selected_false_mass_128 = _finite_mean(val_selected_false_mass_128_vals)
@@ -4067,6 +4105,12 @@ def train_mssubsetnet():
             'val_official_cos_no_precursor': avg_val_cos,
             'val_official_js_no_precursor': avg_val_js,
             'val_false_support': avg_val_false_support,
+            'val_selected_true_hit_mass@8': avg_val_selected_true_hit_mass_8,
+            'val_selected_false_mass@8': avg_val_selected_false_mass_8,
+            'val_selected_true_hit_mass@16': avg_val_selected_true_hit_mass_16,
+            'val_selected_false_mass@16': avg_val_selected_false_mass_16,
+            'val_selected_true_hit_mass@32': avg_val_selected_true_hit_mass_32,
+            'val_selected_false_mass@32': avg_val_selected_false_mass_32,
             'val_selected_true_hit_mass@64': avg_val_selected_true_hit_mass_64,
             'val_selected_false_mass@64': avg_val_selected_false_mass_64,
             'val_selected_true_hit_mass@128': avg_val_selected_true_hit_mass_128,
@@ -4076,12 +4120,9 @@ def train_mssubsetnet():
             'val_teacher_prob_render_cos': avg_val_teacher_prob_render_cos,
             'val_teacher_prob_render_false': avg_val_teacher_prob_render_false,
         }
-        if int(eval_k_used) == 64:
-            epoch_metrics['val_model_topk_oracle_cos@64'] = avg_val_model_topk_oracle_cos_eval
-            epoch_metrics['val_model_topk_oracle_false_support@64'] = avg_val_model_topk_oracle_false_support_eval
-        elif int(eval_k_used) == 128:
-            epoch_metrics['val_model_topk_oracle_cos@128'] = avg_val_model_topk_oracle_cos_eval
-            epoch_metrics['val_model_topk_oracle_false_support@128'] = avg_val_model_topk_oracle_false_support_eval
+        if int(eval_k_used) in (8, 16, 32, 64, 128):
+            epoch_metrics[f'val_model_topk_oracle_cos@{int(eval_k_used)}'] = avg_val_model_topk_oracle_cos_eval
+            epoch_metrics[f'val_model_topk_oracle_false_support@{int(eval_k_used)}'] = avg_val_model_topk_oracle_false_support_eval
 
         epoch_line = format_metric_line(f'Epoch {epoch+1}/{epochs}', epoch_metrics)
         if is_best:
@@ -4172,10 +4213,14 @@ def train_mssubsetnet():
         history['val_selector_quality_mean@64'].append(avg_val_selector_quality_mean_64)
         history['val_selector_quality_mean@128'].append(avg_val_selector_quality_mean_128)
         history['val_selector_quality_mean@256'].append(avg_val_selector_quality_mean_256)
+        history['val_selected_true_hit_mass@8'].append(avg_val_selected_true_hit_mass_8)
+        history['val_selected_true_hit_mass@16'].append(avg_val_selected_true_hit_mass_16)
         history['val_selected_true_hit_mass@32'].append(avg_val_selected_true_hit_mass_32)
         history['val_selected_true_hit_mass@64'].append(avg_val_selected_true_hit_mass_64)
         history['val_selected_true_hit_mass@128'].append(avg_val_selected_true_hit_mass_128)
         history['val_selected_true_hit_mass@256'].append(avg_val_selected_true_hit_mass_256)
+        history['val_selected_false_mass@8'].append(avg_val_selected_false_mass_8)
+        history['val_selected_false_mass@16'].append(avg_val_selected_false_mass_16)
         history['val_selected_false_mass@32'].append(avg_val_selected_false_mass_32)
         history['val_selected_false_mass@64'].append(avg_val_selected_false_mass_64)
         history['val_selected_false_mass@128'].append(avg_val_selected_false_mass_128)

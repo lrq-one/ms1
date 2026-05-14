@@ -229,11 +229,14 @@ def coverage_aware_topk(
 
         base_raw = score_b[pref_idx]
 
-        finite = torch.isfinite(base_raw)
-        if bool(finite.any().item()):
-            center = base_raw[finite].median()
-            scale = base_raw[finite].std().clamp_min(1e-6)
+        valid_pref = torch.isfinite(base_raw) & (base_raw > neg * 0.5)
+
+        if bool(valid_pref.any().item()):
+            vals = base_raw[valid_pref]
+            center = vals.median()
+            scale = vals.std().clamp_min(1e-6)
             base = ((base_raw - center) / scale).clamp(-5.0, 5.0)
+            base = torch.where(valid_pref, base, torch.full_like(base, -5.0))
         else:
             base = torch.zeros_like(base_raw)
 
