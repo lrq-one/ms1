@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from .nets import *
 from .model_utils import neg_mask_fill_value as _neg_mask_fill_value
-from .selector_heads import SupportAwareSelectorHead, SelectorRankHeadV2
+from .selector_heads import SupportAwareSelectorHead, SelectorRankHeadV2, LocalUtilitySelectorHead
 from .formulaenets_legacy import (
     StructuredOneHot,
     project_formula_probs_to_spectrum_dense,
@@ -144,9 +144,17 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
         except Exception:
             selector_dropout = 0.0
 
+        use_local_utility_selector = os.environ.get("USE_LOCAL_UTILITY_SELECTOR", "0") == "1"
         use_selector_head_v2 = os.environ.get("USE_SELECTOR_HEAD_V2", "0") == "1"
 
-        if use_selector_head_v2:
+        if use_local_utility_selector:
+            self.selector_head = LocalUtilitySelectorHead(
+                hidden_dim=int(internal_d),
+                peak_feat_dim=6,
+                frag_aux_dim=self.fragment_local_aux_dim,
+                dropout=selector_dropout,
+            )
+        elif use_selector_head_v2:
             self.selector_head = SelectorRankHeadV2(
                 hidden_dim=int(internal_d),
                 peak_feat_dim=6,
