@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from .nets import *
 from .model_utils import neg_mask_fill_value as _neg_mask_fill_value
-from .selector_heads import SupportAwareSelectorHead
+from .selector_heads import SupportAwareSelectorHead, SelectorRankHeadV2
 from .formulaenets_legacy import (
     StructuredOneHot,
     project_formula_probs_to_spectrum_dense,
@@ -139,13 +139,29 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
 
         self.align_to_base_proj = nn.Linear(4, int(internal_d))
 
-        self.selector_head = SupportAwareSelectorHead(
-            hidden_dim=int(internal_d),
-            peak_feat_dim=6,
-            frag_aux_dim=self.fragment_local_aux_dim,
-            num_heads=4,
-            dropout=0.10,
-        )
+        try:
+            selector_dropout = float(os.environ.get("SELECTOR_HEAD_DROPOUT", "0.0"))
+        except Exception:
+            selector_dropout = 0.0
+
+        use_selector_head_v2 = os.environ.get("USE_SELECTOR_HEAD_V2", "0") == "1"
+
+        if use_selector_head_v2:
+            self.selector_head = SelectorRankHeadV2(
+                hidden_dim=int(internal_d),
+                peak_feat_dim=6,
+                frag_aux_dim=self.fragment_local_aux_dim,
+                num_heads=4,
+                dropout=selector_dropout,
+            )
+        else:
+            self.selector_head = SupportAwareSelectorHead(
+                hidden_dim=int(internal_d),
+                peak_feat_dim=6,
+                frag_aux_dim=self.fragment_local_aux_dim,
+                num_heads=4,
+                dropout=selector_dropout,
+            )
 
         # New: set-wise scorer
         self.set_score_norm = nn.LayerNorm(int(internal_d) * 4 + 2)
