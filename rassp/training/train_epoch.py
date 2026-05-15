@@ -180,7 +180,156 @@ def _masked_selector_recall_bce(
     neg_loss = raw[neg].mean() if bool(neg.any().item()) else zero
     return float(pos_part) * pos_loss + float(neg_part) * neg_loss
 
+def _selector_hard_topk_teacher_loss(
+    selector_logits,
+    teacher_dist,
+    formulae_mask,
+    teacher_topk=8,
+    hard_neg_topk=64,
+    ce_temp=1.0,
+    margin=1.0,
+    eps=1e-12,
+):
+    """
+    Force selector topK to match runtime teacher topK.
 
+    Why:
+      KL over 4096 candidates can decrease while final top8 remains poor.
+      This loss directly optimizes:
+        1) teacher topK CE
+        2) teacher-positive vs hard-negative margin
+        3) balanced BCE on teacher topK positives and hard negatives
+    """
+    if not (
+        torch.is_tensor(selector_logits)
+        and torch.is_tensor(teacher_dist)
+        and torch.is_tensor(formulae_mask)
+    ):
+        return None, {}
+
+    aligned = _align_2d(selector_logits, teacher_dist, formulae_mask)
+    if aligned is None:
+        return None, {}
+
+    logits, target, mask = aligned
+    logits = logits.float()
+    target = target.to(device=logits.device, dtype=logits.dtype).clamp_min(0.0)
+    mask = (mask > 0.5).to(device=logits.device)
+
+    B, M = logits.shape
+    device = logits.device
+
+    ce_losses = []
+    margin_losses = []
+    bce_losses = []
+    recall_values = []
+    precision_values = []
+
+    for b in range(B):
+        valid = mask[b]
+        if int(valid.sum().detach().item()) <= 1:
+            continue
+
+        t = target[b] * valid.float()
+        pos_available = (t > eps) & valid
+        pos_n = int(pos_available.sum().detach().item())
+        if pos_n <= 0:
+            continue
+
+        k_pos = max(1, min(int(teacher_topk), pos_n))
+        k_neg = max(1, min(int(hard_neg_topk), int(valid.sum().detach().item()) - k_pos))
+        if k_neg <= 0:
+            continue
+
+        pos_scores = t.masked_fill(~pos_available, -1e9)
+        pos_idx = torch.topk(pos_scores, k=k_pos, dim=0).indices
+
+        neg_valid = valid.clone()
+        neg_valid[pos_idx] = False
+
+        neg_scores = logits[b].detach().masked_fill(~neg_valid, -1e9)
+        neg_idx = torch.topk(neg_scores, k=k_neg, dim=0).indices
+
+        # CE over all valid candidates, but only teacher topK receives target mass.
+        q = torch.zeros((M,), dtype=logits.dtype, device=device)
+        q[pos_idx] = t[pos_idx]
+        q = q / q.sum().clamp_min(eps)
+
+        logp = F.log_softmax(
+            logits[b].masked_fill(~valid, -1e9) / max(float(ce_temp), 1e-6),
+            dim=0,
+        )
+        ce_losses.append(-(q[pos_idx].detach() * logp[pos_idx]).sum())
+
+        # Margin: every teacher positive should beat hard negatives.
+        pos_log = logits[b, pos_idx]
+        neg_log = logits[b, neg_idx]
+        diff = pos_log[:, None] - neg_log[None, :]
+        margin_losses.append(F.softplus(float(margin) - diff).mean())
+
+        # Balanced BCE on teacher topK positives + hard negatives only.
+        use_idx = torch.cat([pos_idx, neg_idx], dim=0)
+        y = torch.cat(
+            [
+                torch.ones_like(pos_idx, dtype=logits.dtype, device=device),
+                torch.zeros_like(neg_idx, dtype=logits.dtype, device=device),
+            ],
+            dim=0,
+        )
+        bce_losses.append(
+            F.binary_cross_entropy_with_logits(
+                logits[b, use_idx],
+                y,
+                reduction="mean",
+            )
+        )
+
+        # Monitoring: overlap between model topK and teacher topK.
+        model_top = torch.topk(
+            logits[b].detach().masked_fill(~valid, -1e9),
+            k=k_pos,
+            dim=0,
+        ).indices
+
+        pos_set = set(int(x) for x in pos_idx.detach().cpu().tolist())
+        model_set = set(int(x) for x in model_top.detach().cpu().tolist())
+        hit = len(pos_set & model_set)
+
+        recall_values.append(hit / max(1, len(pos_set)))
+        precision_values.append(hit / max(1, len(model_set)))
+
+    if len(ce_losses) == 0:
+        return logits.sum() * 0.0, {
+            "selector_teacher_topk_recall": 0.0,
+            "selector_teacher_topk_precision": 0.0,
+        }
+
+    ce = torch.stack(ce_losses).mean()
+    mg = torch.stack(margin_losses).mean()
+    bce = torch.stack(bce_losses).mean()
+
+    try:
+        ce_w = float(os.environ.get("SELECTOR_HARD_TOPK_CE_WEIGHT", "1.0"))
+    except Exception:
+        ce_w = 1.0
+    try:
+        margin_w = float(os.environ.get("SELECTOR_TOPK_MARGIN_WEIGHT", "0.5"))
+    except Exception:
+        margin_w = 0.5
+    try:
+        bce_w = float(os.environ.get("SELECTOR_TOPK_BCE_WEIGHT", "0.5"))
+    except Exception:
+        bce_w = 0.5
+
+    total = float(ce_w) * ce + float(margin_w) * mg + float(bce_w) * bce
+
+    return total, {
+        "selector_hard_topk_ce": float(ce.detach().cpu().item()),
+        "selector_hard_topk_margin": float(mg.detach().cpu().item()),
+        "selector_hard_topk_bce": float(bce.detach().cpu().item()),
+        "selector_teacher_topk_recall": float(sum(recall_values) / max(1, len(recall_values))),
+        "selector_teacher_topk_precision": float(sum(precision_values) / max(1, len(precision_values))),
+    }
 def train_one_epoch(
     model,
     loader,
@@ -318,7 +467,41 @@ def train_one_epoch(
                     target_mask = (target_use > 0).float()
 
                     selector_loss_total = logits_use.sum() * 0.0
+                    hard_topk_w = float(os.environ.get("SELECTOR_HARD_TOPK_LOSS_WEIGHT", "0.0"))
+                    if hard_topk_w > 0:
+                        try:
+                            teacher_topk = int(os.environ.get("SELECTOR_TEACHER_TOPK", "8"))
+                        except Exception:
+                            teacher_topk = 8
+                        try:
+                            hard_neg_topk = int(os.environ.get("SELECTOR_HARD_NEG_TOPK", "64"))
+                        except Exception:
+                            hard_neg_topk = 64
+                        try:
+                            ce_temp = float(os.environ.get("SELECTOR_HARD_TOPK_TEMP", "1.0"))
+                        except Exception:
+                            ce_temp = 1.0
+                        try:
+                            margin = float(os.environ.get("SELECTOR_TOPK_MARGIN", "1.0"))
+                        except Exception:
+                            margin = 1.0
 
+                        hard_loss, hard_metrics = _selector_hard_topk_teacher_loss(
+                            logits_use,
+                            target_use,
+                            mask_use,
+                            teacher_topk=teacher_topk,
+                            hard_neg_topk=hard_neg_topk,
+                            ce_temp=ce_temp,
+                            margin=margin,
+                        )
+
+                        if torch.is_tensor(hard_loss):
+                            selector_loss_total = selector_loss_total + hard_topk_w * hard_loss
+
+                        if isinstance(hard_metrics, dict):
+                            for hk, hv in hard_metrics.items():
+                                acc.add(hk, hv)
                     bce_w = float(_cfg_value(loss_cfg, "selector_bce_weight", 0.0))
                     if bce_w > 0:
                         bce_loss = _masked_selector_bce(

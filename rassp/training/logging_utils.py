@@ -57,7 +57,11 @@ def format_metric_line(prefix, metrics):
         "val_selected_false_mass@128",
         "val_teacher_oracle_cos",
         "val_teacher_oracle_false_support",
-
+        "train_selector_hard_topk_ce",
+        "train_selector_hard_topk_margin",
+        "train_selector_hard_topk_bce",
+        "train_selector_teacher_topk_recall",
+        "train_selector_teacher_topk_precision",
         "val_overlap_teacher_selected_true_hit_mass@8",
         "val_overlap_teacher_selected_false_mass@8",
         "val_overlap_teacher_selected_n",
