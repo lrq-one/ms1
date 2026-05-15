@@ -1421,15 +1421,58 @@ def train_mssubsetnet():
     if load_model_path:
         if not os.path.exists(load_model_path):
             raise FileNotFoundError(f"LOAD_MODEL_PATH not found: {load_model_path}")
+
         obj = torch.load(load_model_path, map_location=device)
+
         if isinstance(obj, dict):
-            missing, unexpected = model.load_state_dict(obj, strict=False)
+            if "model_state_dict" in obj:
+                state_dict = obj["model_state_dict"]
+                ckpt_epoch = obj.get("epoch", None)
+                ckpt_metrics = obj.get("metrics", {})
+                log(f"[CKPT] detected training checkpoint format | epoch={ckpt_epoch}")
+                if isinstance(ckpt_metrics, dict):
+                    keys_preview = list(ckpt_metrics.keys())[:20]
+                    log(f"[CKPT] metrics keys preview={keys_preview}")
+            elif "state_dict" in obj:
+                state_dict = obj["state_dict"]
+                log("[CKPT] detected state_dict key")
+            else:
+                state_dict = obj
+                log("[CKPT] detected raw state_dict dict")
         else:
-            missing, unexpected = model.load_state_dict(obj.state_dict(), strict=False)
+            state_dict = obj.state_dict()
+            log("[CKPT] detected model object")
+
+        if isinstance(state_dict, dict):
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                nk = k[7:] if isinstance(k, str) and k.startswith("module.") else k
+                new_state_dict[nk] = v
+            state_dict = new_state_dict
+
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
         log(
             f"馃攣 loaded model from {load_model_path} | "
             f"missing={len(missing)} unexpected={len(unexpected)}"
         )
+
+        if missing:
+            log(f"[LOAD_DEBUG] missing first 30: {missing[:30]}")
+        if unexpected:
+            log(f"[LOAD_DEBUG] unexpected first 30: {unexpected[:30]}")
+
+        if len(unexpected) <= 10 and any(k in unexpected for k in ["model_state_dict", "optimizer_state_dict", "scaler_state_dict", "metrics", "epoch"]):
+            raise RuntimeError(
+                "Checkpoint was loaded as a whole training checkpoint dict, not as model_state_dict. "
+                "This means Stage1 weights were not actually loaded."
+            )
+
+        if len(missing) > 80:
+            raise RuntimeError(
+                f"Too many missing keys when loading checkpoint: missing={len(missing)}, unexpected={len(unexpected)}. "
+                "Stage1 checkpoint is probably not compatible with current model config."
+            )
     assert hasattr(model.spect_out, 'set_score_norm')
     assert hasattr(model.spect_out, 'selector_head')
     assert hasattr(model.spect_out, 'peak_score_mlp')
