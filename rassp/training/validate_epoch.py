@@ -77,7 +77,7 @@ def validate_one_epoch(
                 selector_logits=selector_logits,
                 batch=batch,
                 k=suffix,
-                use_coverage=False,
+                use_coverage=bool(_cfg_value(selector_cfg, "use_coverage_aware_topk", False)),
                 use_group_unique=bool(_cfg_value(selector_cfg, "use_group_unique_model", False)),
             )
             selector_metrics = compute_selected_support_metrics(topk_idx, batch)

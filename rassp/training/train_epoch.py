@@ -446,17 +446,120 @@ def train_one_epoch(
                     official_max_mz=official_max_mz,
                     support_topk=int(_cfg_value(selector_cfg, "target_support_topk", 64)),
                 )
-                teacher_dist = build_selector_teacher_dist_setcover(
-                    batch=batch,
-                    formulae_mask=formulae_mask,
-                    official_bin_n=official_bin_n,
-                )
+
+                # ------------------------------------------------------------
+                # Selector runtime teacher mode
+                #
+                # quality:
+                #   Stage1 推荐。使用 build_candidate_local_quality_target()
+                #   给 local selector 一个更可学的 pointwise/local target。
+                #
+                # overlap:
+                #   使用 official overlap teacher，比 setcover 更局部。
+                #
+                # setcover:
+                #   保留旧路径。只建议 teacher audit 或后续 reranker/setwise 阶段使用。
+                #
+                # cached:
+                #   fallback 到 compute_formula_target_probs_from_batch()
+                # ------------------------------------------------------------
+                runtime_teacher_mode = os.environ.get(
+                    "SELECTOR_RUNTIME_TEACHER_MODE",
+                    "quality",
+                ).strip().lower()
+
+                target_mask_source = None
+                pairwise_utility = None
+                valid_mask_for_loss = formulae_mask.float()
+                local_extra = {}
+
+                if runtime_teacher_mode in ("quality", "local", "local_quality"):
+                    quality, pos_label, valid_mask_for_loss, local_extra = build_candidate_local_quality_target(
+                        batch=batch,
+                        formulae_mask=formulae_mask,
+                        official_bin_n=official_bin_n,
+                    )
+
+                    # KL / hard-topk 使用更平滑的 utility_dist；
+                    # 如果 utility_dist 不存在，则 fallback 到 quality。
+                    teacher_dist = local_extra.get("utility_dist", None)
+                    if not torch.is_tensor(teacher_dist):
+                        teacher_dist = quality
+
+                    # BCE / recall BCE 使用明确的 local positive label。
+                    target_mask_source = pos_label
+
+                    # pairwise 应该吃连续 utility，而不是 sparse teacher_dist。
+                    pairwise_utility = local_extra.get("utility", quality)
+
+                elif runtime_teacher_mode == "overlap":
+                    teacher_dist = build_selector_teacher_dist_from_official_overlap(
+                        batch=batch,
+                        formulae_mask=formulae_mask,
+                        official_bin_n=official_bin_n,
+                    )
+
+                    # 仍然构造一次 local target，主要为了拿 valid_mask 和 utility。
+                    quality, pos_label, valid_mask_for_loss, local_extra = build_candidate_local_quality_target(
+                        batch=batch,
+                        formulae_mask=formulae_mask,
+                        official_bin_n=official_bin_n,
+                    )
+
+                    target_mask_source = (teacher_dist > 1e-12).float()
+                    pairwise_utility = local_extra.get("utility", quality)
+
+                elif runtime_teacher_mode == "setcover":
+                    teacher_dist = build_selector_teacher_dist_setcover(
+                        batch=batch,
+                        formulae_mask=formulae_mask,
+                        official_bin_n=official_bin_n,
+                    )
+
+                    target_mask_source = (teacher_dist > 1e-12).float()
+
+                    # setcover 没有信号的行直接从 selector loss 里跳过。
+                    if torch.is_tensor(teacher_dist):
+                        row_has_signal = (teacher_dist.sum(dim=-1, keepdim=True) > 1e-12).float()
+                        valid_mask_for_loss = formulae_mask.float() * row_has_signal
+                    else:
+                        valid_mask_for_loss = formulae_mask.float()
+
+                    pairwise_utility = None
+
+                elif runtime_teacher_mode in ("cached", "cache", "target_probs"):
+                    teacher_dist = target_probs
+                    target_mask_source = (teacher_dist > 1e-12).float()
+                    row_has_signal = (teacher_dist.sum(dim=-1, keepdim=True) > 1e-12).float()
+                    valid_mask_for_loss = formulae_mask.float() * row_has_signal
+                    pairwise_utility = None
+
+                else:
+                    # 安全 fallback：未知 mode 不要崩，退回 quality。
+                    quality, pos_label, valid_mask_for_loss, local_extra = build_candidate_local_quality_target(
+                        batch=batch,
+                        formulae_mask=formulae_mask,
+                        official_bin_n=official_bin_n,
+                    )
+                    teacher_dist = local_extra.get("utility_dist", quality)
+                    target_mask_source = pos_label
+                    pairwise_utility = local_extra.get("utility", quality)
+
                 if not torch.is_tensor(teacher_dist):
                     teacher_dist = target_probs
+                if not torch.is_tensor(target_mask_source):
+                    target_mask_source = (teacher_dist > 1e-12).float()
+                if not torch.is_tensor(valid_mask_for_loss):
+                    valid_mask_for_loss = formulae_mask.float()
 
-                aligned = _align_2d(selector_logits, teacher_dist, formulae_mask)
+                aligned = _align_2d(
+                    selector_logits,
+                    teacher_dist,
+                    valid_mask_for_loss,
+                    target_mask_source,
+                )
                 if aligned is not None:
-                    logits_use, target_use, mask_use = aligned
+                    logits_use, target_use, mask_use, target_mask_source_use = aligned
                     logits_use = logits_use.float()
                     target_use = target_use.to(device=logits_use.device, dtype=logits_use.dtype).clamp_min(0.0)
                     mask_use = (mask_use > 0.5).to(device=logits_use.device)
@@ -464,8 +567,63 @@ def train_one_epoch(
                     target_use = target_use * mask_use.float()
                     target_sum = target_use.sum(dim=-1, keepdim=True)
                     target_use = target_use / target_sum.clamp_min(1e-12)
-                    target_mask = (target_use > 0).float()
+                    target_mask = (
+                        (target_mask_source_use > 0.5).float()
+                        * mask_use.float()
+                    )
+                    # -----------------------------
+                    # target diagnostics
+                    # -----------------------------
+                    try:
+                        acc.add(
+                            "selector_target_pos_rate",
+                            float(
+                                (
+                                    target_mask.sum()
+                                    / mask_use.float().sum().clamp_min(1.0)
+                                ).detach().cpu().item()
+                            ),
+                        )
+                        acc.add(
+                            "selector_target_valid_row_rate",
+                            float(
+                                (
+                                    (mask_use.float().sum(dim=-1) > 0).float().mean()
+                                ).detach().cpu().item()
+                            ),
+                        )
+                        acc.add(
+                            "selector_teacher_nnz",
+                            float(
+                                (
+                                    (target_use > 1e-12).float().sum(dim=-1).mean()
+                                ).detach().cpu().item()
+                            ),
+                        )
+                    except Exception:
+                        pass
 
+                    if isinstance(local_extra, dict):
+                        if torch.is_tensor(local_extra.get("false_mass", None)):
+                            acc.add(
+                                "selector_local_false_mass_mean",
+                                float(local_extra["false_mass"].detach().float().mean().cpu().item()),
+                            )
+                        if torch.is_tensor(local_extra.get("true_hit_mass", None)):
+                            acc.add(
+                                "selector_local_true_hit_mass_mean",
+                                float(local_extra["true_hit_mass"].detach().float().mean().cpu().item()),
+                            )
+                        if torch.is_tensor(local_extra.get("clean_pos_label", None)):
+                            acc.add(
+                                "selector_clean_pos_rate",
+                                float(local_extra["clean_pos_label"].detach().float().mean().cpu().item()),
+                            )
+                        if torch.is_tensor(local_extra.get("teacher_pos_label", None)):
+                            acc.add(
+                                "selector_teacher_pos_rate",
+                                float(local_extra["teacher_pos_label"].detach().float().mean().cpu().item()),
+                            )
                     selector_loss_total = logits_use.sum() * 0.0
                     hard_topk_w = float(os.environ.get("SELECTOR_HARD_TOPK_LOSS_WEIGHT", "0.0"))
                     if hard_topk_w > 0:
@@ -560,10 +718,30 @@ def train_one_epoch(
 
                     pairwise_w = float(_cfg_value(loss_cfg, "selector_pairwise_weight", 0.0))
                     if pairwise_w > 0:
+                        pairwise_target = target_use
+
+                        if torch.is_tensor(pairwise_utility):
+                            pair_aligned = _align_2d(
+                                logits_use,
+                                pairwise_utility,
+                                mask_use.float(),
+                            )
+                            if pair_aligned is not None:
+                                _, pairwise_target, pairwise_mask = pair_aligned
+                                pairwise_target = pairwise_target.to(
+                                    device=logits_use.device,
+                                    dtype=logits_use.dtype,
+                                )
+                                pairwise_mask = pairwise_mask > 0.5
+                            else:
+                                pairwise_mask = mask_use
+                        else:
+                            pairwise_mask = mask_use
+
                         pairwise_loss = selector_pairwise_utility_loss(
                             logits_use,
-                            target_use,
-                            valid_mask=mask_use,
+                            pairwise_target,
+                            valid_mask=pairwise_mask,
                         )
                         if torch.is_tensor(pairwise_loss):
                             selector_loss_total = selector_loss_total + pairwise_w * pairwise_loss
