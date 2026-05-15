@@ -256,22 +256,37 @@ def _resolve_formula_oh_sizes(element_n):
         return override, 'env'
     return [50] * int(element_n), 'fixed50'
 
-
 def _build_parquet_dataset_with_optional_cache(parquet_path, cache_dir, spect_bin, featurizer_config):
     prev_cache = os.environ.get('FEAT_CACHE_DIR')
     try:
         if cache_dir:
+            cache_dir = os.path.abspath(str(cache_dir))
+            if not os.path.isdir(cache_dir):
+                raise FileNotFoundError(
+                    f"FEAT_CACHE_DIR does not exist: {cache_dir}\n"
+                    f"parquet fallback is disabled because cache_dir was explicitly set."
+                )
+
+            pkl_n = len([x for x in os.listdir(cache_dir) if x.endswith(".pkl")])
+            if pkl_n <= 0:
+                raise FileNotFoundError(
+                    f"FEAT_CACHE_DIR has no .pkl files: {cache_dir}"
+                )
+
+            print(f"[CACHE_OK] {cache_dir} | pkl_n={pkl_n}", flush=True)
             os.environ['FEAT_CACHE_DIR'] = cache_dir
+
         elif 'FEAT_CACHE_DIR' in os.environ:
             del os.environ['FEAT_CACHE_DIR']
+
         return dataset.ParquetDataset(parquet_path, spect_bin, featurizer_config, {})
+
     finally:
         if prev_cache is None:
             if 'FEAT_CACHE_DIR' in os.environ:
                 del os.environ['FEAT_CACHE_DIR']
         else:
             os.environ['FEAT_CACHE_DIR'] = prev_cache
-
 
 def _masked_selector_bce(selector_logits, target_mask, formulae_mask=None, pos_weight=4.0):
     if (not torch.is_tensor(selector_logits)) or (not torch.is_tensor(target_mask)):
