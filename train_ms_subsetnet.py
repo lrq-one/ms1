@@ -255,25 +255,43 @@ def _resolve_formula_oh_sizes(element_n):
     if override is not None:
         return override, 'env'
     return [50] * int(element_n), 'fixed50'
-
 def _build_parquet_dataset_with_optional_cache(parquet_path, cache_dir, spect_bin, featurizer_config):
     prev_cache = os.environ.get('FEAT_CACHE_DIR')
     try:
         if cache_dir:
             cache_dir = os.path.abspath(str(cache_dir))
+
             if not os.path.isdir(cache_dir):
                 raise FileNotFoundError(
                     f"FEAT_CACHE_DIR does not exist: {cache_dir}\n"
-                    f"parquet fallback is disabled because cache_dir was explicitly set."
+                    f"Explicit cache was requested, so parquet fallback is disabled."
                 )
 
-            pkl_n = len([x for x in os.listdir(cache_dir) if x.endswith(".pkl")])
-            if pkl_n <= 0:
+            all_names = [x for x in os.listdir(cache_dir) if x.endswith(".pkl")]
+            real_names = [
+                x for x in all_names
+                if os.path.isfile(os.path.join(cache_dir, x))
+            ]
+            broken_names = [
+                x for x in all_names
+                if os.path.islink(os.path.join(cache_dir, x))
+                and not os.path.exists(os.path.join(cache_dir, x))
+            ]
+
+            if len(real_names) <= 0:
                 raise FileNotFoundError(
-                    f"FEAT_CACHE_DIR has no .pkl files: {cache_dir}"
+                    f"FEAT_CACHE_DIR has no readable .pkl files: {cache_dir}\n"
+                    f"all_pkl={len(all_names)} broken_symlink={len(broken_names)} "
+                    f"broken_examples={broken_names[:5]}"
                 )
 
-            print(f"[CACHE_OK] {cache_dir} | pkl_n={pkl_n}", flush=True)
+            print(
+                f"[CACHE_OK] {cache_dir} | "
+                f"all_pkl={len(all_names)} real_pkl={len(real_names)} "
+                f"broken_symlink={len(broken_names)}",
+                flush=True,
+            )
+
             os.environ['FEAT_CACHE_DIR'] = cache_dir
 
         elif 'FEAT_CACHE_DIR' in os.environ:
