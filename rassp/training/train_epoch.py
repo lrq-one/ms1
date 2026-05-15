@@ -342,8 +342,18 @@ def train_one_epoch(
                             formulae_mask=mask_use.float(),
                             topk=recall_topk,
                         )
+
                         if not torch.is_tensor(recall_mask):
                             recall_mask = target_mask
+                        else:
+                            # Critical fix:
+                            # apply_teacher_topk_to_target(topk=128) may include zero-prob candidates
+                            # when teacher has fewer than 128 positives.
+                            # Those zero-prob candidates must NOT become recall BCE positives.
+                            recall_mask = recall_mask.to(device=target_use.device, dtype=target_use.dtype)
+                            recall_mask = recall_mask * (target_use > 1e-12).float()
+                            recall_mask = recall_mask * mask_use.float()
+
                         recall_bce_loss = _masked_selector_recall_bce(
                             logits_use,
                             recall_mask,

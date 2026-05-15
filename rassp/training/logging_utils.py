@@ -57,6 +57,13 @@ def format_metric_line(prefix, metrics):
         "val_selected_false_mass@128",
         "val_teacher_oracle_cos",
         "val_teacher_oracle_false_support",
+
+        "val_overlap_teacher_selected_true_hit_mass@8",
+        "val_overlap_teacher_selected_false_mass@8",
+        "val_overlap_teacher_selected_n",
+        "val_setcover_teacher_selected_true_hit_mass@8",
+        "val_setcover_teacher_selected_false_mass@8",
+        "val_setcover_teacher_selected_n",
     ]
 
     parts = [prefix]
