@@ -749,7 +749,62 @@ def train_one_epoch(
 
                     utility_w = float(_cfg_value(loss_cfg, "selector_utility_weight", 0.0))
                     if utility_w > 0:
-                        util_loss = compute_selector_utility_target_loss(logits_use, batch)
+                        util_loss = None
+
+                        utility_source = os.environ.get(
+                            "SELECTOR_UTILITY_SOURCE",
+                            "local",
+                        ).strip().lower()
+
+                        if utility_source in ("local", "local_extra", "quality"):
+                            util_target = None
+                            if isinstance(local_extra, dict):
+                                util_target = local_extra.get("utility_dist", None)
+
+                            if torch.is_tensor(util_target):
+                                util_aligned = _align_2d(
+                                    logits_use,
+                                    util_target,
+                                    mask_use.float(),
+                                )
+
+                                if util_aligned is not None:
+                                    u_logits, u_target, u_mask = util_aligned
+                                    u_logits = u_logits.float()
+                                    u_target = u_target.to(
+                                        device=u_logits.device,
+                                        dtype=u_logits.dtype,
+                                    ).clamp_min(0.0)
+                                    u_mask = (u_mask > 0.5).to(device=u_logits.device)
+
+                                    u_target = u_target * u_mask.float()
+                                    u_sum = u_target.sum(dim=-1, keepdim=True)
+                                    valid_rows = u_sum.squeeze(-1) > 1e-12
+
+                                    if bool(valid_rows.any().item()):
+                                        u_target = u_target / u_sum.clamp_min(1e-12)
+
+                                        neg_fill = -1e4 if u_logits.dtype in (
+                                            torch.float16,
+                                            torch.bfloat16,
+                                        ) else -1e9
+
+                                        log_prob = F.log_softmax(
+                                            u_logits.masked_fill(~u_mask, neg_fill),
+                                            dim=-1,
+                                        )
+
+                                        per_row = -(u_target.detach() * log_prob).sum(dim=-1)
+                                        util_loss = per_row[valid_rows].mean()
+                                    else:
+                                        util_loss = logits_use.sum() * 0.0
+
+                        elif utility_source in ("legacy", "old", "batch"):
+                            util_loss = compute_selector_utility_target_loss(logits_use, batch)
+
+                        else:
+                            util_loss = logits_use.sum() * 0.0
+
                         if torch.is_tensor(util_loss):
                             selector_loss_total = selector_loss_total + utility_w * util_loss
                             acc.add("selector_utility", util_loss.detach().item())
