@@ -200,6 +200,10 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
         self.set_score_l1_v2 = nn.Linear(rerank_v2_in_d, int(internal_d))
         self.set_score_l2_v2 = nn.Linear(int(internal_d), int(internal_d))
         self.set_score_out_v2 = nn.Linear(int(internal_d), 1)
+        # Critical: start reranker as identity.
+        # Otherwise random delta destroys the StageA selector ranking.
+        nn.init.zeros_(self.set_score_out_v2.weight)
+        nn.init.zeros_(self.set_score_out_v2.bias)
         oos_in_d = int(self.g_feat_in) + int(self.peak_support_proj_dim) + int(self.peak_support_proj_dim) + 4
         self.oos_norm = nn.LayerNorm(oos_in_d)
         self.oos_head = nn.Sequential(
@@ -1066,6 +1070,8 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
                     device=device,
                 )
             pool_peak_raw = pool_peak_raw.to(device=device, dtype=pool_hidden_for_rerank.dtype)
+            if detach_rerank_selector:
+                pool_peak_raw = pool_peak_raw.detach()
             pool_peak_raw_h = self.rerank_peak_raw_proj(pool_peak_raw)
 
             # candidate_peak_feat: [B, M, 16]
@@ -1077,6 +1083,8 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
                     device=device,
                 )
             pool_peak_emb = pool_peak_emb.to(device=device, dtype=pool_hidden_for_rerank.dtype)
+            if detach_rerank_selector:
+                pool_peak_emb = pool_peak_emb.detach()
             pool_peak_emb_h = self.rerank_peak_emb_proj(pool_peak_emb)
 
             def _gather_meta_2d(name, scale=1.0):
@@ -1124,6 +1132,8 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
             ]
             pool_meta = torch.cat(meta_parts, dim=-1)
             pool_meta = torch.nan_to_num(pool_meta, nan=0.0, posinf=0.0, neginf=0.0)
+            if detach_rerank_selector:
+                pool_meta = pool_meta.detach()
             pool_meta_h = self.rerank_meta_proj(pool_meta)
 
             set_parts = old_set_parts + [
@@ -1139,6 +1149,8 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
                         device=device,
                         dtype=pool_hidden_for_rerank.dtype,
                     )
+                    if detach_rerank_selector:
+                        pool_frag_raw = pool_frag_raw.detach()
                     pool_frag_h = self.rerank_frag_raw_proj(pool_frag_raw)
                     set_parts.append(pool_frag_h)
 
