@@ -66,6 +66,8 @@ def format_metric_line(prefix, metrics):
         "train_rerank_selector_teacher_topk_recall",
         "train_rerank_selector_teacher_topk_precision",
         "train_rerank_active_row_rate",
+        "train_rerank_direct_bce",
+        "train_rerank_direct_pairwise",
         "val_overlap_teacher_selected_true_hit_mass@8",
         "val_overlap_teacher_selected_false_mass@8",
         "val_overlap_teacher_selected_n",
