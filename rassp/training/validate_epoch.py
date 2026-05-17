@@ -10,9 +10,13 @@ from rassp.training.selector_metrics import (
     compute_candidate_support_stats,
     compute_selector_eval_pack,
     compute_selected_support_metrics,
+    compute_topk_pool_recall_metrics,
     select_model_topk_indices,
 )
-
+from rassp.training.runtime_selector_targets import (
+    build_selector_teacher_dist_from_official_overlap,
+    build_selector_teacher_dist_setcover,
+)
 def _cfg_value(cfg, name, default):
     return getattr(cfg, name, default) if cfg is not None else default
 
@@ -111,7 +115,78 @@ def validate_one_epoch(
 
                 selector_metrics = compute_selected_support_metrics(topk_idx, batch)
                 acc.add_dict({f"{key}@{suffix}": value for key, value in selector_metrics.items()})
+                try:
+                    official_bin_width = float(metric_cfg.get("bin_width", 0.01))
+                    official_max_mz = float(metric_cfg.get("max_mz", 1005.0))
+                    official_bin_n = int(official_max_mz / max(official_bin_width, 1e-8)) + 1
 
+                    formulae_mask_for_teacher = batch.get("formulae_mask", None)
+
+                    overlap_teacher = build_selector_teacher_dist_from_official_overlap(
+                        batch=batch,
+                        formulae_mask=formulae_mask_for_teacher,
+                        official_bin_n=official_bin_n,
+                    )
+
+                    setcover_teacher = build_selector_teacher_dist_setcover(
+                        batch=batch,
+                        formulae_mask=formulae_mask_for_teacher,
+                        official_bin_n=official_bin_n,
+                    )
+
+                    if torch.is_tensor(overlap_teacher):
+                        overlap_mask = (overlap_teacher > 1e-12).float()
+                    else:
+                        overlap_mask = None
+
+                    if torch.is_tensor(setcover_teacher):
+                        setcover_mask = (setcover_teacher > 1e-12).float()
+                    else:
+                        setcover_mask = None
+
+                    pool_true_metrics = compute_topk_pool_recall_metrics(
+                        topk_idx,
+                        batch,
+                        teacher_mask=None,
+                        official_bin_width=official_bin_width,
+                        official_max_mz=official_max_mz,
+                    )
+                    acc.add_dict({
+                        f"pool_{key}@{suffix}": value
+                        for key, value in pool_true_metrics.items()
+                    })
+
+                    if torch.is_tensor(overlap_mask):
+                        pool_overlap_metrics = compute_topk_pool_recall_metrics(
+                            topk_idx,
+                            batch,
+                            teacher_mask=overlap_mask,
+                            official_bin_width=official_bin_width,
+                            official_max_mz=official_max_mz,
+                        )
+                        if "teacher_recall" in pool_overlap_metrics:
+                            acc.add(
+                                f"pool_overlap_teacher_recall@{suffix}",
+                                pool_overlap_metrics["teacher_recall"],
+                            )
+
+                    if torch.is_tensor(setcover_mask):
+                        pool_setcover_metrics = compute_topk_pool_recall_metrics(
+                            topk_idx,
+                            batch,
+                            teacher_mask=setcover_mask,
+                            official_bin_width=official_bin_width,
+                            official_max_mz=official_max_mz,
+                        )
+                        if "teacher_recall" in pool_setcover_metrics:
+                            acc.add(
+                                f"pool_setcover_teacher_recall@{suffix}",
+                                pool_setcover_metrics["teacher_recall"],
+                            )
+
+                except Exception as e:
+                    if os.environ.get("DEBUG_POOL_RECALL", "0") == "1":
+                        print("[DEBUG_POOL_RECALL_ERROR]", repr(e), flush=True)
                 topk_mask = build_mask_from_topk_indices(
                     topk_idx,
                     selector_logits,

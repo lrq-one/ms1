@@ -68,6 +68,49 @@ def format_metric_line(prefix, metrics):
         "val_setcover_teacher_selected_true_hit_mass@8",
         "val_setcover_teacher_selected_false_mass@8",
         "val_setcover_teacher_selected_n",
+        "val_model_topk_oracle_cos@256",
+        "val_model_topk_oracle_false_support@256",
+        "val_selected_true_hit_mass@256",
+        "val_selected_false_mass@256",
+        "val_model_topk_oracle_cos@512",
+        "val_model_topk_oracle_false_support@512",
+        "val_selected_true_hit_mass@512",
+        "val_selected_false_mass@512",
+
+        "val_pool_true_peak_recall@8",
+        "val_pool_true_int_recall@8",
+        "val_pool_overlap_teacher_recall@8",
+        "val_pool_setcover_teacher_recall@8",
+
+        "val_pool_true_peak_recall@16",
+        "val_pool_true_int_recall@16",
+        "val_pool_overlap_teacher_recall@16",
+        "val_pool_setcover_teacher_recall@16",
+
+        "val_pool_true_peak_recall@32",
+        "val_pool_true_int_recall@32",
+        "val_pool_overlap_teacher_recall@32",
+        "val_pool_setcover_teacher_recall@32",
+
+        "val_pool_true_peak_recall@64",
+        "val_pool_true_int_recall@64",
+        "val_pool_overlap_teacher_recall@64",
+        "val_pool_setcover_teacher_recall@64",
+
+        "val_pool_true_peak_recall@128",
+        "val_pool_true_int_recall@128",
+        "val_pool_overlap_teacher_recall@128",
+        "val_pool_setcover_teacher_recall@128",
+
+        "val_pool_true_peak_recall@256",
+        "val_pool_true_int_recall@256",
+        "val_pool_overlap_teacher_recall@256",
+        "val_pool_setcover_teacher_recall@256",
+
+        "val_pool_true_peak_recall@512",
+        "val_pool_true_int_recall@512",
+        "val_pool_overlap_teacher_recall@512",
+        "val_pool_setcover_teacher_recall@512",
     ]
 
     parts = [prefix]

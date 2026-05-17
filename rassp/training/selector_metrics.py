@@ -660,7 +660,143 @@ def compute_selected_support_metrics(topk_idx, batch, eps=1e-8):
         "selected_true_hit_mass": float(torch.stack(true_mass_list).mean().detach().cpu().item()),
         "selected_false_mass": float(torch.stack(false_mass_list).mean().detach().cpu().item()),
     }
+def compute_topk_pool_recall_metrics(
+    topk_idx,
+    batch,
+    teacher_mask=None,
+    official_bin_width=0.01,
+    official_max_mz=1005.0,
+    eps=1e-8,
+):
+    """
+    Pool-capacity diagnostics.
 
+    Different from selected_true_hit_mass:
+      selected_true_hit_mass = purity among selected candidates.
+      true_peak_recall = how much true spectrum support is covered by selected candidates.
+      teacher_recall = how many teacher-selected candidates are included in selected topK.
+
+    These metrics answer:
+      Does selector retrieve a useful candidate pool before reranking?
+    """
+    cand_idx = batch.get("formulae_peaks_official_idx_agg", None)
+    cand_int = batch.get("formulae_peaks_official_intensity_agg", None)
+
+    if cand_idx is None:
+        cand_idx = batch.get("formulae_peaks_official_idx", None)
+    if cand_int is None:
+        cand_int = batch.get("formulae_peaks_official_intensity", None)
+
+    true_idx_obj = batch.get("true_all_official_idx", None)
+    if true_idx_obj is None:
+        true_idx_obj = batch.get("true_official_idx", None)
+
+    true_int_obj = batch.get("true_all_official_intensity", None)
+    if true_int_obj is None:
+        true_int_obj = batch.get("true_official_intensity", None)
+
+    if not (
+        torch.is_tensor(topk_idx)
+        and torch.is_tensor(cand_idx)
+        and torch.is_tensor(cand_int)
+    ):
+        return {}
+
+    if cand_idx.dim() == 2:
+        cand_idx = cand_idx.unsqueeze(0)
+    if cand_int.dim() == 2:
+        cand_int = cand_int.unsqueeze(0)
+
+    device = cand_idx.device
+    batch_n = int(min(topk_idx.shape[0], cand_idx.shape[0], cand_int.shape[0]))
+
+    try:
+        official_bin_n = int(np.floor(float(official_max_mz) / float(official_bin_width))) + 1
+    except Exception:
+        official_bin_n = 1
+    official_bin_n = max(1, int(official_bin_n))
+
+    true_peak_recall_list = []
+    true_int_recall_list = []
+    teacher_recall_list = []
+
+    for b in range(batch_n):
+        sel = topk_idx[b].long().clamp(0, max(0, int(cand_idx.shape[1]) - 1))
+
+        idx_b = cand_idx[b, sel].long()
+        int_b = cand_int[b, sel].float()
+
+        valid = (
+            (idx_b >= 0)
+            & (idx_b < official_bin_n)
+            & torch.isfinite(int_b)
+            & (int_b > 0)
+        )
+
+        selected_bins = torch.zeros(
+            (official_bin_n,),
+            dtype=torch.bool,
+            device=device,
+        )
+
+        if bool(valid.any().item()):
+            selected_bins[idx_b[valid]] = True
+
+        if torch.is_tensor(true_idx_obj):
+            true_idx = true_idx_obj[b].detach().to(device).long().reshape(-1)
+        else:
+            try:
+                true_idx = torch.as_tensor(true_idx_obj[b], dtype=torch.long, device=device).reshape(-1)
+            except Exception:
+                true_idx = None
+
+        if true_idx is not None:
+            true_idx = true_idx[(true_idx >= 0) & (true_idx < official_bin_n)]
+
+            if true_idx.numel() > 0:
+                true_hit = selected_bins[true_idx].float()
+                true_peak_recall_list.append(true_hit.mean())
+
+                if torch.is_tensor(true_int_obj):
+                    true_int = true_int_obj[b].detach().to(device).float().reshape(-1)
+                    use_n = min(int(true_idx.numel()), int(true_int.numel()))
+                    if use_n > 0:
+                        ti = true_int[:use_n].clamp_min(0.0)
+                        th = true_hit[:use_n]
+                        denom = ti.sum().clamp_min(float(eps))
+                        true_int_recall_list.append((ti * th).sum() / denom)
+
+        if torch.is_tensor(teacher_mask):
+            tm = teacher_mask
+            if tm.dim() == 1:
+                tm = tm.unsqueeze(0)
+            elif tm.dim() > 2:
+                tm = tm.reshape(tm.shape[0], -1)
+
+            if b < int(tm.shape[0]):
+                tmb = tm[b].to(device).float()
+                teacher_pos = tmb > 0.5
+                denom = teacher_pos.float().sum().clamp_min(1.0)
+
+                pred_mask = torch.zeros_like(tmb, dtype=torch.bool)
+                sel2 = sel.clamp(0, max(0, int(tmb.shape[0]) - 1))
+                pred_mask[sel2] = True
+
+                hit = (pred_mask & teacher_pos).float().sum()
+                teacher_recall_list.append(hit / denom)
+
+    out = {}
+
+    if len(true_peak_recall_list) > 0:
+        out["true_peak_recall"] = float(torch.stack(true_peak_recall_list).mean().detach().cpu().item())
+
+    if len(true_int_recall_list) > 0:
+        out["true_int_recall"] = float(torch.stack(true_int_recall_list).mean().detach().cpu().item())
+
+    if len(teacher_recall_list) > 0:
+        out["teacher_recall"] = float(torch.stack(teacher_recall_list).mean().detach().cpu().item())
+
+    return out
 
 def compute_selector_eval_pack(
     selector_logits,
