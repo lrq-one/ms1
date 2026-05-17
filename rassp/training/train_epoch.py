@@ -926,6 +926,153 @@ def train_one_epoch(
                                         "rerank_active_row_rate",
                                         float(r_valid_rows.float().mean().detach().cpu().item()),
                                     )
+                                    # ------------------------------------------------------------
+                                    # Direct pool rerank loss for StageB: 1536 -> 512.
+                                    #
+                                    # The hard-topk teacher loss above was not moving @512 recall.
+                                    # This loss directly trains positives inside selector_pool_idx
+                                    # against hard negatives inside the same pool.
+                                    # ------------------------------------------------------------
+                                    direct_bce_w = _env_float("RERANK_DIRECT_BCE_WEIGHT", 0.0)
+                                    direct_pair_w = _env_float("RERANK_DIRECT_PAIRWISE_WEIGHT", 0.0)
+
+                                    if (direct_bce_w > 0.0 or direct_pair_w > 0.0) and isinstance(res, dict):
+                                        pool_logits = res.get("rerank_logits_pool", None)
+                                        pool_idx2 = res.get("selector_pool_idx", None)
+
+                                        if torch.is_tensor(pool_logits) and torch.is_tensor(pool_idx2):
+                                            pool_logits = pool_logits.float()
+
+                                            pi2 = pool_idx2.to(device=pool_logits.device, dtype=torch.long)
+                                            if pi2.dim() == 1:
+                                                pi2 = pi2.unsqueeze(0)
+                                            elif pi2.dim() > 2:
+                                                pi2 = pi2.reshape(pi2.shape[0], -1)
+
+                                            Bp = min(int(pool_logits.shape[0]), int(pi2.shape[0]))
+                                            Kp = min(int(pool_logits.shape[1]), int(pi2.shape[1]))
+
+                                            if Bp > 0 and Kp > 0:
+                                                pool_logits_use = pool_logits[:Bp, :Kp]
+                                                pi_use2 = pi2[:Bp, :Kp].clamp(min=0, max=int(rerank_teacher.shape[1]) - 1)
+
+                                                teacher_pool = torch.gather(
+                                                    rerank_teacher[:Bp].to(
+                                                        device=pool_logits.device,
+                                                        dtype=pool_logits.dtype,
+                                                    ),
+                                                    1,
+                                                    pi_use2,
+                                                )
+
+                                                mask_pool = torch.gather(
+                                                    formulae_mask[:Bp].to(
+                                                        device=pool_logits.device,
+                                                        dtype=pool_logits.dtype,
+                                                    ),
+                                                    1,
+                                                    pi_use2,
+                                                ) > 0.5
+
+                                                pos_pool = (teacher_pool > 1e-12) & mask_pool
+                                                neg_pool = (~pos_pool) & mask_pool
+
+                                                valid_direct = (
+                                                    pos_pool.any(dim=1)
+                                                    & neg_pool.any(dim=1)
+                                                )
+
+                                                # Direct BCE: every teacher candidate in the 1536 pool
+                                                # should be scored as positive.
+                                                if direct_bce_w > 0.0 and bool(valid_direct.any().item()):
+                                                    y = pos_pool.to(dtype=pool_logits_use.dtype)
+
+                                                    pos_n = pos_pool.float().sum(dim=1, keepdim=True)
+                                                    neg_n = neg_pool.float().sum(dim=1, keepdim=True)
+                                                    pos_weight_row = (neg_n / pos_n.clamp_min(1.0)).clamp(
+                                                        min=1.0,
+                                                        max=_env_float("RERANK_DIRECT_POS_WEIGHT_MAX", 20.0),
+                                                    )
+
+                                                    bce_raw = F.binary_cross_entropy_with_logits(
+                                                        pool_logits_use,
+                                                        y,
+                                                        reduction="none",
+                                                    )
+
+                                                    weight = torch.where(
+                                                        pos_pool,
+                                                        pos_weight_row.expand_as(pool_logits_use),
+                                                        torch.ones_like(pool_logits_use),
+                                                    )
+                                                    weight = weight * mask_pool.float()
+
+                                                    bce_row = (bce_raw * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1.0)
+                                                    direct_bce_loss = bce_row[valid_direct].mean()
+
+                                                    loss = loss + direct_bce_w * direct_bce_loss
+                                                    acc.add("rerank_direct_bce", direct_bce_loss.detach().item())
+
+                                                # Hard pairwise: teacher positives should beat hard negatives.
+                                                if direct_pair_w > 0.0 and bool(valid_direct.any().item()):
+                                                    try:
+                                                        neg_k = int(os.environ.get("RERANK_DIRECT_NEG_TOPK", "512"))
+                                                    except Exception:
+                                                        neg_k = 512
+                                                    try:
+                                                        margin = float(os.environ.get("RERANK_DIRECT_MARGIN", "0.2"))
+                                                    except Exception:
+                                                        margin = 0.2
+
+                                                    pair_losses = []
+                                                    neg_fill = -1e9
+                                                    pos_fill = 1e9
+
+                                                    for bi in range(Bp):
+                                                        if not bool(valid_direct[bi].item()):
+                                                            continue
+
+                                                        s = pool_logits_use[bi]
+                                                        pos_b = pos_pool[bi]
+                                                        neg_b = neg_pool[bi]
+
+                                                        pos_scores = s.masked_fill(~pos_b, pos_fill)
+                                                        neg_scores = s.masked_fill(~neg_b, neg_fill)
+
+                                                        pos_count = int(pos_b.sum().detach().cpu().item())
+                                                        neg_count = int(neg_b.sum().detach().cpu().item())
+
+                                                        if pos_count <= 0 or neg_count <= 0:
+                                                            continue
+
+                                                        # weakest positives
+                                                        p_k = min(pos_count, int(os.environ.get("RERANK_DIRECT_POS_LOWK", "64")))
+                                                        pos_low = torch.topk(
+                                                            -pos_scores,
+                                                            k=p_k,
+                                                            largest=True,
+                                                        ).values.neg()
+
+                                                        # strongest negatives
+                                                        n_k = min(neg_count, neg_k)
+                                                        neg_high = torch.topk(
+                                                            neg_scores,
+                                                            k=n_k,
+                                                            largest=True,
+                                                        ).values
+
+                                                        # [p_k, n_k]: max(0, margin + neg - pos)
+                                                        pl = F.relu(
+                                                            float(margin)
+                                                            + neg_high.unsqueeze(0)
+                                                            - pos_low.unsqueeze(1)
+                                                        ).mean()
+                                                        pair_losses.append(pl)
+
+                                                    if len(pair_losses) > 0:
+                                                        direct_pair_loss = torch.stack(pair_losses).mean()
+                                                        loss = loss + direct_pair_w * direct_pair_loss
+                                                        acc.add("rerank_direct_pairwise", direct_pair_loss.detach().item())
                 false_total = None
                 hard_false_w = float(_cfg_value(loss_cfg, "false_support_weight", 0.0))
                 if hard_false_w > 0:
