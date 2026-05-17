@@ -153,7 +153,53 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
         self.set_score_l1 = nn.Linear(int(internal_d) * 4 + 2, int(internal_d))
         self.set_score_l2 = nn.Linear(int(internal_d), int(internal_d))
         self.set_score_out = nn.Linear(int(internal_d), 1)
+        # ------------------------------------------------------------
+        # V2 reranker head:
+        # keep old head unchanged for checkpoint compatibility.
+        # This head adds explicit candidate peak / fragment / meta features.
+        # ------------------------------------------------------------
+        self.use_rerank_head_v2 = os.environ.get("USE_RERANK_HEAD_V2", "0") == "1"
 
+        self.rerank_peak_raw_proj = nn.Sequential(
+            nn.LayerNorm(self.peak_support_feat_dim),      # 8D raw peak summary
+            nn.Linear(self.peak_support_feat_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+        )
+
+        self.rerank_peak_emb_proj = nn.Sequential(
+            nn.LayerNorm(self.peak_support_proj_dim),      # 16D embedded peak summary
+            nn.Linear(self.peak_support_proj_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+        )
+
+        self.rerank_meta_dim = 6
+        self.rerank_meta_proj = nn.Sequential(
+            nn.LayerNorm(self.rerank_meta_dim),
+            nn.Linear(self.rerank_meta_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+        )
+
+        if self.fragment_local_aux_dim > 0:
+            self.rerank_frag_raw_proj = nn.Sequential(
+                nn.LayerNorm(self.fragment_local_aux_dim),
+                nn.Linear(self.fragment_local_aux_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, 64),
+            )
+            rerank_frag_extra_d = 64
+        else:
+            self.rerank_frag_raw_proj = None
+            rerank_frag_extra_d = 0
+
+        rerank_v2_in_d = int(internal_d) * 4 + 2 + 64 + 64 + 64 + rerank_frag_extra_d
+
+        self.set_score_norm_v2 = nn.LayerNorm(rerank_v2_in_d)
+        self.set_score_l1_v2 = nn.Linear(rerank_v2_in_d, int(internal_d))
+        self.set_score_l2_v2 = nn.Linear(int(internal_d), int(internal_d))
+        self.set_score_out_v2 = nn.Linear(int(internal_d), 1)
         oos_in_d = int(self.g_feat_in) + int(self.peak_support_proj_dim) + int(self.peak_support_proj_dim) + 4
         self.oos_norm = nn.LayerNorm(oos_in_d)
         self.oos_head = nn.Sequential(
@@ -984,10 +1030,14 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
         pool_hidden = self._gather_candidates_3d(base_h, pool_idx)
         pool_selector_logits = torch.gather(selector_logits, 1, pool_idx)
 
-        if os.environ.get("RERANK_DETACH_SELECTOR", "0") == "1":
+        detach_rerank_selector = os.environ.get("RERANK_DETACH_SELECTOR", "0") == "1"
+
+        if detach_rerank_selector:
             pool_hidden_for_rerank = pool_hidden.detach()
+            pool_selector_logits_for_rerank = pool_selector_logits.detach()
         else:
             pool_hidden_for_rerank = pool_hidden
+            pool_selector_logits_for_rerank = pool_selector_logits
 
         pool_mean = pool_hidden_for_rerank.mean(dim=1, keepdim=True).expand_as(pool_hidden_for_rerank)
         pool_max = pool_hidden_for_rerank.max(dim=1, keepdim=True).values.expand_as(pool_hidden_for_rerank)
@@ -995,24 +1045,115 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
         rank_pos = torch.arange(pool_k, device=device).float()
         rank_pos = rank_pos.view(1, pool_k, 1).expand(batch_n, pool_k, 1) / max(1.0, float(pool_k - 1))
 
-        selector_logit_feat = pool_selector_logits.unsqueeze(-1)
+        selector_logit_feat = pool_selector_logits_for_rerank.unsqueeze(-1)
 
-        set_in = torch.cat(
-            [
-                pool_hidden_for_rerank,
-                pool_mean,
-                pool_max,
-                pool_hidden_for_rerank - pool_mean,
-                selector_logit_feat,
-                rank_pos,
-            ],
-            dim=-1,
-        )
+        old_set_parts = [
+            pool_hidden_for_rerank,
+            pool_mean,
+            pool_max,
+            pool_hidden_for_rerank - pool_mean,
+            selector_logit_feat,
+            rank_pos,
+        ]
 
-        set_in = self.set_score_norm(set_in)
-        score_h = F.relu(self.set_score_l1(set_in))
-        score_h = F.relu(self.set_score_l2(score_h))
-        raw_rerank_delta_pool = self.set_score_out(score_h).squeeze(-1)
+        if self.use_rerank_head_v2:
+            # candidate_peak_feat_raw: [B, M, 8]
+            pool_peak_raw = self._gather_candidates_3d(candidate_peak_feat_raw, pool_idx)
+            if pool_peak_raw is None:
+                pool_peak_raw = torch.zeros(
+                    (batch_n, pool_k, self.peak_support_feat_dim),
+                    dtype=pool_hidden_for_rerank.dtype,
+                    device=device,
+                )
+            pool_peak_raw = pool_peak_raw.to(device=device, dtype=pool_hidden_for_rerank.dtype)
+            pool_peak_raw_h = self.rerank_peak_raw_proj(pool_peak_raw)
+
+            # candidate_peak_feat: [B, M, 16]
+            pool_peak_emb = self._gather_candidates_3d(candidate_peak_feat, pool_idx)
+            if pool_peak_emb is None:
+                pool_peak_emb = torch.zeros(
+                    (batch_n, pool_k, self.peak_support_proj_dim),
+                    dtype=pool_hidden_for_rerank.dtype,
+                    device=device,
+                )
+            pool_peak_emb = pool_peak_emb.to(device=device, dtype=pool_hidden_for_rerank.dtype)
+            pool_peak_emb_h = self.rerank_peak_emb_proj(pool_peak_emb)
+
+            def _gather_meta_2d(name, scale=1.0):
+                t = kwargs.get(name, None)
+                if not torch.is_tensor(t):
+                    return torch.zeros(
+                        (batch_n, pool_k, 1),
+                        dtype=pool_hidden_for_rerank.dtype,
+                        device=device,
+                    )
+                t = t.to(device=device, dtype=pool_hidden_for_rerank.dtype)
+                if t.dim() == 1:
+                    t = t.unsqueeze(0)
+                elif t.dim() > 2:
+                    t = t.reshape(t.shape[0], -1)
+
+                if t.shape[0] < batch_n:
+                    pad = torch.zeros(
+                        (batch_n - int(t.shape[0]), int(t.shape[1])),
+                        dtype=t.dtype,
+                        device=device,
+                    )
+                    t = torch.cat([t, pad], dim=0)
+                t = t[:batch_n]
+
+                if t.shape[1] < formula_n:
+                    pad = torch.zeros(
+                        (batch_n, formula_n - int(t.shape[1])),
+                        dtype=t.dtype,
+                        device=device,
+                    )
+                    t = torch.cat([t, pad], dim=1)
+                t = t[:, :formula_n]
+
+                out = torch.gather(t, 1, pool_idx).unsqueeze(-1)
+                return out / max(float(scale), 1e-6)
+
+            meta_parts = [
+                _gather_meta_2d("formulae_prior_score", 1.0),
+                _gather_meta_2d("formulae_source_flag", 1.0),
+                _gather_meta_2d("formulae_break_depth", 4.0),
+                _gather_meta_2d("formulae_ring_cut_flag", 1.0),
+                _gather_meta_2d("formulae_instance_depth", 4.0),
+                _gather_meta_2d("formulae_instance_h_shift", 4.0),
+            ]
+            pool_meta = torch.cat(meta_parts, dim=-1)
+            pool_meta = torch.nan_to_num(pool_meta, nan=0.0, posinf=0.0, neginf=0.0)
+            pool_meta_h = self.rerank_meta_proj(pool_meta)
+
+            set_parts = old_set_parts + [
+                pool_peak_raw_h,
+                pool_peak_emb_h,
+                pool_meta_h,
+            ]
+
+            if self.rerank_frag_raw_proj is not None and torch.is_tensor(frag_aux_t):
+                pool_frag_raw = self._gather_candidates_3d(frag_aux_t, pool_idx)
+                if pool_frag_raw is not None:
+                    pool_frag_raw = pool_frag_raw.to(
+                        device=device,
+                        dtype=pool_hidden_for_rerank.dtype,
+                    )
+                    pool_frag_h = self.rerank_frag_raw_proj(pool_frag_raw)
+                    set_parts.append(pool_frag_h)
+
+            set_in = torch.cat(set_parts, dim=-1)
+            set_in = self.set_score_norm_v2(set_in)
+            score_h = F.relu(self.set_score_l1_v2(set_in))
+            score_h = F.relu(self.set_score_l2_v2(score_h))
+            raw_rerank_delta_pool = self.set_score_out_v2(score_h).squeeze(-1)
+
+        else:
+            set_in = torch.cat(old_set_parts, dim=-1)
+            set_in = self.set_score_norm(set_in)
+            score_h = F.relu(self.set_score_l1(set_in))
+            score_h = F.relu(self.set_score_l2(score_h))
+            raw_rerank_delta_pool = self.set_score_out(score_h).squeeze(-1)
 
         try:
             rerank_loss_weight_env = float(os.environ.get("RERANK_LOSS_WEIGHT", "0.0"))
@@ -1025,7 +1166,20 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
         )
 
         if use_rerank_delta:
-            rerank_delta_pool = raw_rerank_delta_pool
+            try:
+                rerank_delta_scale = float(os.environ.get("RERANK_DELTA_SCALE", "0.30"))
+            except Exception:
+                rerank_delta_scale = 0.30
+
+            try:
+                rerank_delta_clip = float(os.environ.get("RERANK_DELTA_CLIP", "3.0"))
+            except Exception:
+                rerank_delta_clip = 3.0
+
+            rerank_delta_pool = raw_rerank_delta_pool.clamp(
+                -float(rerank_delta_clip),
+                float(rerank_delta_clip),
+            ) * float(rerank_delta_scale)
         else:
             rerank_delta_pool = torch.zeros_like(pool_selector_logits)
 
@@ -1033,7 +1187,12 @@ class MolAttentionGRUNewSparse(PeakFeatureMixin, nn.Module):
         rerank_delta_pool_std = rerank_delta_pool.std().detach()
         selector_logits_pool_std = pool_selector_logits.std().detach()
 
-        final_pool_logits = pool_selector_logits + rerank_delta_pool
+        if detach_rerank_selector:
+            final_base_logits = pool_selector_logits.detach()
+        else:
+            final_base_logits = pool_selector_logits
+
+        final_pool_logits = final_base_logits + rerank_delta_pool
 
         neg_fill = _neg_mask_fill_value(selector_logits)
         final_logits = selector_logits.new_full(selector_logits.shape, neg_fill)
