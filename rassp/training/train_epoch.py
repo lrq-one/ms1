@@ -812,7 +812,120 @@ def train_one_epoch(
                     if selector_loss_total is not None:
                         loss = loss + float(_cfg_value(loss_cfg, "selector_weight", 1.0)) * selector_loss_total
                         acc.add("selector_loss", selector_loss_total.detach().item())
+                    # ------------------------------------------------------------
+                    # Setwise reranker loss
+                    #
+                    # Base selector is still trained by local-quality / overlap target.
+                    # Reranker should learn setcover-style target inside the selector pool.
+                    # This is the missing bridge between local selector and set-cover teacher.
+                    # ------------------------------------------------------------
+                    rerank_w = _env_float("RERANK_LOSS_WEIGHT", 0.0)
+                    if rerank_w > 0.0 and isinstance(res, dict):
+                        rerank_logits = res.get("formulae_scores_raw", None)
+                        pool_idx = res.get("selector_pool_idx", None)
 
+                        if torch.is_tensor(rerank_logits) and torch.is_tensor(pool_idx):
+                            rerank_teacher_mode = os.environ.get(
+                                "RERANK_TEACHER_MODE",
+                                "setcover",
+                            ).strip().lower()
+
+                            if rerank_teacher_mode == "setcover":
+                                rerank_teacher = build_selector_teacher_dist_setcover(
+                                    batch=batch,
+                                    formulae_mask=formulae_mask,
+                                    official_bin_n=official_bin_n,
+                                )
+                            elif rerank_teacher_mode == "overlap":
+                                rerank_teacher = build_selector_teacher_dist_from_official_overlap(
+                                    batch=batch,
+                                    formulae_mask=formulae_mask,
+                                    official_bin_n=official_bin_n,
+                                )
+                            else:
+                                rerank_teacher = teacher_dist
+
+                            r_aligned = _align_2d(
+                                rerank_logits,
+                                rerank_teacher,
+                                formulae_mask.float(),
+                            )
+
+                            if r_aligned is not None:
+                                r_logits, r_target, r_mask_base = r_aligned
+                                r_logits = r_logits.float()
+                                r_target = r_target.to(
+                                    device=r_logits.device,
+                                    dtype=r_logits.dtype,
+                                ).clamp_min(0.0)
+                                r_mask_base = (r_mask_base > 0.5).to(device=r_logits.device)
+
+                                B_r, M_r = r_logits.shape
+
+                                # Only train reranker on candidates inside selector pool.
+                                r_pool_mask = torch.zeros_like(r_mask_base, dtype=torch.bool)
+                                pi = pool_idx.to(device=r_logits.device, dtype=torch.long)
+
+                                if pi.dim() == 1:
+                                    pi = pi.unsqueeze(0)
+                                elif pi.dim() > 2:
+                                    pi = pi.reshape(pi.shape[0], -1)
+
+                                use_b = min(B_r, int(pi.shape[0]))
+                                use_k = int(pi.shape[1]) if pi.dim() == 2 else 0
+
+                                if use_b > 0 and use_k > 0:
+                                    pi_use = pi[:use_b, :].clamp(min=0, max=M_r - 1)
+                                    r_pool_mask[:use_b].scatter_(1, pi_use, True)
+
+                                r_mask = r_mask_base & r_pool_mask
+
+                                r_target = r_target * r_mask.float()
+                                r_sum = r_target.sum(dim=-1, keepdim=True)
+                                r_valid_rows = r_sum.squeeze(-1) > 1e-12
+
+                                if bool(r_valid_rows.any().item()):
+                                    r_target = r_target / r_sum.clamp_min(1e-12)
+
+                                    try:
+                                        r_teacher_topk = int(os.environ.get("RERANK_TEACHER_TOPK", "8"))
+                                    except Exception:
+                                        r_teacher_topk = 8
+                                    try:
+                                        r_hard_neg_topk = int(os.environ.get("RERANK_HARD_NEG_TOPK", "64"))
+                                    except Exception:
+                                        r_hard_neg_topk = 64
+                                    try:
+                                        r_temp = float(os.environ.get("RERANK_HARD_TOPK_TEMP", "1.0"))
+                                    except Exception:
+                                        r_temp = 1.0
+                                    try:
+                                        r_margin = float(os.environ.get("RERANK_TOPK_MARGIN", "0.5"))
+                                    except Exception:
+                                        r_margin = 0.5
+
+                                    rerank_loss, rerank_metrics = _selector_hard_topk_teacher_loss(
+                                        r_logits,
+                                        r_target,
+                                        r_mask,
+                                        teacher_topk=r_teacher_topk,
+                                        hard_neg_topk=r_hard_neg_topk,
+                                        ce_temp=r_temp,
+                                        margin=r_margin,
+                                    )
+
+                                    if torch.is_tensor(rerank_loss):
+                                        loss = loss + float(rerank_w) * rerank_loss
+                                        acc.add("rerank_selector_loss", rerank_loss.detach().item())
+
+                                    if isinstance(rerank_metrics, dict):
+                                        for rk, rv in rerank_metrics.items():
+                                            acc.add(f"rerank_{rk}", rv)
+
+                                    acc.add(
+                                        "rerank_active_row_rate",
+                                        float(r_valid_rows.float().mean().detach().cpu().item()),
+                                    )
                 false_total = None
                 hard_false_w = float(_cfg_value(loss_cfg, "false_support_weight", 0.0))
                 if hard_false_w > 0:

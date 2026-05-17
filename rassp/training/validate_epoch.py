@@ -70,7 +70,16 @@ def validate_one_epoch(
                     else:
                         acc.add(key, value)
 
-        selector_logits = res.get("selector_logits", None) if isinstance(res, dict) else None
+        selector_logits = None
+        if isinstance(res, dict):
+            if os.environ.get("EVAL_USE_RERANK_LOGITS", "0") == "1":
+                selector_logits = res.get("formulae_scores_raw", None)
+                if not torch.is_tensor(selector_logits):
+                    selector_logits = res.get("formulae_scores_train", None)
+                if not torch.is_tensor(selector_logits):
+                    selector_logits = res.get("selector_logits", None)
+            else:
+                selector_logits = res.get("selector_logits", None)
         if torch.is_tensor(selector_logits):
             suffix = int(_cfg_value(selector_cfg, "model_topk_eval", 64))
             topk_idx = select_model_topk_indices(
