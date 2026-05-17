@@ -1567,7 +1567,23 @@ def train_mssubsetnet():
         best_metric = None
         best_ckpt_path = os.environ.get("BEST_CKPT_PATH", "checkpoints/best_clean_engine.pt")
         spect_bin_centers = spect_bin.get_bin_centers().astype(np.float32)
+        if os.environ.get("EVAL_ONLY", "0") == "1":
+            val_metrics = validate_one_epoch(
+                model=model,
+                loader=val_dl,
+                device=device,
+                spect_bin=spect_bin,
+                spect_bin_centers=spect_bin_centers,
+                epoch=0,
+                run_cfg=run_cfg,
+                selector_cfg=selector_cfg,
+                metric_cfg=official_metric_cfg,
+            )
 
+            epoch_metrics = {f"val_{k}": v for k, v in val_metrics.items()}
+            line = format_metric_line("EVAL_ONLY", epoch_metrics)
+            log(line)
+            return
         for epoch_idx in range(1, int(run_cfg.epochs) + 1):
             train_metrics = train_one_epoch(
                 model=model,

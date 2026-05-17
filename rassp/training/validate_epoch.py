@@ -81,33 +81,55 @@ def validate_one_epoch(
             else:
                 selector_logits = res.get("selector_logits", None)
         if torch.is_tensor(selector_logits):
-            suffix = int(_cfg_value(selector_cfg, "model_topk_eval", 64))
-            topk_idx = select_model_topk_indices(
-                selector_logits=selector_logits,
-                batch=batch,
-                k=suffix,
-                use_coverage=bool(_cfg_value(selector_cfg, "use_coverage_aware_topk", False)),
-                use_group_unique=bool(_cfg_value(selector_cfg, "use_group_unique_model", False)),
-            )
-            selector_metrics = compute_selected_support_metrics(topk_idx, batch)
-            acc.add_dict({f"{key}@{suffix}": value for key, value in selector_metrics.items()})
+            raw_eval_topks = os.environ.get("SELECTOR_EVAL_TOPKS", "").strip()
 
-            topk_mask = build_mask_from_topk_indices(
-                topk_idx,
-                selector_logits,
-                formulae_mask=batch.get("formulae_mask", None),
-            )
-            support_stats = compute_candidate_support_stats(
-                batch,
-                topk_mask,
-                official_bin_width=float(metric_cfg.get("bin_width", 0.01)),
-                official_max_mz=float(metric_cfg.get("max_mz", 1005.0)),
-            )
-            if isinstance(support_stats, dict):
-                if "official_cos" in support_stats:
-                    acc.add(f"model_topk_oracle_cos@{suffix}", support_stats["official_cos"])
-                if "false_support" in support_stats:
-                    acc.add(f"model_topk_oracle_false_support@{suffix}", support_stats["false_support"])
+            if raw_eval_topks:
+                eval_topks = []
+                for x in raw_eval_topks.split(","):
+                    x = x.strip()
+                    if not x:
+                        continue
+                    try:
+                        kx = int(x)
+                    except Exception:
+                        continue
+                    if kx > 0 and kx not in eval_topks:
+                        eval_topks.append(kx)
+                if not eval_topks:
+                    eval_topks = [int(_cfg_value(selector_cfg, "model_topk_eval", 64))]
+            else:
+                eval_topks = [int(_cfg_value(selector_cfg, "model_topk_eval", 64))]
+
+            for suffix in eval_topks:
+                topk_idx = select_model_topk_indices(
+                    selector_logits=selector_logits,
+                    batch=batch,
+                    k=suffix,
+                    use_coverage=bool(_cfg_value(selector_cfg, "use_coverage_aware_topk", False)),
+                    use_group_unique=bool(_cfg_value(selector_cfg, "use_group_unique_model", False)),
+                )
+
+                selector_metrics = compute_selected_support_metrics(topk_idx, batch)
+                acc.add_dict({f"{key}@{suffix}": value for key, value in selector_metrics.items()})
+
+                topk_mask = build_mask_from_topk_indices(
+                    topk_idx,
+                    selector_logits,
+                    formulae_mask=batch.get("formulae_mask", None),
+                )
+
+                support_stats = compute_candidate_support_stats(
+                    batch,
+                    topk_mask,
+                    official_bin_width=float(metric_cfg.get("bin_width", 0.01)),
+                    official_max_mz=float(metric_cfg.get("max_mz", 1005.0)),
+                )
+
+                if isinstance(support_stats, dict):
+                    if "official_cos" in support_stats:
+                        acc.add(f"model_topk_oracle_cos@{suffix}", support_stats["official_cos"])
+                    if "false_support" in support_stats:
+                        acc.add(f"model_topk_oracle_false_support@{suffix}", support_stats["false_support"])
 
         teacher_probs = batch.get("teacher_formula_probs", None)
         if torch.is_tensor(teacher_probs):
