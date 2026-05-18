@@ -17,6 +17,7 @@ from rassp.training.runtime_selector_targets import (
     build_candidate_local_quality_target,
     build_selector_teacher_dist_from_official_overlap,
     build_selector_teacher_dist_setcover,
+    build_selector_teacher_dist_template_oracle,
 )
 from rassp.training.selector_losses import (
     compute_selector_false_support_loss,
@@ -508,7 +509,15 @@ def train_one_epoch(
 
                     target_mask_source = (teacher_dist > 1e-12).float()
                     pairwise_utility = local_extra.get("utility", quality)
+                elif runtime_teacher_mode in ("template_oracle", "cache_oracle", "oracle_template"):
+                    teacher_dist, pos_label, valid_mask_for_loss, local_extra = build_selector_teacher_dist_template_oracle(
+                        batch=batch,
+                        formulae_mask=formulae_mask,
+                        official_bin_n=official_bin_n,
+                    )
 
+                    target_mask_source = pos_label
+                    pairwise_utility = local_extra.get("template_oracle_score", teacher_dist)
                 elif runtime_teacher_mode == "setcover":
                     teacher_dist = build_selector_teacher_dist_setcover(
                         batch=batch,

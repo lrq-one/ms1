@@ -1196,3 +1196,202 @@ def build_candidate_local_quality_target(
     }
 
 
+def _get_first_tensor_from_batch(batch, names):
+    for name in names:
+        x = batch.get(name, None)
+        if torch.is_tensor(x):
+            return x
+    feat = batch.get("features", None)
+    if isinstance(feat, dict):
+        for name in names:
+            x = feat.get(name, None)
+            if torch.is_tensor(x):
+                return x
+    return None
+
+
+def build_selector_teacher_dist_template_oracle(
+    batch,
+    formulae_mask,
+    official_bin_n,
+):
+    """
+    Build a direct template-oracle teacher.
+
+    Teacher score for each candidate formula is based on:
+      candidate official peak template vs true official spectrum.
+
+    This is different from local quality / setcover:
+    it directly supervises the selector to find the few candidates whose
+    cached peak templates actually explain the target spectrum.
+    """
+    device = formulae_mask.device
+    B, M = formulae_mask.shape
+
+    true_idx = _get_first_tensor_from_batch(
+        batch,
+        [
+            "true_all_official_idx",
+            "true_official_idx",
+            "target_official_idx",
+        ],
+    )
+    true_int = _get_first_tensor_from_batch(
+        batch,
+        [
+            "true_all_official_intensity",
+            "true_official_intensity",
+            "target_official_intensity",
+        ],
+    )
+
+    cand_idx = _get_first_tensor_from_batch(
+        batch,
+        [
+            "formulae_peaks_official_idx",
+            "formulae_peaks_official_idx_agg",
+            "formulae_peaks_mass_idx",
+        ],
+    )
+    cand_int = _get_first_tensor_from_batch(
+        batch,
+        [
+            "formulae_peaks_official_intensity",
+            "formulae_peaks_official_intensity_agg",
+            "formulae_peaks_intensity",
+        ],
+    )
+
+    if not (
+        torch.is_tensor(true_idx)
+        and torch.is_tensor(true_int)
+        and torch.is_tensor(cand_idx)
+        and torch.is_tensor(cand_int)
+    ):
+        zero = formulae_mask.float() * 0.0
+        return zero, zero, formulae_mask.float(), {
+            "template_oracle_missing": torch.ones((B,), device=device),
+        }
+
+    true_idx = true_idx.to(device=device, dtype=torch.long)
+    true_int = true_int.to(device=device, dtype=torch.float32)
+    cand_idx = cand_idx.to(device=device, dtype=torch.long)
+    cand_int = cand_int.to(device=device, dtype=torch.float32)
+
+    if true_idx.dim() == 1:
+        true_idx = true_idx.unsqueeze(0)
+    if true_int.dim() == 1:
+        true_int = true_int.unsqueeze(0)
+
+    if true_idx.dim() > 2:
+        true_idx = true_idx.reshape(true_idx.shape[0], -1)
+    if true_int.dim() > 2:
+        true_int = true_int.reshape(true_int.shape[0], -1)
+
+    if cand_idx.dim() == 2:
+        cand_idx = cand_idx.unsqueeze(-1)
+    if cand_int.dim() == 2:
+        cand_int = cand_int.unsqueeze(-1)
+
+    if cand_idx.dim() > 3:
+        cand_idx = cand_idx.reshape(cand_idx.shape[0], cand_idx.shape[1], -1)
+    if cand_int.dim() > 3:
+        cand_int = cand_int.reshape(cand_int.shape[0], cand_int.shape[1], -1)
+
+    use_b = min(B, int(true_idx.shape[0]), int(true_int.shape[0]), int(cand_idx.shape[0]), int(cand_int.shape[0]))
+    use_m = min(M, int(cand_idx.shape[1]), int(cand_int.shape[1]))
+    use_p = min(int(cand_idx.shape[2]), int(cand_int.shape[2]))
+
+    if use_b <= 0 or use_m <= 0 or use_p <= 0:
+        zero = formulae_mask.float() * 0.0
+        return zero, zero, formulae_mask.float(), {}
+
+    true_idx = true_idx[:use_b]
+    true_int = true_int[:use_b]
+    cand_idx = cand_idx[:use_b, :use_m, :use_p]
+    cand_int = cand_int[:use_b, :use_m, :use_p]
+
+    true_dense = torch.zeros(
+        (use_b, int(official_bin_n)),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    true_valid = (
+        (true_idx >= 0)
+        & (true_idx < int(official_bin_n))
+        & torch.isfinite(true_int)
+        & (true_int > 0)
+    )
+
+    true_safe_idx = true_idx.clamp(min=0, max=int(official_bin_n) - 1)
+    true_dense.scatter_add_(1, true_safe_idx, true_int * true_valid.float())
+    true_dense = true_dense.clamp_min(0.0)
+    true_dense = true_dense / true_dense.sum(dim=1, keepdim=True).clamp_min(1e-12)
+
+    cand_valid = (
+        (cand_idx >= 0)
+        & (cand_idx < int(official_bin_n))
+        & torch.isfinite(cand_int)
+        & (cand_int > 0)
+    )
+
+    cand_safe_idx = cand_idx.clamp(min=0, max=int(official_bin_n) - 1)
+    cand_mass = cand_int * cand_valid.float()
+    cand_mass = cand_mass / cand_mass.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    flat_idx = cand_safe_idx.reshape(use_b, -1)
+    true_at_peak = torch.gather(true_dense, 1, flat_idx).reshape(use_b, use_m, use_p)
+
+    true_hit = (true_at_peak > 1e-12).float() * cand_valid.float()
+
+    overlap_mass = (cand_mass * true_hit).sum(dim=-1)
+    false_mass = 1.0 - overlap_mass
+
+    true_dot = (cand_mass * true_at_peak * cand_valid.float()).sum(dim=-1)
+
+    # Same spirit as cache_template_oracle_probe.py:
+    # true intensity dot + overlap reward - light false penalty.
+    oracle_score = true_dot + 0.10 * overlap_mass - 0.02 * false_mass
+    oracle_score = torch.where(
+        torch.isfinite(oracle_score),
+        oracle_score,
+        torch.zeros_like(oracle_score),
+    )
+    oracle_score = oracle_score.clamp_min(0.0)
+
+    full_score = formulae_mask.float() * 0.0
+    full_score[:use_b, :use_m] = oracle_score
+    full_score = full_score * formulae_mask.float()
+
+    try:
+        topk = int(os.environ.get("TEMPLATE_ORACLE_TOPK", "64"))
+    except Exception:
+        topk = 64
+    topk = max(1, min(topk, M))
+
+    # Keep only strongest oracle candidates as teacher positives.
+    masked_score = full_score.masked_fill(formulae_mask <= 0.5, -1e9)
+    top_idx = torch.topk(masked_score, k=topk, dim=1).indices
+
+    pos_label = torch.zeros_like(full_score)
+    pos_label.scatter_(1, top_idx, 1.0)
+    pos_label = pos_label * (full_score > 0).float() * formulae_mask.float()
+
+    teacher_dist = full_score * pos_label
+    row_sum = teacher_dist.sum(dim=1, keepdim=True)
+    valid_row = row_sum > 1e-12
+    teacher_dist = teacher_dist / row_sum.clamp_min(1e-12)
+
+    valid_mask = formulae_mask.float() * valid_row.float()
+
+    extra = {
+        "template_oracle_score": full_score,
+        "template_oracle_pos_label": pos_label,
+        "template_oracle_overlap_mass": torch.zeros_like(full_score),
+        "template_oracle_false_mass": torch.zeros_like(full_score),
+    }
+    extra["template_oracle_overlap_mass"][:use_b, :use_m] = overlap_mass
+    extra["template_oracle_false_mass"][:use_b, :use_m] = false_mass
+
+    return teacher_dist, pos_label, valid_mask, extra
